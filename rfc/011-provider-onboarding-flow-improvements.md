@@ -34,10 +34,43 @@ The goal is to make Providers to be "onboarding-aware".
 
 - Accepting the "become a PM provider" request means the Provider can reconcile consumers on the PM instance. No other manual steps should be needed.
 
+
 #### Providers machinery + SDK
-
-
 
 #### APIs
 
+# Notes
 
+PM side:
+0. Owner goes and retrieves the token
+    - Logs into Provider's infra
+    - Copies the token
+    - Token: PlatformMeshTokenV1:<Identifier>:<Alg>:<PublicKey>
+    - Single use, expirable (set by Provider)
+1. Create Provider with token already in spec
+2. root:providers:# is created, SA created, kubeconfig copied back to root:orgs:<Org>:<User>
+3. Make /onboard request:
+    - schema:
+        - envelope: {"kind": "PlatformMeshOnboardRequest", "version": "v1", identifier: "<Identifier from token>", payload: "<base64-encoded encrypted payload>"}
+        - payload: {"kubeconfig": "<base64-encoded kubeconfig>": "apiexportendpointslice": "<APIExportEndpointSliceName>"}
+4. Continuous reconcilliation on APIExportEndpointSlice by Provider
+5. Use TokenRequest API to manage the token rotation
+    - Provider uses Token API to manage this
+
+Provider side:
+1. /onboard handler receives the json data in POST
+2. Decrypts with private key assigned to public key associated with <Envelope.Identifier>
+3. Retrieve the kubeconfig
+4. Establish the connection:
+    - <Establish the HTTP tunnel>
+    - Create REST config, create k8s client
+    - Create Lease
+    - On Success, ProviderConnection.status.phase=Connected
+
+TODO:
+- Idempotency
+- Provider down, reconnect
+- PM down, reconnect
+- Provider down, can't reconnect because SA token has rotated
+- Direct flow for locally available Providers
+- How to evict Provider?
