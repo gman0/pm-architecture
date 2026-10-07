@@ -51,7 +51,7 @@ pm1.<base64url(Provider base URL)>.<tokenID>.<tokenSecret>
 - **Single-use and short-lived** (minutes). The Provider-side stores only `tokenID → {hash(secret), expiry, owner, usedBy}`.
 - **Stored in a Secret**, referenced from the request, never inlined in its spec. Specs leak into GitOps repos, `kubectl get -o yaml` and audit logs. The controller adds the request as the Secret's owner, so the token is garbage-collected with the request.
 - **The TTL must cover `Provider` setup.** When the request creates the `Provider`, registration waits for the workspace and SA. That normally takes seconds, but a TTL in the tens of minutes leaves room for a slow kcp.
-- **Trust in the Provider-side** comes from web PKI on the URL, or from `spec.remote.caBundle` for private CAs.
+- **Trust in the Provider-side** comes from web PKI on the URL, or from the `Provider`'s `spec.remote.caBundle` for private CAs.
 
 ### Connection API
 
@@ -65,7 +65,6 @@ Authorization: Bearer <tokenID>.<tokenSecret>
   "previousConnectionID": "...",                 // optional: re-onboarding this Provider
   "clusterID": "<logical cluster name of the provider workspace>",
   "frontProxyURL": "https://...",
-  "apiExportEndpointSlice": "<name>",
   "transport": "tunnel" | "direct",
   "credentials": { "caBundle": "...", "token": "<bound SA token>", "expirationTimestamp": "..." }
 }
@@ -84,25 +83,29 @@ Authorization: Bearer <connectionSecret>
 → 204
 ```
 
-- **One-step registration.** The workspace and SA exist before the request registers, so the first call carries real addressing and credentials. There's no separate "onboard, then connect" phase.
-- **Idempotency.** `POST` is keyed on `(tokenID, idempotencyKey)`. If the response is lost, a retry from the same request returns the same `connectionID` and **issues a new connection secret**, which invalidates the previous one. The Provider-side stores only hashes, so it can't return the old secret, and the old one never reached anyone.
-- **Addressing is immutable.** `clusterID`, `frontProxyURL` and `apiExportEndpointSlice` are fixed at registration. `PUT` only replaces the token and CA bundle. So a stolen connection secret can't redirect the Provider-side to another kcp. Changing addressing means re-onboarding.
+- **One-step registration.** The request waits in `WaitingForProvider` until the `Provider` is `Ready`, which in RFC 006 means the workspace and SA exist. So the first call carries real addressing and credentials, and there's no separate "onboard, then connect" phase. The request controller mints that first SA token itself (TokenRequest), so it needs the same token permission as the connector.
+- **No APIExport details at registration.** RFC 006 leaves APIExport bootstrap out of scope, and an external Provider typically creates its APIExport only after it has credentials. So registration names only the workspace (`clusterID`) and the front-proxy. What the Provider-side does in its workspace, including which exports and endpoint slices it uses, is its own business. It finds them through the provider workspace like any other object.
+- **Idempotency.** `POST` is keyed on `(tokenID, idempotencyKey)`. If the response is lost, a retry from the same request returns the same `connectionID` and **issues a new connection secret**, which invalidates the previous one. The Provider-side stores only hashes, so it can't return the old secret, and the PM-side never stored it anyway.
+- **Retries outlive the token's expiry.** A retry with the same `(tokenID, idempotencyKey)` is honoured for a bounded window (e.g. 24h) even after the token has expired. Otherwise a lost response followed by expiry would leave a connection record on the Provider-side that the PM-side doesn't know about. The Provider-side garbage-collects records that never saw a `PUT` or a tunnel.
+- **Addressing is immutable**, for the whole life of a connection. `clusterID` and `frontProxyURL` are fixed at registration. `PUT` only replaces the token and CA bundle, and re-onboarding only issues a new connection secret. So neither a stolen connection secret nor a stolen onboarding token can redirect an existing connection to another kcp. Changing addressing means a new connection.
 - **Responses carry nothing sensitive** beyond the connection secret on `POST`.
 - **Bearer credentials survive ingresses.** Everything works through an ingress or CDN that terminates TLS. No client certificates and no custom signatures.
 
 ### Credentials and rotation
 
 - **Send parts, not a kubeconfig:** the CA bundle, the token and the real URLs.
-- **The PM-side mints, the Provider-side holds.** The connector calls TokenRequest (`serviceaccounts/token`) and `PUT`s the result at about half the token's TTL, and immediately after every reconnect.
+- **The PM-side mints, the Provider-side holds.** The connector calls TokenRequest (`serviceaccounts/token`) and `PUT`s the result at about half the token's TTL, and immediately after every connector restart and tunnel reconnect.
 - **Long-lived proof, short-lived authorization.** The connection secret is long-lived and the SA token is short-lived. An outage longer than the SA token's TTL therefore recovers on its own: the next `PUT` delivers a fresh token. If a credential could only be refreshed by presenting itself, its TTL would become a power-off budget.
 - **Credentials don't depend on the tunnel.** `PUT` is a plain outbound HTTPS call. A broken tunnel doesn't block credential delivery, and the other way round.
 - **RBAC is owned by the PM-side.** The Provider controller creates the SA and RBAC in the provider workspace (RFC 006). The Provider-side doesn't request permissions.
+- **No static kubeconfig for remote `Provider`s.** RFC 006 generates a kubeconfig Secret with a static token in the provider workspace. A remote `Provider` only ever uses short-lived TokenRequest tokens, so the controller skips that Secret rather than leave an unused, non-expiring credential in kcp. This is a deliberate deviation from RFC 006.
+  - **Note: no long-lived kcp tokens by default, anywhere.** A non-expiring token is bad design in general, not just for remote `Provider`s. Either RFC 006 moves to short-lived TokenRequest tokens for every `Provider` as well, or static kubeconfigs become an explicit opt-in (e.g. `spec.staticKubeconfig: true`) for the cases that really need them, such as local development or a ManagedProvider that can't refresh tokens yet. Never as an implicit default. RFC 006 already asks whether SA kubeconfigs should only be a stopgap. See "Open items".
 
 ### What each credential exposes
 
 | Credential | Lifetime | Stored at | If stolen |
 |---|---|---|---|
-| Onboarding token | minutes, single-use | PM-side Secret until spent; hash on the Provider-side | The thief can register **their own** kcp under the token owner's portal account (billing, quotas, possibly account-level resources). The legitimate registration then fails visibly with "already used". Nothing from the PM-side leaks. |
+| Onboarding token | minutes, single-use | PM-side Secret until spent; hash on the Provider-side | The thief can register **their own** kcp under the token owner's portal account (billing, quotas, possibly account-level resources). With a known `connectionID`, they can instead re-onboard an existing connection of the same owner, which only issues a new connection secret: denial of service, no redirect, because addressing is immutable. Either way, the legitimate registration then fails visibly with "already used". Nothing from the PM-side leaks. |
 | Connection secret | long-lived | PM-side Secret; hash on the Provider-side | The thief can push a broken token or delete the connection: loud denial of service. They can't redirect it, because addressing is immutable. |
 | SA token | hours | Provider-side | Access to the provider workspace and the APIExport virtual workspace, within RFC 006 RBAC. Inherent to any design; bounded by TTL and RBAC scope. |
 
@@ -112,10 +115,12 @@ NAT is a requirement, so the tunnel is the default transport.
 
 - **The connector dials out.** It opens a WebSocket to `/v1/connections/{id}/tunnel`, authenticated with the connection secret, and keeps it open.
 - **The tunnel is a dial proxy**, not a pipe to a single apiserver. Every `Dial` on the Provider-side becomes a stream over the one WebSocket, opened with its target `host:port`. The connector checks the target against the allow-list, dials it and pipes bytes.
-- **TLS is end to end.** The Provider-side keeps the real URLs (the front-proxy and the shard virtual-workspace URLs from the APIExportEndpointSlice). Only its `Dial` goes through the tunnel; `ServerName` is the real host, so no URLs are rewritten. The connector can't read or alter traffic.
+- **TLS is end to end.** The Provider-side keeps the real URLs (the front-proxy, and the shard virtual-workspace URLs it finds in whatever endpoint slices it uses). Only its `Dial` goes through the tunnel; `ServerName` is the real host, so no URLs are rewritten. The connector can't read or alter traffic.
 - **client-go integration.** The tunnel plugs in as `rest.Config.Dial`. multicluster-runtime per-endpoint clients are derived from the base `rest.Config`, so they all inherit it.
-- **Allow-list.** The connector only dials the front-proxy and the hosts in the APIExportEndpointSlice, which it watches. Shard hostnames can be internal-only.
-  - The list is built only from PM-side objects, never from anything the Provider-side sends. An empty list refuses every dial.
+- **Allow-list.** The connector only dials the front-proxy and the `spec.virtualWorkspaceURL` host of every kcp `Shard`, which it watches. Shard hostnames can be internal-only.
+  - **Built from Shards, not from endpoint slices.** Every endpoint slice points at a shard's virtual-workspace URL, whatever its kind. The provider workspace is the Provider-side's domain: it decides which exports to use and which kinds of endpoint slices (`APIExportEndpointSlice` or others). So the connector doesn't guess from known types. It allows every shard, which covers any endpoint the Provider-side can legitimately reach.
+  - The list is built only from PM-side data (the Shard objects and the front-proxy config), never from anything the Provider-side sends or creates. The connector needs read access to Shards in the root workspace.
+  - A new shard is allowed as soon as its `Shard` object appears. Shards' `baseURL`s aren't on the list: direct shard access isn't needed, because the front-proxy handles workspace traffic and the virtual-workspace URLs handle endpoint slices.
   - Each hostname is resolved once, every resulting address is checked, and the connector dials those exact addresses, so DNS can't be re-pointed between the check and the dial.
   - Link-local, multicast and cloud-metadata addresses are always refused.
 - **Liveness.** The tunnel runs its own ping/pong with read deadlines. Proxies and CDNs drop idle connections without telling either end, and TCP keepalive doesn't notice.
@@ -186,7 +191,7 @@ stringData:
 **`ProviderOnboardingRequest`**
 - **The user creates only the request** (and the token Secret). The `Provider` is created as a side effect if it doesn't exist yet.
 - **Runs once.** A request registers at most once. A finished request never acts again, even before it's garbage-collected.
-- **One active request per `Provider`.** A second request for the same `Provider` while one is running is refused with a condition until the first finishes, so two registrations can't race on one connection.
+- **One active request per `Provider`.** A second request for the same `Provider` waits, with a condition saying so, until the first one finishes, so two registrations can't race on one connection.
 - **Short-lived.** A `Ready` request is deleted after `ttlSecondsAfterFinished`, together with the token Secret it owns. Failed requests are kept until someone deletes them, as a record of the attempt.
 - **Separate permission.** Registering sends a live SA token to an external party. RBAC on requests is therefore "who may connect this PM instance to an external Provider", separate from managing `Provider` objects. Creating a request implies creating the `Provider`, which the controller does on the user's behalf.
 
@@ -196,7 +201,7 @@ stringData:
 |---|---|
 | doesn't exist | creates it from `provider.spec`, waits for the workspace and SA, then registers |
 | exists, not registered (a leftover from a failed attempt, or created by hand) | reuses it and registers |
-| exists and is registered | re-onboards: `POST` with `previousConnectionID`. The Provider-side keeps the same connection record and issues a new connection secret only if the token's owner and the `clusterID` match; otherwise it refuses and the existing connection is untouched |
+| exists and is registered | re-onboards: `POST` with `previousConnectionID`. The Provider-side keeps the same connection record and issues a new connection secret only if the token's owner and the addressing (`clusterID`, `frontProxyURL`) all match; otherwise it refuses and the existing connection is untouched. Before sending anything, the request refuses if the token's URL differs from the existing connection's URL, so a token for a different Provider never receives credentials meant for this one |
 | exists, but isn't a remote `Provider` (e.g. a ManagedProvider) | refuses |
 
 - **`provider.spec` applies only on creation.** If the `Provider` already exists, the request doesn't rewrite it. When the two differ, it sets `ProviderSpecIgnored`. Later changes are made on the `Provider` directly.
@@ -205,9 +210,9 @@ stringData:
 - **Moving to another portal account** isn't re-onboarding: the Provider-side refuses a token from a different owner. Delete the `Provider` (which offboards it) and onboard again.
 
 **`Provider`**
-- Kept largely as-is (RFC 006). It gains `spec.remote` and handles credentials and the tunnel.
+- Kept largely as-is (RFC 006). It gains `spec.remote` and handles credentials and the tunnel. For a remote `Provider`, the controller skips RFC 006's static kubeconfig Secret (see "Credentials and rotation").
 - **Independent once created**: no `ownerReferences` to the request, so it survives the request's garbage collection.
-- **The connection Secret is the durable state**, not the status. After a restart the connector needs only that Secret.
+- **The connection Secret is the durable state**, not the status. After a restart the connector needs only that Secret. `status.connection` mirrors the URL and `connectionID`, so a request can still re-onboard if the Secret is lost.
 
 **Re-onboarding** is creating a new request with the same `provider.name`. Typical reasons: the connection secret leaked, the connection was deleted on the Provider-side (`CredentialsValid=False`), or the connection Secret was lost.
 
@@ -223,16 +228,17 @@ stringData:
 | Provider-side restarts | Tunnels drop and connectors reconnect and `PUT`. The Provider-side rebuilds clients from the connection record and the latest token. |
 | Outage longer than the SA token TTL | The next `PUT` after recovery delivers a fresh token. |
 | Crash after the request created the `Provider`, before `POST` | The request reuses the `Provider` it created on the next reconcile; nothing is created twice. |
-| `POST` response lost, or crash before the connection Secret is written | The same request retries with the same token and idempotency key: same `connectionID`, new connection secret. If the token has expired in the meantime, the request fails and the user creates a new one with a new token; the `Provider` is reused. |
+| `POST` response lost, or crash before the connection Secret is written | The same request retries with the same token and idempotency key: same `connectionID`, new connection secret. The retry works even if the token has expired since, within the bounded retry window. |
 | Registration fails (bad or expired token, Provider-side refuses) | The request is `Failed` and kept. The `Provider` stays with `Registered=False`, or, when re-onboarding, keeps its existing connection. |
 | Connection deleted on the Provider-side | `PUT` and the tunnel get 401. The `Provider` gets `CredentialsValid=False`. Recovery is a new request with a new token. |
-| Request rejected by the Provider-side vs. something in between | A rejection by the Provider-side itself means `CredentialsValid=False` and a long backoff. An ingress error or 5xx is transient. The Provider-side marks its own rejections so the connector can tell them apart. |
+| `PUT` or tunnel connect rejected by the Provider-side vs. by something in between | A rejection by the Provider-side itself means `CredentialsValid=False` and a long backoff. An ingress error or 5xx is transient. The Provider-side marks its own rejections so the connector can tell them apart. |
 | Connector reconnects while the old tunnel is still open | The new tunnel replaces the old one, which is closed. Cleaning up the old tunnel must only remove its own registration (and Lease), never the one that replaced it. Otherwise the connection becomes unroutable while both ends look healthy. |
 | Provider-side runs multiple replicas | A tunnel lands on one pod. Either shard so that pod owns that connection's reconciliation, or add a routing layer: the pod holding the tunnel claims a Lease per connection naming its internal address and renews it while the tunnel lives, and other pods relay through it. The Leases are then the only input to the connection record's `Connected` status. |
 
 ### Offboarding and revocation
 
-- **Deleting the `Provider`** triggers a finalizer that calls `DELETE /v1/connections/{id}`. The Provider controller then cleans up the SA and RBAC (RFC 006), and the connection Secret is garbage-collected with the `Provider`.
+- **Deleting the `Provider`** triggers a finalizer that calls `DELETE /v1/connections/{id}`. The Provider controller then cleans up the SA and RBAC (RFC 006), and the connection Secret is garbage-collected with the `Provider`. Revoking the SA cuts off the Provider-side even if `DELETE` never arrives.
+- **An unreachable Provider-side doesn't block deletion forever.** The finalizer retries `DELETE` and gives up after a timeout, or immediately if the `Provider` is annotated to skip it. The Provider-side's record then lingers until it is cleaned up there.
 - **Deleting the connection on the Provider-side** invalidates the connection secret and closes the tunnel. The PM-side surfaces it through `CredentialsValid=False`.
 
 ## Changes from v1
@@ -244,7 +250,7 @@ stringData:
 | Per-connection keypair, fingerprint entered in the portal, token bound to it | Long-lived connection secret, stored as a hash on the Provider-side | Binding only protected against a stolen, unspent token; see the credentials table |
 | mTLS, then DPoP-style proofs | Bearer credentials | Work through any ingress, no custom signatures |
 | Pin of the Provider-side's key, signed replies, HPKE sealing | Web PKI, URL embedded in the token | The realistic risk was a wrong URL, which the token now rules out |
-| Adoption via `previousConnectionID` with `ProviderConflict` | Same mechanism; the Provider-side checks the token's owner and the `clusterID`, and a refusal fails the request | Reuse by name is safe because the Provider-side, not the name, decides |
+| Adoption via `previousConnectionID` with `ProviderConflict` | Same mechanism; the Provider-side checks the token's owner and the addressing, and a refusal fails the request | Reuse by name is safe because the Provider-side, not the name, decides |
 
 ## Rejected alternatives
 
@@ -261,12 +267,13 @@ stringData:
 
 ## Open items
 
-- **Connector placement.** Inside the PM operator's Provider controller, a separate deployment per PM instance, or one per connection. Considerations: one long-lived tunnel per connection, spreading tunnels across replicas, network reach to the front-proxy and every shard, TokenRequest permissions in every provider workspace, blast radius (it holds connection secrets and tokens), coupling to PM operator upgrades.
+- **Connector placement.** Inside the PM operator's Provider controller, a separate deployment per PM instance, or one per connection. The request controller also mints SA tokens (for the first `POST`), so running it in the same component as the connector keeps TokenRequest permission in one place. Considerations: one long-lived tunnel per connection, spreading tunnels across replicas, network reach to the front-proxy and every shard, TokenRequest permissions in every provider workspace, blast radius (it holds connection secrets and tokens), coupling to PM operator upgrades.
 - **Tunnel library.** remotedialer or Konnectivity, and how its protocol is versioned alongside `/v1`.
 - **Provider-side multi-replica.** Sharding vs. the Lease-based routing layer.
+- **Long-lived credentials in general.** Two options for RFC 006's static kubeconfig: drop it for every `Provider` in favour of short-lived TokenRequest tokens, or keep it only as an explicit opt-in for local and managed use cases. The connection secret in this design is long-lived too. It grants no kcp access, only "push a token for this connection", but rotating it (next item) would remove the last non-expiring credential.
 - **Connection secret rotation.** Whether `PUT` should occasionally return a new secret, and how to avoid losing it if the response is lost.
 - **`direct` mode.** Whether the user chooses it, or the connector detects reachability.
-- **Addressing changes.** Whether re-onboarding is acceptable when the front-proxy URL changes, or whether a dedicated, re-authorized update is needed.
+- **Addressing changes.** A new front-proxy URL currently means a new connection, losing whatever the Provider-side keyed to the old one. Is that acceptable, or is a dedicated update needed, authorized by more than one credential (e.g. a new token **and** the current connection secret)?
 - **Request permissions.** Whether creating a request should require create permission on `Provider` too, or whether the request's permission alone is enough for the controller to create it.
 - **Token format and portal UX.** Encoding, length, and whether the portal offers a "copy as Secret manifest" button.
 
