@@ -41,6 +41,8 @@ kind: ConnectorCABundle
 metadata:
   name: default
   generation: 7
+  # annotations:
+  #   providerconnections.platform-mesh.io/ignore-degraded-connections-for: g3   # activate g3 despite degraded connections
 spec:
   generations:                          # rendered by the chart from values; public data only
     - name: g1
@@ -72,23 +74,26 @@ status:
       connections: 140
       pinnedCurrent: 140
       unreachable: 0
+      degraded: 0
       lastUpdateTime: "2026-10-12T14:02:10Z"
     - name: nereus
       connections: 151
-      pinnedCurrent: 149
+      pinnedCurrent: 148
       unreachable: 2
+      degraded: 1                       # sessions up, control calls failing; listed with their last error
       lastUpdateTime: "2026-10-12T14:01:55Z"
   connections:
     total: 291
-    pinnedCurrent: 289
+    pinnedCurrent: 288
     unreachable: 2
+    degraded: 1
   conditions:
     - type: Valid                       # every certificate parses, is a CA, can sign, isn't expired
       status: "True"
     - type: BundleConverged             # every reachable connection pins the current sequence
       status: "False"
       reason: ConnectionsUnreachable
-    - type: ReadyToActivate             # a Next generation is pinned by every reachable connection
+    - type: ReadyToActivate             # a Next generation is pinned by every reachable connection, and none is degraded
       status: "False"
       reason: NoNextGeneration
     - type: ReadyToRetire               # no valid connector certificate from a Retiring generation remains
@@ -149,12 +154,12 @@ Shard workers build the bundle from the **spec**, not from the aggregator's stat
 
 Four changes to values, each gated by a condition:
 
-1. **Add the new generation as `Next`** (key source and public certificate). The operator pins it everywhere. Wait for **`ReadyToActivate`**.
+1. **Add the new generation as `Next`** (key source and public certificate). The operator pins it everywhere. Wait for **`ReadyToActivate`**. It stays false while any connection is **degraded** (sessions up, control calls failing): activating would cut that connection's traffic. Fix the control path with the Provider, or proceed knowingly by annotating the resource with `providerconnections.platform-mesh.io/ignore-degraded-connections-for: "<next generation>"`; those connections lose their sessions until their control path works again and they catch up. The operator honours the annotation only while the named generation is `Next`, so it can't carry over to a later rollover; for any other value it records an event and ignores it. It can be set through values (the chart renders it, and the decision is recorded in Git) or with `kubectl annotate` in an incident; if an installation enables Flux's drift correction for the release, a hand-set annotation may be reverted at the next reconcile.
 2. **Set it `Active` and the old one `Retiring`.** The chart switches connector `Certificate`s to the new issuer; cert-manager reissues them; connectors check the chain. Wait for **`ReadyToRetire`**.
 3. **Set the old one `Retired`.** The operator unpins it everywhere. Wait for **`BundleConverged`**.
 4. **Delete the old generation's key**: its Secret, or retire it in the external PKI.
 
-**The procedure is manual by design**: people create generations and change their states; the operator, cert-manager and connectors do everything else. A generation lives **10 years**, aligned with kcp-operator's CA default. Unlike kcp's CAs, which cert-manager renews 30 days before expiry because nobody outside PM pins them, a connector CA rollover must **start at least a year before the active generation expires**, to leave time for the procedure and for Providers that are unreachable for a while. It's otherwise planned, never urgent unless a key is in doubt. Connections that stay unreachable don't block the conditions (they count only reachable connections) but are listed per shard; if they're still unreachable past the old generation's expiry, they need a rebind or a new connection.
+**The procedure is manual by design**: people create generations and change their states; the operator, cert-manager and connectors do everything else. A generation lives **10 years**, aligned with kcp-operator's CA default. Unlike kcp's CAs, which cert-manager renews 30 days before expiry because nobody outside PM pins them, a connector CA rollover must **start at least a year before the active generation expires**, to leave time for the procedure and for Providers that are unreachable for a while. It's otherwise planned, never urgent unless a key is in doubt. Connections that stay **unreachable** (down: no control calls, no sessions) don't block the conditions but are listed per shard, and catch up as soon as their control calls succeed again; **degraded** connections block activation as described in step 1. if they're still unreachable past the old generation's expiry, they need a rebind or a new connection.
 
 ## Documentation and follow-ups
 
