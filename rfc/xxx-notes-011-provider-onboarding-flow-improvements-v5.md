@@ -3,7 +3,7 @@
 Working notes for [011](./011-provider-onboarding-flow-improvements.md). Not the RFC itself. v5 builds on the [v4 notes](./xxx-notes-011-provider-onboarding-flow-improvements-v4.md) and removes most of its machinery by reversing two of its assumptions:
 
 - **The Provider-side never holds kcp credentials.** The connector becomes an authenticating HTTP proxy for kcp. It adds the SA token itself, so no access token, kcp CA bundle or token rotation ever crosses to the Provider-side.
-- **The Provider's edge is the Provider's responsibility**, mirroring v4's "the owner's workspace is the owner's responsibility". The inner mTLS, server-key pinning and the pinned connection key proven inside it lose their purpose.
+- **The Provider's edge is the Provider's responsibility**, mirroring v4's "the owner's workspace is the owner's responsibility". The inner mTLS, server-key pinning and the pinned connection key proven inside it lose their purpose. A later revision of these notes proposes bringing the inner TLS back on sessions, on by default, without the connection key or any credential delivery, so that this assumption isn't needed (see "The Provider's edge: inner TLS on sessions").
 
 It then splits the PM-side into a **control plane** (one stateful connection controller) and a **data plane** (stateless connectors, one per kcp shard). Control calls are authenticated by a PM-generated secret per connection; sessions by short-lived assertions signed with short-lived certificates from a PM connections CA. Nothing needs anyone's involvement to rotate, and owners learn nothing about PM's shards.
 
@@ -23,8 +23,8 @@ What's left is: one registration call, at most one WebSocket per (connection, sh
 - **Shard certificate**: a short-lived certificate (e.g. 24h) from the session CA for one shard's connector, renewed automatically and mounted read-only into the connector. It names the virtual-workspace host its sessions serve.
 - **Session assertion**: a short-lived JWT signed with the shard certificate's key, carrying the shard certificate (and an intermediate, if PM uses one), bound to one connection. It authenticates a session upgrade and nothing else. The Provider-side verifies it locally against the pinned session CA certificates.
 - **Session**: one WebSocket from one shard's connector to the Provider's base URL, authenticated with a session assertion. There's at most one per (connection, shard), opened only where the connection has traffic (see "Per-shard connectors"). It carries a stream multiplexer. The Provider-side opens streams on demand, as if dialling, and speaks plain HTTP on each; the connector serves HTTP on them.
-- **Connection export**: a PM APIExport that serves the `ProviderConnection` resource. The Provider controller binds it in every provider workspace when it creates the workspace. It claims read-only access to `apiexportendpointslices` there.
-- **Connection record**: a non-secret `ProviderConnection` object (`connectionID`, base URL, the connection's SA) in the connection's **provider workspace**, written by the connection controller through the connection export. The Provider is admin in that workspace (RFC 006), but the connector's authorizer denies it any write to the record (see "Connector policy"). Connectors read it through the export's endpoint slice, so the record lives on the shard of the workspace it describes.
+- **Connection export**: a PM APIExport that serves the `ProviderConnection` resource, with a local **maximal permission policy** that allows only reads in the workspaces that bind it. The Provider controller binds it in every provider workspace when it creates the workspace. It claims read-only access to `apiexportendpointslices` there.
+- **Connection record**: a non-secret `ProviderConnection` object (`connectionID`, base URL, the connection's SA) in the connection's **provider workspace**, written by the connection controller through the connection export. The Provider is admin in that workspace (RFC 006), but the export's maximal permission policy makes kcp itself deny it any write to the record (see "Connector policy"). Connectors read it through the export's endpoint slice, so the record lives on the shard of the workspace it describes.
 - **Connection principal**: the identity a request arriving over a session of connection `{id}` is authenticated as inside the connector, e.g. `pm:connection:<id>`. The connector maps it to the connection's SA before forwarding to kcp.
 - **`ProviderOnboardingRequest`**: as in v4, plus rebind (see "Recovery: rebind").
 
@@ -51,13 +51,13 @@ Unchanged from v2: the Provider-side must reconcile on any number of PM instance
 Two symmetric statements:
 
 - **The owner's workspace is the owner's responsibility** (from v4). Whoever can read the connection Secret can act as the owner's connection for control calls.
-- **The Provider's edge is the Provider's responsibility** (new). A Provider already trusts its ingress, load balancer or CDN with all of its customers' traffic. v5 doesn't defend a connection against the Provider's own edge.
+- **The Provider's edge is the Provider's responsibility** (new). A Provider already trusts its ingress, load balancer or CDN with all of its customers' traffic. With plain sessions, v5 doesn't defend a connection against the Provider's own edge: a compromised edge can act as the Provider in kcp while sessions last, fake kcp's responses to the Provider, and use the connection secret on control calls. Inner TLS on sessions, proposed on by default, removes the edge from this boundary (see "The Provider's edge: inner TLS on sessions").
 
 v5 makes sure that:
 - **nothing outside these two boundaries** can take over a connection: not a stolen onboarding token, not a compromised portal account on its own (see "Recovery: rebind"), not an observer of logged requests;
 - **no kcp credential ever leaves the PM-side**, so a compromised Provider-side database or edge yields nothing that works against kcp once its sessions are gone;
 - **revocation is immediate**: when the connectors stop proxying, the Provider-side has nothing left to use;
-- **a Provider can't harm PM from within its own workspace**, even though it's admin there: its only path into kcp is the connector, whose authorizer denies the few operations that would affect PM (see "Connector policy").
+- **a Provider can't harm PM from within its own workspace**, even though it's admin there: kcp's maximal permission policy on the connection export keeps connection records read-only for it on any path, and its only path into kcp is the connector, whose authorizer denies the few other operations that would affect PM (see "Connector policy").
 
 **In tunnel mode, trusting kcp is trusting the connection.** The connector decides where every request goes, so the Provider-side can never verify kcp more strongly than it verifies the session. v2 to v4 treated "kcp's CA bundle" as a separate concern; v5 drops it. The Provider-side trusts responses that arrive over an authenticated session, for that connection only.
 
@@ -84,7 +84,7 @@ Provider-side controllers ── client-go, standard http.Transport (real kcp UR
 - **State keyed by `connectionID`** (see "Provider-side: serving many PM instances").
 - **Owner notifications and controls** in the portal: notify the token owner of every registration, rotation and rebind, and let them freeze or delete connections.
 
-Not required: TLS passthrough, client-certificate handling, a CA of the Provider's own, a server key, cert-manager, or any knowledge of kcp's tokens, keys or CAs.
+Not required: TLS passthrough, client-certificate handling at the ingress, a CA of the Provider's own, cert-manager, or any knowledge of kcp's tokens, keys or CAs. With inner TLS on sessions (proposed on by default), the Provider-side also keeps a **server key** in a Secret, generated by the SDK and rotated with overlap.
 
 ## Flow overview
 
@@ -180,7 +180,7 @@ Authorization: Bearer <connection secret>
 - **Secret format**: a prefix plus 256 random bits, e.g. `pmc1_<base64url>`. The prefix lets secret scanners (GitHub, GitLab, gitleaks) recognise leaked secrets. High entropy means a plain SHA-256 is enough to store it; no slow password hash.
 - **Idempotency**, the bounded retry window after token expiry, immutable addressing and no APIExport details at registration: as in v4.
 - **Two kinds of credential, two planes.**
-  - The **connection secret** (bearer) only authenticates control calls, which are rare, and only the connection controller uses it. Bearer is fine here because of the trust boundary: the only hop that sees it is the Provider's own edge, and it grants no kcp access.
+  - The **connection secret** (bearer) only authenticates control calls, which are rare, and only the connection controller uses it. Bearer is fine here because of the trust boundary: the only hop that sees it is the Provider's own edge, and it grants no kcp access. With inner TLS on sessions, control calls move inside the inner TLS and the edge doesn't see it at all.
   - **Session assertions** (signed, minutes) only authenticate sessions. No reusable credential crosses the edge on the session path.
 - **Status is per host, not per shard.** `requiredHosts` lists the front-proxy and the hosts from the endpoint slices the Provider-side actually uses, with whether a live session covers each and reaches kcp. The Provider-side knows which hosts it needs; nobody has to tell it the shard layout.
 
@@ -251,6 +251,82 @@ Each connection pins the **session CA certificate** at registration. Each shard'
 - **Graceful replacement.** The connector replaces sessions before the Provider's edge cuts them at its maximum connection age: it opens a new session, then tells the Provider-side to stop opening streams on the old one (the multiplexer's go-away, where available) and closes it once in-flight requests finish. An abrupt cut by the edge still drops all watches on that session at once, as with any apiserver connection.
 - **Why not a dial proxy to kcp** (remotedialer or Konnectivity as used in v1 to v4): there the stream carried opaque TLS from the Provider-side to kcp, so the Provider-side had to hold kcp credentials and trust kcp's CA. In v5 the same kind of stream ends at the connector's HTTP server, which owns both.
 
+### The Provider's edge: inner TLS on sessions
+
+Moving the kcp credential to the PM-side moves the authority from a credential onto the session: whoever holds the Provider's end of a session can act as the Provider in kcp. With sessions on a plain WebSocket, that end is the Provider's **inbound edge**, where the outer TLS ends, not its runtime. This section makes that explicit and proposes closing it.
+
+**Today, before and after** (`══` encrypted, `──` plain):
+
+```
+TODAY: RFC 006 static kubeconfig (baseline)
+
+  Provider cluster                                      PM
+  ┌─────────────────────────────────┐
+  │ controllers                     │
+  │   holds: admin SA token         │══ TLS, end to end, outbound ══▶ front-proxy / shard VW ──▶ kcp
+  │                                 │
+  │ ingress / CDN (inbound)         │   not on this path
+  └─────────────────────────────────┘
+
+  acts as the Provider in kcp:    whoever holds the token (the Provider's runtime)
+  can fake kcp to the Provider:   nobody (TLS to kcp's serving certificates)
+```
+
+```
+BEFORE: plain sessions (the edge is inside the Provider's trust boundary)
+
+  PM                                        │ internet │   Provider
+                                            │          │  ┌───────────────── trust boundary ─────────────────┐
+  kcp ◀── APIExport VW ◀══TLS══ connector ══╪═ outer TLS (WebSocket) ══▶ ingress/CDN ──▶ SDK ──▶ controllers │
+                              adds SA token │          │  │               outer TLS ends                       │
+                                            │          │  │               ◀── multiplexer + plain HTTP ──▶     │
+                                            │          │  │               readable and writable here          │
+                                            │          │  └────────────────────────────────────────────────────┘
+
+  acts as the Provider in kcp:    the runtime, or the ingress/CDN (by opening its own streams)
+  can fake kcp to the Provider:   the ingress/CDN
+  sees the connection secret:     the ingress/CDN (control calls are plain HTTPS)
+```
+
+```
+AFTER: inner TLS on sessions (the edge is outside the trust boundary)
+
+  PM                                        │ internet │   Provider
+                                            │          │                           ┌──── trust boundary ────┐
+  kcp ◀── APIExport VW ◀══TLS══ connector ══╪═ outer TLS (WebSocket) ══▶ ingress/CDN ──▶ SDK ──▶ controllers │
+                              adds SA token │          │                outer TLS  │                         │
+                                            │          │                 ends here │                         │
+                                connector ══╪═ inner TLS 1.3 ════════════════════════▶ SDK                    │
+                                            │  client: shard certificate (chains to the pinned session CA)   │
+                                            │  server: pinned server key                                     │
+                                            │    ╚═ multiplexer + plain HTTP, inside the inner TLS           │
+                                            │          │                           └─────────────────────────┘
+
+  ingress/CDN sees:               opaque bytes
+  acts as the Provider in kcp:    the runtime only
+  can fake kcp to the Provider:   nobody without a shard certificate (PM's side)
+  sees the connection secret:     nobody (control calls move inside the inner TLS too)
+```
+
+**Why the edge matters, even though Providers usually trust it:**
+- **The edge is often someone else's.** A third-party CDN or WAF, or a central platform team's shared ingress that the service team doesn't control. In-cluster ingress controllers often hold cluster-wide access to Secrets and serve many tenants; vulnerabilities in them have allowed remote code execution (ingress-nginx's "IngressNightmare", 2025).
+- **Edges keep data without anyone being malicious.** WAFs inspect bodies, CDNs sample and log requests, and people capture traffic while debugging.
+- **Compliance.** Some regulated Providers must keep certain data encrypted end to end, or out of a third party's jurisdiction.
+- **It's PM's consumers' data.** Today a Provider's reconcile traffic goes outbound to PM and never crosses its inbound edge. With plain sessions it does: consumers' objects for the Provider's APIs, and whatever the export claims in their workspaces. Consumers trust the Provider to process that data; they didn't choose its CDN.
+- **PM can't check it.** "The Provider's edge is the Provider's responsibility" is an assumption PM would place on every Provider, and some can't meet it.
+
+**Design.**
+- **Sessions.** The upgrade stays as described above, with the session assertion in the outer `Authorization` header. Inside the WebSocket, the connector and the Provider SDK run a TLS 1.3 handshake. The connector's client certificate is its shard certificate; the SDK verifies its chain as in "Session credentials" and requires it to be the same certificate as the assertion's `x5c` leaf, which binds the inner handshake to the assertion's connection and `cluster`. The SDK's server certificate is self-signed for its **server key**; the connector checks it against the connection's pinned server keys. The multiplexer runs inside the inner TLS. Shard certificates need EKU `clientAuth` in addition to signing.
+- **Server keys.** The Provider-side returns `serverKeys` in the `POST` response, as in v4. The controller writes them into the connection record, so stateless connectors can read them; the record is PM-written only (see "Connector policy"). The list allows rotation with overlap: the Provider-side announces a new key in `GET`, the controller updates the record, the Provider-side retires the old key after the overlap. A controller that missed the whole overlap re-reads them from `GET /v1/connections/{id}/server-keys` (web PKI), as trustworthy as registration.
+- **Control calls.** The controller makes them on a control session: the same WebSocket and inner TLS, server key pinned, with the connection secret still sent as a bearer, now inside the inner TLS. Only `POST /v1/connections`, `POST …/rebind` and `GET …/server-keys` stay plain HTTPS; they carry the onboarding token (spent) and public material only.
+- **TLS layers.** Three on traffic between the Provider's runtime and kcp: inner (runtime ↔ connector), outer (connector ↔ edge, around the inner) and connector ↔ kcp. The extra layer's CPU cost is small next to the virtual workspace's decoding.
+
+**What it costs.** The Provider SDK terminates TLS inside the WebSocket and pins keys in both directions (v4's verification helper, without token or CA-bundle handling); the Provider-side keeps a server key in a Secret, which the SDK can generate, and rotates it with overlap; the record gains `serverKeys`; one more handshake per session. Nothing changes in the connector's proxy half, the policy, revocation, the connection export, rebind or per-shard sessions.
+
+**What it gives.** The authority to act as the Provider in kcp, the integrity of kcp's responses to the Provider, the connection secret and PM consumers' data never cross the Provider's edge readable. That holds by construction instead of depending on each Provider's infrastructure, and it closes the lock-out path through the edge without signed control calls.
+
+**Proposal: on by default.** The cost falls mostly on SDK code PM writes once. A per-connection opt-out for Providers that explicitly accept their edge is possible, but shouldn't be built until someone needs it: one mode is simpler to test and reason about. Whether to make it the default, or required, is a decision for the TSC (see "Open items"); the rest of these notes describe plain sessions unless they say otherwise.
+
 ### The connector as an authenticating proxy
 
 For every request arriving over a session of connection `{id}`:
@@ -267,13 +343,20 @@ For every request arriving over a session of connection `{id}`:
 
 ### Connector policy: what an admin Provider can't do
 
-The Provider is admin in its provider workspace (RFC 006) and free to deploy whatever it needs, so PM doesn't restrict its RBAC there. But in v5 the connector is the Provider's **only path into kcp**: the Provider-side holds no kcp credentials, and every request it makes passes through the connector's handler chain. The connector's authorizer therefore applies a small **denylist** on top of the Provider's RBAC, for the connection principal:
+The Provider is admin in its provider workspace (RFC 006) and free to deploy whatever it needs, so PM doesn't restrict its RBAC there. But in v5 the connector is the Provider's **only path into kcp**: the Provider-side holds no kcp credentials, and every request it makes passes through the connector's handler chain. Two mechanisms apply on top of the Provider's RBAC.
+
+**Connection records: kcp's maximal permission policy.** Records must stay PM-written, so the Provider can't redirect connectors or take another connection's identity. This doesn't need the connector: the connection export sets `maximalPermissionPolicy.local`, and kcp checks every request to a resource bound from that export against RBAC in **PM's export workspace**, with the user and groups prefixed `apis.kcp.io:binding:` (`kcp/pkg/authorization/maximal_permission_policy_authorizer.go`). The check runs in each shard's authorizer chain before local RBAC, so admin in the provider workspace doesn't bypass it, and the Provider has no rights in the export workspace to widen it. PM grants there:
+- `get`, `list`, `watch` on `providerconnections` to the group `apis.kcp.io:binding:system:authenticated`;
+- writes (`create`, `update`, `patch`, `delete`, `deletecollection`, including `/status`) only to `apis.kcp.io:binding:<connection controller user>`, and to any other PM component that writes records.
+
+kcp's own e2e test shows the pattern: a consumer-workspace admin is refused a write the export's policy doesn't grant (`kcp/test/e2e/apibinding/maximalpermissionpolicy_authorizer_test.go`, `TestMaximalPermissionPolicyAuthorizer`). Because kcp enforces it, it holds on every path, including a leaked connector SA token, and the connector's authorizer needs no rule for records (observation 19).
+
+**Everything else: the connector's denylist.** The policy only covers resources served by the export, not `apis.kcp.io` system resources or core resources. For those, the connector's authorizer applies a small **denylist** for the connection principal:
 
 | Denied | Why |
 |---|---|
-| Any write (`create`, `update`, `patch`, `delete`, `deletecollection`) to `providerconnections` | Records stay PM-written: the Provider can't redirect connectors or take another connection's identity |
-| `update`, `patch` and `delete` on the connection export's APIBinding (a fixed name, set by the Provider controller) | The Provider can't drop the binding or reject its permission claim |
-| Writes to `apiexportendpointslices/status` | kcp maintains that status; forging it is the only way to make connectors open sessions on shards without consumers |
+| `update`, `patch` and `delete` on the connection export's APIBinding (a fixed name, set by the Provider controller) | The Provider can't drop the binding or reject its permission claim. Deleting the binding also deletes the records, and with them the policy's protection |
+| Writes to `apiexportendpointslices/status` | kcp maintains that status; forging it is the only way to make connectors open sessions on shards without consumers. kcp's system-CRD authorizer only protects the status of `apiexports` and `apibindings` |
 | `create` on `serviceaccounts/token` | No TokenRequest: the Provider never gets a kcp credential it could keep |
 | `create` on `certificatesigningrequests`, and their approval | Closes the other route to a credential, if kcp signs CSRs |
 | Upgrade requests (`exec`, `attach`, `port-forward`) | Not needed to reconcile an APIExport |
@@ -281,7 +364,7 @@ The Provider is admin in its provider workspace (RFC 006) and free to deploy wha
 
 Everything else, the Provider's own exports, schemas, endpoint-slice specs, RBAC and arbitrary resources, passes through unchanged, subject to its admin RBAC.
 
-**The invariant this rests on: the connector is the Provider's only path to kcp.** That makes these requirements:
+**The invariant the denylist rests on: the connector is the Provider's only path to kcp.** Record protection doesn't depend on it. That makes these requirements:
 - **No static kubeconfig for remote Providers**: RFC 006's kubeconfig Secret is not generated or handed out for them.
 - **No token minting through the proxy**: the TokenRequest and CSR rules above, plus legacy SA-token Secrets if kcp issues them (see "Open items").
 - **`direct` mode, if ever added, goes through the same connector virtual workspace**, so it hits the same authorizer.
@@ -290,7 +373,7 @@ Everything else, the Provider's own exports, schemas, endpoint-slice specs, RBAC
 **Implementation notes:**
 - The authorizer needs the original request's group, resource, subresource, verb, name and cluster, for both kcp path shapes the Provider uses: `/clusters/<id>/…` through the front-proxy and `/services/apiexport/…` through a shard's virtual workspace. The generic request-info parser doesn't understand kcp's cluster prefix, so use kcp's resolver or parse both shapes explicitly.
 - The denylist is the security guarantee, so it needs thorough tests, including every verb and both path shapes. Denied attempts are audited.
-- The owner and every other kcp user reach the provider workspace through the front-proxy with their own credentials, outside this policy. The owner has no rights in the provider workspace; only PM's own components and the Provider (admin, through the connector) do.
+- The owner and every other kcp user reach the provider workspace through the front-proxy with their own credentials, outside the denylist but still under the export's policy. The owner has no rights in the provider workspace; only PM's own components and the Provider (admin, through the connector) do.
 
 ### Connector implementation: a virtual workspace
 
@@ -368,11 +451,31 @@ The three kinds of bindings involved, and which one decides what:
 | Carries | `Provider`, `ProviderOnboardingRequest`; the connection Secret sits next to them | one `ProviderConnection` record per connection | the Provider's own services |
 | Exported by | PM | PM | the Provider-side, from `:root:providers:<Provider name>-<Suffix>` |
 | Bound in | the owner's workspace, `:root:orgs:<Org>:<User>` | each provider workspace, by the Provider controller | consumers' workspaces, on any shard |
-| Written by | the owner (request), PM (status) | PM only, through the export. The Provider is admin in its workspace, but the connector policy denies it writes to records | the Provider (exports), consumers (bindings) |
+| Written by | the owner (request), PM (status) | PM only, through the export. The Provider is admin in its workspace, but the export's maximal permission policy denies it writes to records | the Provider (exports), consumers (bindings) |
 | Read by | the connection controller | every shard's connector, through the export's endpoint slice | kcp, which lists the shards with bindings in each Service endpoint slice; connectors read those slices through (2)'s permission claim |
 | Decides | nothing about sessions | where the front-proxy session lives (the shard hosting the record) | where endpoint sessions live (shards listed in the slices) |
 
 **Load.** In today's direct model, a Provider's endpoint traffic (wildcard LIST and WATCH per resource, per-workspace reads and writes) goes straight to each shard's virtual workspace; only its workspace traffic (the endpoint slice and a few objects) uses the front-proxy. v5 sends the same requests to the same targets with the same SA identity, so kcp's load doesn't change; connections to kcp now come pooled from the connectors instead of from each Provider. What's added is a hop: every request and response byte passes a connector, which parses HTTP, authorizes, audits, injects the token and copies the response, including watch streams held for hours. Each watch holds two streams on the connector, roughly a few goroutines and a 32 KB copy buffer each. Per shard, this is the same shape as the virtual-workspace load kcp already carries, plus the per-request L7 overhead. Any NAT-traversing design adds a hop; v4's is an L4 byte copy (see the [comparison](./xxx-notes-011-provider-onboarding-flow-improvements-v4-v5-comparison.md)).
+
+**Compared with the standard flow through the APIExport virtual workspace** (kcp `ee9e6f3f3`, read on 2026-10-12): the connector sits in front of a hop that already exists, and that hop is the heavier of the two.
+
+| | Standard flow | v5 |
+|---|---|---|
+| Requests reaching the shard's virtual workspace and the shard | per Provider × resource × shard | the same |
+| Identity kcp sees | the Provider's SA token | the same token, added by the connector |
+| The virtual workspace's work | full handler chain; `apiexports/content` checked by a SubjectAccessReview against kcp (`pkg/virtual/apiexport/authorizer/content.go`); every watch opens its own watch on the shard and decodes each event into `Unstructured` and re-encodes it (`virtual-workspace-framework/pkg/forwardingregistry/store.go`) | unchanged |
+| Extra hop | none | the connector, on the same shard: session authentication and policy checks, both local; an audit entry; header rewrites; bytes streamed without decoding objects |
+| Per long-running watch on the extra hop | — | two streams, a few goroutines and a 32 KB copy buffer each |
+| Connections into PM | one per Provider and host, inbound; kcp's endpoints must be reachable from the Provider | none inbound; one outbound WebSocket per (connection, shard) |
+| Bytes over the internet | LIST and WATCH payloads | the same, plus multiplexer framing |
+| Extra calls to kcp | none | one TokenRequest per connection at half the token's TTL |
+
+**In short: two virtual workspaces in a chain.** The `providerconnections` virtual workspace is a client of the APIExport virtual workspace, the way the Provider is today. It carries exactly the watches its shard's APIExport virtual workspace already serves to remote Providers, scales one-to-one with it, and does less per watch: no object decoding and no calls to kcp per request. The per-watch goroutines, buffers and flow-control windows are the kind the APIExport virtual workspace already pays; v5 adds a second, lighter copy of them. Front-proxy traffic follows the same pattern: connector → front-proxy → shard instead of Provider → front-proxy → shard.
+
+What's really different is small:
+- **Backpressure runs through the multiplexer.** Today a slow Provider is throttled by TCP and HTTP/2 flow control towards the APIExport virtual workspace. In v5 it has to be throttled through the multiplexer streams inside the WebSocket, which works only if the multiplexer applies flow control per stream (see "Open items").
+- **The long-lived connections change direction**: one outbound WebSocket per (connection, shard) instead of the Provider's inbound HTTP/2 connections.
+- **Configuration of the second hop**: the timeout settings for proxied LISTs and watches, and whether it counts toward `X-Kcp-Virtual-Resource-Hops`.
 
 **What per-shard gives:**
 - **Load scales with shards**, as virtual-workspace servers already do.
@@ -392,7 +495,7 @@ The three kinds of bindings involved, and which one decides what:
    - **`ProviderConnection` records**: every object arrives with its logical cluster, which is the provider workspace's `clusterID`. So the `clusterID → (connectionID, base URL)` mapping is just the informer's index, and which endpoint delivered the record tells the connector which shard hosts the workspace;
    - **the connections' Service `apiexportendpointslices`**, read-only, through the export's **permission claim**. That's how the connector learns which shards have consumers, without any shard-wide read of APIBindings.
 
-   The records are written only by PM through the export. The Provider stays admin in its workspace, as in RFC 006, but it reaches kcp only through the connector, whose policy denies writes to records, to the connection export's binding and to endpoint-slice status (see "Connector policy"). So neither the owner nor the Provider can change the URL connectors dial, drop the binding or forge which shards have consumers. The owner has no rights in the provider workspace at all. The export claims nothing else in the provider workspace. An outage of one shard's virtual workspace only freezes the records and slices from that shard; informers keep the last state.
+   The records are written only by PM through the export. The Provider stays admin in its workspace, as in RFC 006, but the export's maximal permission policy denies it writes to records, and it reaches kcp only through the connector, whose policy denies writes to the connection export's binding and to endpoint-slice status (see "Connector policy"). So neither the owner nor the Provider can change the URL connectors dial, drop the binding or forge which shards have consumers. The owner has no rights in the provider workspace at all. The export claims nothing else in the provider workspace. An outage of one shard's virtual workspace only freezes the records and slices from that shard; informers keep the last state.
 4. **SA tokens.** Each shard's connector mints tokens for the connection's SA through TokenRequest via the front-proxy, since the SA lives in the provider workspace on one shard. All shards trust all shards' signing keys (v4 finding 3), so those tokens work against every shard's virtual workspace.
 5. **Front-proxy traffic on any session.** Workspace traffic goes through the front-proxy today anyway, and the front-proxy routes it to the right shard, so every session may carry it. The hosting shard's session (point 1) guarantees there's always one, even before any consumer binds; that's what lets the Provider watch its own exports and slices from the start. Which shard that is comes from the connection export itself, not from any lookup.
 6. **Provider-side routing.** The dial hook picks a session by target host: the front-proxy can use any session; a shard's virtual-workspace host uses that shard's sessions. Because sessions open by the same rule that puts shards into endpoint slices, a URL can briefly appear in a slice before its session is up; client-go retries. The Provider-side multi-replica problem gets more pressing: sessions for different shards can land on different Provider replicas, while a replica running the endpoint-slice providers needs all of a connection's hosts. Lease routing between replicas, or reconciliation sharded by connection with forwarding.
@@ -489,9 +592,9 @@ v4 has no way back after a lost connection key without a recent backup: a new co
 | Session CA key (root of a generation) | one generation, rolled over with overlap | Control plane (cert-manager issuer; ideally KMS or Vault) | Issuing shard certificates: sessions for every connection on every shard, with fake data, until that generation is unpinned everywhere or expires. No control calls, no kcp access. The control plane already holds every connection secret, so this doesn't widen a control-plane compromise. |
 | Intermediate key (if used) | short (e.g. weeks) | Control plane | Same as the root's, until the intermediate expires: nothing revokes it. |
 | Session assertion | minutes | On the wire only | Bound to one connection; a `jti` cache stops replays within its validity. Useless at any other Provider. |
-| SA token | minutes to hours | Connector memory only | Admin access to the provider workspace (RFC 006) and its exports' virtual workspaces until it expires, without the connector policy in the way. Only reachable by compromising a connector; never sent to the Provider-side. |
+| SA token | minutes to hours | Connector memory only | Admin access to the provider workspace (RFC 006) and its exports' virtual workspaces until it expires, without the connector's denylist in the way. Records stay read-only (maximal permission policy). Only reachable by compromising a connector; never sent to the Provider-side. |
 | Provider-side runtime | — | Provider-side | Whatever its open sessions allow: kcp requests within its admin RBAC in its own workspace, minus the connector policy, while the sessions last. Nothing persistent: there's no kcp credential to exfiltrate, and the policy refuses minting one. Ends when the PM-side closes the sessions. |
-| Provider's edge (ingress, CDN) | — | Provider's infrastructure | Sees the onboarding token (spent), the connection secret on rare control calls, short-lived session assertions, and the reconcile traffic. Within the Provider's trust boundary, like the rest of its customers' traffic. |
+| Provider's edge (ingress, CDN) | — | Provider's infrastructure | **Plain sessions:** sees the onboarding token (spent), the connection secret on control calls, session assertions and the reconcile traffic, including PM consumers' data. A compromised edge can act as the Provider in kcp while sessions last (by opening its own streams), fake kcp's responses to the Provider, and use the connection secret to lock the owner out, swap the session CA or delete the connection. No kcp access beyond the sessions PM opens. **Inner TLS on sessions:** sees the spent onboarding token and opaque bytes. |
 
 ### Threat model: what moved
 
@@ -499,10 +602,10 @@ Compared to v4's threat model:
 - **The control plane** is now the highest-impact target: it holds every connection secret and the session CA. It's one component, not on the traffic path, so it can be locked down and kept small.
 - **A connector** holds only its shard certificate (hours) and mints SA tokens. A compromised connector exposes that shard's sessions and traffic until its certificate expires, can't make control calls, and has no persistent secret to steal.
 - **The owner's workspace**: same exposure as v4, with a bearer secret instead of a private key, limited to one connection. Secret scanning catches dumps and commits of the prefixed secret; v4's PEM keys are only caught by generic rules.
-- **The Provider's edge** sees short-lived session assertions, the connection secret on rare control calls, and the reconcile traffic; v4's edge saw only handshake signatures. That's acceptable because of the trust boundary. Signing control calls too would remove the last bearer credential (see "Open items"); the edge would still see reconcile traffic.
+- **The Provider's edge**, with plain sessions, holds the Provider's end of every session: it can act as the Provider in kcp while sessions last, fake kcp's responses, read PM consumers' data, and use the connection secret. v4's edge saw only handshake signatures. Compared with today's RFC 006 kubeconfig, where the Provider's runtime holds a long-lived credential and its inbound edge isn't on the path, the exposure is shorter but adds a party. Inner TLS on sessions takes the edge out again (see "The Provider's edge: inner TLS on sessions").
 - **A compromised Provider-side** loses most of its value: there's no kcp token to take away. v1 to v4 all left a usable kcp token behind.
 - **Owners** see only aggregate conditions; connection records live in provider workspaces, and the session CA and shard certificates in the control plane, all outside owners' workspaces.
-- **The Provider** is admin in its provider workspace and can see its own record, but the connector policy denies it any write to the record, the connection export's binding, endpoint-slice status, and token or certificate minting. That holds as long as the connector is its only path to kcp (see "Connector policy"). The connection export's only claim is read-only access to the workspace's endpoint slices.
+- **The Provider** is admin in its provider workspace and can see its own record, but kcp denies it any write to the record (the connection export's maximal permission policy, on any path), and the connector policy denies it changes to the connection export's binding, endpoint-slice status, and token or certificate minting. The latter holds as long as the connector is its only path to kcp (see "Connector policy"). The connection export's only claim is read-only access to the workspace's endpoint slices.
 
 ### Resources
 
@@ -545,10 +648,46 @@ spec:
     - name: providerconnections                      # served by this export
       group: connections.platform-mesh.io
       # …schema reference
+  maximalPermissionPolicy:
+    local: {}                                        # RBAC below, in this workspace, caps every binding workspace
   permissionClaims:
     - group: apis.kcp.io
       resource: apiexportendpointslices
       verbs: [ get, list, watch ]                    # read-only; the export's only claim
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole                                    # in the export's workspace
+metadata:
+  name: connections-mpp-read
+rules:
+  - apiGroups: [ connections.platform-mesh.io ]
+    resources: [ providerconnections ]
+    verbs: [ get, list, watch ]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: connections-mpp-read
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: connections-mpp-read }
+subjects:
+  - { apiGroup: rbac.authorization.k8s.io, kind: Group, name: "apis.kcp.io:binding:system:authenticated" }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole                                    # in the export's workspace
+metadata:
+  name: connections-mpp-write
+rules:
+  - apiGroups: [ connections.platform-mesh.io ]
+    resources: [ providerconnections, providerconnections/status ]
+    verbs: [ create, update, patch, delete, deletecollection ]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: connections-mpp-write
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: connections-mpp-write }
+subjects:
+  - { apiGroup: rbac.authorization.k8s.io, kind: User, name: "apis.kcp.io:binding:<connection controller user>" }
 ---
 apiVersion: connections.platform-mesh.io/v1alpha1
 kind: ProviderConnection                             # in the provider workspace :root:providers:<name>-<suffix>
@@ -558,10 +697,11 @@ spec:
   connectionID: "..."
   url: https://provider.example.com/pm               # validated against the egress rules
   serviceAccount: { namespace: ..., name: ... }      # the SA the Provider controller created in this workspace
+  serverKeys: [ "<PEM SPKI>", ... ]                  # with inner TLS on sessions: the Provider-side's pinned server keys
 ```
 
 - **No `clusterID` field**: the record's logical cluster is the provider workspace. The front-proxy URL is deployment configuration. The SA is named explicitly, because RFC 006 doesn't fix its name (pm-operator derives it from a prefix and the provider suffix).
-- **RBAC**: the connection controller writes records through the export's virtual workspace; connectors get read-only `apiexports/content`. The Provider's SA stays admin in its workspace, as in RFC 006; the connector policy, not RBAC, keeps it from writing records or the binding.
+- **RBAC**: the connection controller writes records through the export's virtual workspace; connectors get read-only `apiexports/content`. The Provider's SA stays admin in its workspace, as in RFC 006; the export's maximal permission policy keeps it from writing records, and the connector's denylist keeps it from changing the binding.
 
 **How the request treats `provider.name`**:
 
@@ -588,7 +728,8 @@ spec:
 | Shard removed | Its connector goes away with it; the Provider-side drops the sessions; endpoint slices stop listing the shard. |
 | First consumer binding on a shard | kcp adds the shard to the endpoint slice; that shard's connector sees it through the permission claim and dials. The Provider may briefly see the URL before the session is up; client-go retries. |
 | Last binding on a shard removed | kcp drops the shard from the slice; that shard's connector closes the session after a grace period. |
-| Provider tries to edit its record, drop the binding, forge endpoint-slice status or mint a token | The connector's authorizer denies it, and the attempt is audited. |
+| Provider tries to edit its record | kcp denies it (the connection export's maximal permission policy), and kcp's audit log records it. |
+| Provider tries to drop the binding, forge endpoint-slice status or mint a token | The connector's authorizer denies it, and the attempt is audited. |
 | Connection export's binding or record lost anyway (e.g. PM operator error) | Connectors drop that connection's sessions; the controller reports `SessionsConnected=False` and recreates them. |
 | A record points at the wrong connection (PM-side bug) | The `cluster` claim doesn't match the `clusterID` the Provider-side stored at registration, so it refuses the session. |
 | Shard certificate expires or renews | cert-manager renews it, with a new key, under the same pinned CA; the connector picks up the new files. Nothing reaches the Provider's control API. |
@@ -640,6 +781,11 @@ New observations (2026-10-08/09):
     - **APIExport virtual workspace, standalone server.** It uses the upstream default handler chain, without kcp's gatekeeper or scoping, and the `impersonate` check goes to the APIExport virtual workspace's authorizer (`pkg/virtual/apiexport/builder/build.go`, `newAuthorizer`). For per-cluster requests, `boundAPIAuthorizer` only allows resources bound or claimed in the consumer's APIBinding, so impersonating `serviceaccounts` is denied (`pkg/virtual/apiexport/authorizer/binding.go`). For wildcard requests, the content authorizer checks `impersonate` on `apiexports/content` without looking at the impersonation target (`content.go`), and the maximal-permission authorizer allows unclaimed resources (`maximal_permission_policy.go`). Granting that verb would let the caller impersonate any user or group, including `system:masters`, which the virtual-workspace server always allows (`virtual-workspace-framework/pkg/options/authorization.go`).
 17. **`ClusterCachedResource` replicates per workspace, but a shared identity makes one cache-wide set.** A `ClusterCachedResource` publishes objects of one GVR from the workspace it lives in into the cache server (`pkg/reconciler/cache/clustercachedresources`). Workspaces that use the same identity key land in one set that can be listed and watched across all workspaces and shards in one call, `<resource>:<identityHash>` (`test/e2e/cache/replication_api_cache_test.go`, `TestReplicationWithWildcardListing`). Reads also work, read-only, through the replication virtual workspace (`pkg/virtual/replication`), authorized by `apiexports/content` on an APIExport whose resource has virtual storage pointing at a `ClusterCachedResourceEndpointSlice`. It was considered for connection discovery and dropped in favour of the connection export (see "Rejected alternatives").
 18. **kcp-operator gives `VirtualWorkspace` servers the cache-server credentials when an external cache server exists.** PM runs an external `CacheServer` that the root shard and shards reference (`pm-helm-charts/charts/infra/templates/kcp/cache-server.yaml`, `root-shard.yaml`, `shards.yaml`). kcp-operator then mounts the cache-server kubeconfig and client certificate into every `VirtualWorkspace` deployment and passes `--cache-kubeconfig` (`kcp-operator/internal/resources/compiledvirtualworkspace/deployment.go`, with a TODO to make it optional). It's presumably the same credential kcp's own components use, so it's far broader than a connector needs. PM's existing virtual-workspaces server, deployed as a plain Helm Deployment, has no cache access.
+19. **An APIExport's maximal permission policy caps even an admin of the binding workspace** (kcp `ee9e6f3f3`, read on 2026-10-11; not tested for this export).
+    - **Shard side.** `MaximalPermissionPolicyAuthorizer` runs in each shard's authorizer chain before bootstrap, local and global RBAC (`pkg/server/options/authorization.go`). For a resource listed in an APIBinding's `status.boundResources`, it checks RBAC in the export's workspace with the user name, groups and warrants prefixed `apis.kcp.io:binding:` (`pkg/authorization/maximal_permission_policy_authorizer.go`, `PrefixUser` in the vendored `pkg/registry/rbac/validation/kcp.go`). If the export has no local policy, or no longer exists, the check is skipped. `system:masters` bypasses the chain.
+    - **Writes through the APIExport virtual workspace.** Per-cluster requests are forwarded impersonating the caller, plus a warrant for a local admin SA (`pkg/virtual/apiexport/builder/build.go`). The shard authorizes each effective user separately and accepts the first allow (`pkg/authorization/warrants.go`, `WithWarrantsAndScopes`), so granting `apis.kcp.io:binding:<controller user>` should be enough. Granting `apis.kcp.io:binding:system:kcp:admin`, as kcp does for its own root exports (`config/root/clusterrolebinding-kcp-admin-maximal-permission-policy.yaml`), would work too but is broader. Wildcard requests use the virtual workspace's own client.
+    - **Evidence.** `test/e2e/apibinding/maximalpermissionpolicy_authorizer_test.go`, `TestMaximalPermissionPolicyAuthorizer`: the export grants `*` on `cowboys` only to `apis.kcp.io:binding:system:authenticated`; a consumer-workspace admin can create cowboys but is refused `UpdateStatus`. The same test shows that deleting the APIBinding deletes the bound resources. No e2e test covers writes through the APIExport virtual workspace to an export with a policy.
+    - **Not covered.** The policy only applies to resources the export serves. Claimed resources and `apis.kcp.io` system resources (the binding itself, `apiexportendpointslices/status`) stay outside it, and kcp's system-CRD authorizer only protects `apibindings/status` and `apiexports/status` (`pkg/authorization/system_crd_authorizer.go`).
 
 ## Comparison
 
@@ -649,7 +795,7 @@ New observations (2026-10-08/09):
 | Blast radius of a leaked PM-side credential | One connection | One connection | One connection's control calls (connection secret); one shard's sessions for hours (shard certificate) |
 | Provider-side authenticated by | Web PKI | Web PKI, then a pinned server key | Web PKI |
 | kcp credentials on the Provider-side | SA token + CA bundle | SA token + CA bundle | **None** |
-| What a TLS-terminating edge sees | Secret, first access token | Spent onboarding token only | Spent onboarding token, connection secret on control calls, short-lived assertions, reconcile traffic (Provider's own edge) |
+| What a TLS-terminating edge sees | Secret, first access token | Spent onboarding token only | Plain sessions: spent onboarding token, connection secret on control calls, short-lived assertions, reconcile traffic. Inner TLS on sessions: spent onboarding token, opaque bytes |
 | Tunnel | Dial proxy (remotedialer/Konnectivity) | Dial proxy inside inner TLS | Multiplexed streams over WebSockets, at most one per (connection, shard) where there's traffic, ending at that shard's connector |
 | TLS layers on kcp traffic | 2 | 3 | 2 (outer to the Provider, connector to kcp) |
 | Revoking kcp access | Token TTL (finding 2) | Token TTL (finding 2) | Immediate: sessions closed (the connector policy refuses minting tokens to keep) |
@@ -660,7 +806,7 @@ New observations (2026-10-08/09):
 | PM-side components | Connector | Connector | Connection controller (stateful) + per-shard connectors (stateless) |
 | Owner sees PM's shard layout | No | No | No |
 | Provider-side software | Bearer check, token handling, dial-proxy server | TLS over WebSocket, pinning, CA checks, token handling | Bearer check, assertion and chain verification, multiplexer server, a dial hook for the standard transport |
-| Main cost | Security holes | Complexity | Connectors in the L7 data path; a session CA to run |
+| Main cost | Security holes | Complexity | A second, lighter virtual-workspace hop for remote Providers' traffic; a session CA to run |
 
 ## Changes from v4
 
@@ -668,7 +814,7 @@ New observations (2026-10-08/09):
 |---|---|---|
 | Provider-side holds access tokens and kcp's CA bundle | Connectors inject SA tokens; Provider-side holds no kcp credentials | Removes credential delivery, refresh, CA bundle handling, and finding 2 for remote `Provider`s |
 | Dial proxy, end-to-end TLS to kcp | Streams over the sessions end at the connectors' HTTP reverse proxy | The connector must see requests to inject credentials; observation 12 |
-| Inner mTLS inside the WebSocket | Plain WebSocket over HTTPS | Provider's edge is the Provider's responsibility; nothing at the edge works against kcp |
+| Inner mTLS inside the WebSocket, authenticated by the connection key | Plain WebSocket over HTTPS; proposed: inner TLS on sessions again, authenticated by the shard certificate and a pinned server key | Nothing at the edge works against kcp; inner TLS keeps the edge from acting as the Provider through a session, without the connection key or credential delivery |
 | Pinned server key, rotation and refetch | Web PKI on the base URL | Only needed against an untrusted Provider edge |
 | Pinned per-connection key, proven in inner mTLS, rotated via `PUT /key` | Connection secret for control calls; session assertions with shard certificates from a pinned session CA | Without inner TLS a key needs a separate proof format; a CA takes all registration off the session path |
 | No re-onboarding; lost key means lost state | Rebind with a waiting period, cancelled while the connection secret exists | Recovery without letting outsiders take over |
@@ -679,7 +825,7 @@ New observations (2026-10-08/09):
 
 All of v4's rejected alternatives still apply, except "a PM-owned front key, with the connector terminating TLS", whose objection (the connector sees plaintext) doesn't hold: the connector is PM-side infrastructure seeing traffic to PM's own kcp, which the front-proxy sees in plaintext anyway. v4's rejection of "a dedicated PM connections CA as the only anchor" doesn't apply to v5's session CA, which only authorizes sessions (see "Session credentials"). In addition:
 
-- **v4's inner mTLS with its pinned connection key.** Correct, but the inner mTLS only defends against the Provider's own edge, and without it a pinned key needs a separate proof format. Too much machinery for that threat.
+- **v4's inner mTLS with its pinned connection key.** The pinned connection key as the session proof stays rejected: sessions are authenticated by shard certificates from the session CA. The inner TLS itself is proposed again, with the shard certificate as client certificate (see "The Provider's edge: inner TLS on sessions"), because without it the Provider's edge holds the authority sessions carry.
 - **A dial proxy with credentials on the Provider-side (v1 to v4).** Forces credential delivery, refresh and kcp CA trust onto every Provider, and leaves a usable kcp token behind on every Provider-side compromise.
 - **The connector impersonating with general impersonation rights.** Avoids minting per-connection tokens, but broad impersonation rights are wider than TokenRequest on specific SAs, and a header-stripping bug would become privilege escalation.
 - **The connector impersonating the connection's SA, scoped by `resourceNames`.** Narrow and verified to work for requests to the provider workspace, but not for the APIExport virtual workspace, which carries most Provider traffic (observation 16). Tokens are needed there anyway.
@@ -697,8 +843,8 @@ All of v4's rejected alternatives still apply, except "a PM-owned front key, wit
 - **Connection records replicated through the cache** (a `ClusterCachedResource` with a shared identity, observation 17). Needs a `ClusterCachedResource` and a shared identity key per provider workspace, and cache-server access for connectors, which in kcp-operator deployments means credentials far broader than they need (observation 18).
 - **Annotations on the provider workspace's `Workspace` object in `:root:providers`.** No new API, but untyped, all on one shard, and finding the hosting shard needs a separate lookup.
 - **Every shard's connector opening a session for every connection.** N connections × N shards sessions, mostly idle. Following kcp's own rule for endpoint slices opens only the ones that carry traffic.
-- **Scoping the Provider's RBAC in its provider workspace**, so it can't write records or the binding. PM doesn't know what a Provider needs to deploy, so the Provider stays admin (RFC 006); the connector policy denies the few operations that matter to PM instead.
-- **Signed connection records**, so connectors can detect a record the Provider edited. Unnecessary once the connector policy denies writes to records; it would add a signing key and verification for no extra protection.
+- **Scoping the Provider's RBAC in its provider workspace**, so it can't write records or the binding. PM doesn't know what a Provider needs to deploy, so the Provider stays admin (RFC 006); the connection export's maximal permission policy caps it for records, and the connector policy denies the few other operations that matter to PM.
+- **Signed connection records**, so connectors can detect a record the Provider edited. Unnecessary once kcp denies the Provider writes to records; it would add a signing key and verification for no extra protection.
 - **Keeping the connection data in the `Provider` object**, with only an empty placeholder in the provider workspace. The owner can edit the `Provider` object (spec and status), so the owner could redirect the connection, and, without a PM-owned link between `Provider` and provider workspace, point it at another Provider's workspace. It also spreads the data back over owner shards and `:root:providers`.
 - **Wildcard read of APIBindings on each connector's own shard** to find local consumers. Works, but needs shard-wide read access. The permission claim on endpoint slices keeps every connector privilege scoped to the connection export, and uses kcp's own answer.
 - **A Provider-issued secret (v2).** The response would carry a secret, which reopens finding 9.
@@ -709,13 +855,14 @@ All of v4's rejected alternatives still apply, except "a PM-owned front key, wit
 
 ## Open items
 
-- **Proxying at scale (the main risk).** Watches and long-running requests from every Provider pass through a connector. Measure memory and goroutines per stream, streams per session, and backpressure, for one shard's connector at realistic Provider and cluster counts.
-- **Multiplexer choice.** remotedialer (built for this direction, widely deployed) vs. yamux/smux. Check: whether remotedialer applies backpressure per stream (it may buffer instead), whether its client side accepts a custom dialer so streams can go to the in-process HTTP server, and whether it has a go-away for graceful session replacement. yamux has per-stream windows and a go-away, but no built-in WebSocket integration or dial addressing.
+- **Multiplexer choice and backpressure.** A slow Provider must be throttled per stream through the multiplexer, as TCP and HTTP/2 flow control throttle it towards the APIExport virtual workspace today (see "Load"). remotedialer (built for this direction, widely deployed) vs. yamux/smux. Check: whether remotedialer applies backpressure per stream (it may buffer instead), whether its client side accepts a custom dialer so streams can go to the in-process HTTP server, and whether it has a go-away for graceful session replacement. yamux has per-stream windows and a go-away, but no built-in WebSocket integration or dial addressing. Cap the connector's upstream HTTP/2 receive buffer per stream (Go's default is 4 MB) so that a slow reader's backlog stays at the APIExport virtual workspace.
+- **Sizing the second hop.** Each shard's connector carries the watches its APIExport virtual workspace already serves to remote Providers, with less work per watch. Confirm in a load test that its memory and goroutines per watch stay below the APIExport virtual workspace's, and size its replicas accordingly.
 - **Transport check.** Confirm that `http.Transport` with a `DialTLSContext` returning a non-TLS stream speaks HTTP/1.1 to `https://` URLs as expected, and that client-go accepts it as `rest.Config.Transport` together with multicluster-runtime's per-endpoint configs.
 - **Edge timing.** A session ping interval and a session replacement schedule that fit common idle timeouts and maximum connection ages; window or buffer sizes for high round-trip times (large LISTs).
 - **Session CA.** Issuer (cert-manager with a KMS- or Vault-backed issuer), generation lifetime and rollover interval, whether to use an intermediate, alerting on a generation's remaining lifetime, shard certificate lifetime, how the host is encoded in the shard certificate (URI SAN format), assertion lifetime, clock-skew tolerance and `jti` cache size on the Provider-side. Whether per-replica certificates are worth it.
 - **Connection controller.** Where it runs (pm-operator or its own Deployment), HA and sharding, poll interval, rate limits and backoff per Provider.
 - **Connection export.** The `ProviderConnection` schema; which PM workspace hosts the export; confirm that a permission claim on `apis.kcp.io` `apiexportendpointslices` works and is readable through the export's virtual workspace; the binding's lifecycle in the Provider controller (create with the workspace, recreate if deleted).
+  - **Maximal permission policy:** an e2e test, modelled on kcp's `TestMaximalPermissionPolicyAuthorizer`, that an admin of the provider workspace is refused every write verb on records and their status but can read them, and that the connection controller can write through the export's virtual workspace with only the prefixed-user grant, and can't without it (observation 19). Decide the controller's identity, and list every other PM component that writes records directly.
 - **Connector policy.**
   - **Legacy SA-token Secrets:** confirm whether kcp issues tokens for Secrets of type `kubernetes.io/service-account-token`. If it does, the proxy handler has to inspect Secret writes (`create`, `update`, `patch`, server-side apply) before forwarding, since an authorizer can't see the type.
   - **Duplicate bindings:** `create` doesn't name the existing binding. Check whether kcp refuses a second binding to the same export in one workspace, and whether a duplicate matters.
@@ -733,7 +880,8 @@ All of v4's rejected alternatives still apply, except "a PM-owned front key, wit
 - **`ServeProxy` upstream.** Propose moving `kcp/pkg/virtual/shared.ServeProxy` into the virtual workspace framework, or copy it.
 - **Provider-side multi-replica.** Sharding vs. Lease routing, and whether opening one session per Provider replica can be made reliable through common ingresses. More pressing with per-shard sessions.
 - **Rebind details.** Length of the waiting period, rate limits, and what happens when a thief holding the secret keeps cancelling the owner's rebinds (portal freeze is the current answer).
-- **Signed control calls.** Sessions already use signed assertions. The remaining bearer credential is the connection secret on rare control calls. For Providers that don't trust their own edge, replace it with a per-connection keypair, pinned at registration, that signs a short-lived JWT (RFC 7523 `private_key_jwt` style) on each control call: v4's per-connection key with a different proof. The edge would then see no reusable credential, but still sees reconcile traffic.
+- **Inner TLS on sessions: default, required, or opt-in (TSC decision).** Proposed on by default (see "The Provider's edge: inner TLS on sessions"). Also decide whether a per-connection opt-out is offered at all, the server key's type and rotation overlap, and whether `serverKeys` in the connection record need the maximal permission policy's protection beyond what records already have.
+- **Signed control calls.** Only relevant with plain sessions: with inner TLS on sessions, control calls run inside it and the edge never sees the connection secret. Otherwise, replace the secret with a per-connection keypair, pinned at registration, that signs a short-lived JWT (RFC 7523 `private_key_jwt` style) on each control call. The edge would then see no reusable credential, but still sees reconcile traffic and holds the Provider's end of every session.
 - **`direct` mode.** In v5, the Provider-side never talks to kcp directly. "Direct" would mean the Provider-side calls the connectors instead of the connectors dialling out, with the same routing, identity injection and authorizer. Each shard's connector would be exposed under its own external hostname, not through the front-proxy, which routes `/services/...` to a single backend (see "Per-shard connectors", point 8). What's missing is a credential in the other direction: one that the virtual workspace accepts for its connection only, is useless against kcp directly, and is revoked by deleting the connection. Defer until there's a use case.
 - **WebSockets through ingresses.** Confirm that a long-lived binary WebSocket survives common ingresses, CDNs and WAFs (binary frames, maximum message size, maximum connection age).
 - **multicluster-runtime composition.** Confirm the `multi` provider (or an equivalent) supports adding and removing per-connection providers at runtime with prefixed cluster names.
