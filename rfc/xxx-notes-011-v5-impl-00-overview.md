@@ -11,8 +11,8 @@ Start here, then follow the walkthrough below, or jump to a component.
 | [00 Overview](./xxx-notes-011-v5-impl-00-overview.md) | Decisions, component map, end-to-end walkthrough, cross-cutting principles, ownership, build order |
 | [01 Protocol](./xxx-notes-011-v5-impl-01-protocol.md) | The wire contract between PM and the Provider-side: endpoints, credentials, session assertion, inner TLS, multiplexer, status, versioning |
 | [02 APIs](./xxx-notes-011-v5-impl-02-apis.md) | kcp-side types and exports: `ProviderOnboardingRequest`, `Provider`, the connection Secret, `ProviderEndpoint`, the connection export and its maximal permission policy |
-| [03 providerconnections-operator](./xxx-notes-011-v5-impl-03-providerconnections-operator.md) | The control plane: onboarding, registration, records, health, secret rotation, rebind, session CA rollover, offboarding |
-| [04 Session CA](./xxx-notes-011-v5-impl-04-session-ca.md) | CA generations, shard certificates, rollover, and how the operator and connectors get them |
+| [03 providerconnections-operator](./xxx-notes-011-v5-impl-03-providerconnections-operator.md) | The control plane: onboarding, registration, records, health, secret rotation, rebind, connector CA rollover, offboarding |
+| [04 Connector CA](./xxx-notes-011-v5-impl-04-connector-ca.md) | CA generations, connector certificates, rollover, and how the operator and connectors get them |
 | [05 Connector](./xxx-notes-011-v5-impl-05-connector.md) | The data plane: the per-shard `providerconnections` virtual workspace, sessions, proxying, policy |
 | [06 Provider controller changes](./xxx-notes-011-v5-impl-06-provider-controller.md) | What the RFC 006 Provider controller in platform-mesh-operator changes for remote Providers |
 | [07 Provider SDK](./xxx-notes-011-v5-impl-07-provider-sdk.md) | The Provider-side library: connection API, store, session server, transport, lifecycle, portal primitives |
@@ -32,19 +32,19 @@ Start here, then follow the walkthrough below, or jump to a component.
 | Record type | **`connections.platform-mesh.io/ProviderEndpoint`**, served only by the connection export. `ProviderConnection` is removed from `providers.platform-mesh.io`. |
 | Connection export home | **`:root:providers:system`**. |
 | Multiplexer | **yamux** over the WebSocket. |
-| Session CA | **cert-manager CA**, immutable generations, `rotationPolicy: Never`; interfaces allow a Vault- or KMS-backed issuer later. |
+| Connector CA | Immutable generations whose keys come from `caSecretRef` or `issuerRef` (mirroring `kcp.certificates`), declared with public certificates in a **`ConnectorCABundle`** CR whose status reports rollover progress ([04](./xxx-notes-011-v5-impl-04-connector-ca.md)). Formerly "session CA"; connector certificates were "shard certificates". |
 | Provider-side state | An SDK **storage interface** plus a **Kubernetes reference store** in the Provider's runtime cluster. |
 | Portal | **SDK primitives** (token issuing and verification, connection lifecycle, notification hooks) plus a minimal flow in **pm-provider-quickstart**. |
 | E2E | **kind, multi-shard**, with the Provider behind a network boundary, extending platform-mesh-operator's `test/e2e/kind`. |
 | Naming | `xxx-notes-011-v5-impl-*.md` in `rfc/`. |
 | Operator partitioning | **One Deployment in PM's cluster, partitioned by kcp shard** with per-shard Leases; replicas and shards independent ([03](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)). |
-| Chart | One new `providerconnections` chart (operator + per-shard connector resources), deployed by platform-mesh-operator, reading the same profile shard list as `infra` ([09](./xxx-notes-011-v5-impl-09-deployment.md)). |
+| Chart | One new `providerconnections` chart (operator + per-shard connector resources), deployed by platform-mesh-operator as a profile service, with an explicit `kcpTopology` that duplicates `infra`'s shards (must match; profile validation enforcing it is a follow-up) ([09](./xxx-notes-011-v5-impl-09-deployment.md)). |
 | Operator Secret access | **No Secret informers**: the token and connection Secrets are read and written by name, uncached ([03](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)). |
 | Requests | Owners create them (one ClusterRole with `Provider`s), no creator checks; the oldest request per `Provider` wins; no terminal failure after registration; spent token data deleted ([02](./xxx-notes-011-v5-impl-02-apis.md), [03](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)). |
 | Migration | None: `spec.remote` is unused today ([06](./xxx-notes-011-v5-impl-06-provider-controller.md)). |
 | Protocol | Current and previous version supported; 1 minute clock skew; 72-hour rebind wait; length-prefixed binary stream preamble ([01](./xxx-notes-011-v5-impl-01-protocol.md)). |
 | Connector | Connections move on replica restart; cache-server credentials accepted; child workspaces denied; one identity group for all shards ([05](./xxx-notes-011-v5-impl-05-connector.md)). |
-| SDK | One active replica for now; Go only; CRDs plus Secrets as reference store ([07](./xxx-notes-011-v5-impl-07-provider-sdk.md)). |
+| SDK | One active replica by leader election (standbys answer `503`), owner replicas as a later opt-in; Go only; CRDs plus Secrets as reference store ([07](./xxx-notes-011-v5-impl-07-provider-sdk.md)). |
 | Quickstart | Keeps kubeconfig mode alongside connection mode ([08](./xxx-notes-011-v5-impl-08-provider-quickstart.md)). |
 | API version | `connections.platform-mesh.io/v1alpha1` ([02](./xxx-notes-011-v5-impl-02-apis.md)). |
 
@@ -58,9 +58,9 @@ Start here, then follow the walkthrough below, or jump to a component.
  │ token Secret, connection Secret          │   (owner     │ providerconnections-operator (doc 03)        │
  └──────────────────────────────────────────┘    side)     │   consumes: providers export,                │
                                                            │             connection export                │
- :root:providers:system                                    │ session CA (cert-manager, doc 04)            │
+ :root:providers:system                                    │ connector CA (cert-manager, doc 04)            │
  ┌──────────────────────────────────────────┐              └──────────────┬───────────────────────────────┘
- │ connection export connections.pm.io      │                             │ shard certificates
+ │ connection export connections.pm.io      │                             │ connector certificates
  │   + maximal permission policy RBAC       │                             ▼
  │ providers export (unchanged home)        │              ┌──────────────────────────────────────────────┐
  └──────────────────────────────────────────┘              │ providerconnections-vw @ shard-A, -B, …      │
@@ -85,13 +85,13 @@ Each step names the document and section that owns it; read them in this order t
 2. **The owner creates a `ProviderOnboardingRequest`** referencing the token Secret: [02 APIs, "ProviderOnboardingRequest"](./xxx-notes-011-v5-impl-02-apis.md).
 3. **The operator creates or reuses the `Provider`**: [03 Operator, "Onboarding"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md).
 4. **The Provider controller bootstraps the provider workspace** (workspace, SA, connection export binding, connector RBAC), without a kubeconfig for remote Providers: [06 Provider controller](./xxx-notes-011-v5-impl-06-provider-controller.md).
-5. **The operator registers the connection** with the Provider-side: generates the connection secret, sends its hash and the session CA certificates, receives the `connectionID` and server keys: [03 Operator, "Registration"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md); the Provider's side: [07 SDK, "Connection API"](./xxx-notes-011-v5-impl-07-provider-sdk.md); the CA certificates it sends: [04 Session CA, "Publishing generations"](./xxx-notes-011-v5-impl-04-session-ca.md).
+5. **The operator registers the connection** with the Provider-side: generates the connection secret, sends its hash and the connector CA certificates, receives the `connectionID` and server keys: [03 Operator, "Registration"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md); the Provider's side: [07 SDK, "Connection API"](./xxx-notes-011-v5-impl-07-provider-sdk.md); the CA certificates it sends: [04 Connector CA, "ConnectorCABundle"](./xxx-notes-011-v5-impl-04-connector-ca.md).
 6. **The operator writes the `ProviderEndpoint`** into the provider workspace through the connection export: [03 Operator, "Records"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md); type and policy: [02 APIs, "ProviderEndpoint" and "Connection export"](./xxx-notes-011-v5-impl-02-apis.md).
 7. **Connectors discover the record and open sessions** where needed: [05 Connector, "Discovery" and "Which sessions"](./xxx-notes-011-v5-impl-05-connector.md); the session handshake: [01 Protocol, "Sessions"](./xxx-notes-011-v5-impl-01-protocol.md); the Provider's side: [07 SDK, "Session server"](./xxx-notes-011-v5-impl-07-provider-sdk.md).
 8. **The Provider's controllers reconcile through the sessions**: transport and client configs in [07 SDK, "Transport" and "Connections for multicluster-runtime"](./xxx-notes-011-v5-impl-07-provider-sdk.md); the proxy on PM's side in [05 Connector, "Proxying"](./xxx-notes-011-v5-impl-05-connector.md); the reference wiring in [08 Quickstart](./xxx-notes-011-v5-impl-08-provider-quickstart.md).
 9. **The operator confirms readiness** from the Provider-side's per-host status: [03 Operator, "Readiness and health"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md); [01 Protocol, "Status"](./xxx-notes-011-v5-impl-01-protocol.md).
-10. **Steady state**: the operator polls health and rotates the connection secret; cert-manager renews shard certificates; connectors refresh SA tokens: [03 Operator, "Secret rotation"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md), [04 Session CA, "Shard certificates"](./xxx-notes-011-v5-impl-04-session-ca.md), [05 Connector, "Identity towards kcp"](./xxx-notes-011-v5-impl-05-connector.md).
-11. **Rare operations**: rebind after a lost connection Secret ([03 Operator, "Rebind"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md), [07 SDK, "Rebind"](./xxx-notes-011-v5-impl-07-provider-sdk.md)); session CA rollover ([04 Session CA, "Rollover"](./xxx-notes-011-v5-impl-04-session-ca.md)); server key rotation ([07 SDK, "Server keys"](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
+10. **Steady state**: the operator polls health and rotates the connection secret; cert-manager renews connector certificates; connectors refresh SA tokens: [03 Operator, "Secret rotation"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md), [04 Connector CA, "Connector certificates"](./xxx-notes-011-v5-impl-04-connector-ca.md), [05 Connector, "Identity towards kcp"](./xxx-notes-011-v5-impl-05-connector.md).
+11. **Rare operations**: rebind after a lost connection Secret ([03 Operator, "Rebind"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md), [07 SDK, "Rebind"](./xxx-notes-011-v5-impl-07-provider-sdk.md)); connector CA rollover ([04 Connector CA, "Rollover"](./xxx-notes-011-v5-impl-04-connector-ca.md)); server key rotation ([07 SDK, "Server keys"](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
 12. **Offboarding**: the operator deletes the record (sessions close), calls `DELETE`, then lets the Provider controller tear down the workspace: [03 Operator, "Offboarding"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md), [06 Provider controller, "Deletion order"](./xxx-notes-011-v5-impl-06-provider-controller.md).
 
 Deployment of all PM-side pieces: [09 Deployment](./xxx-notes-011-v5-impl-09-deployment.md). How each step is tested: [10 Testing](./xxx-notes-011-v5-impl-10-testing.md).
@@ -110,7 +110,8 @@ Every component follows these; the component documents refer back here instead o
 8. **Everything is idempotent and resumable.** Reconcilers converge from any intermediate state; the Provider-side is the source of truth for what it has pinned, and the operator reads it back.
 9. **Owners learn nothing about PM's topology.** Owners see aggregate conditions only; shards, hosts and per-shard detail stay in metrics and PM-internal objects.
 10. **One mode, versioned protocol.** Inner TLS is always on; the protocol carries an explicit version so SDK and PM can evolve independently ([01 Protocol, "Versioning"](./xxx-notes-011-v5-impl-01-protocol.md)).
-11. **Secrets never appear in logs, events, metrics, conditions or audit bodies.** Prefixed formats (`pm1.`, `pmc1_`) make leaks detectable by scanners.
+11. **Signals go to the audience that can act on them.** Owners get conditions and events on their own objects; the people running PM get metrics, the `ConnectorCABundle` status and documented alert rules; Providers get SDK notifications. PM has no alerting pipeline today, so the plan ships signals and documented rules, not alerts.
+12. **Secrets never appear in logs, events, metrics, conditions or audit bodies.** Prefixed formats (`pm1.`, `pmc1_`) make leaks detectable by scanners.
 
 ## Who writes what
 
@@ -127,7 +128,7 @@ Clear ownership avoids two controllers fighting over the same fields.
 | connection Secret | operator | operator only |
 | provider workspace, SA, binding, connector RBAC | Provider controller | operator, connectors |
 | `ProviderEndpoint` | operator | connectors (and readable by the Provider) |
-| session CA generations, shard certificates | deployment and cert-manager | operator (public certificates), connectors (their own shard certificate) |
+| connector CA generations, connector certificates | deployment and cert-manager | operator (public certificates), connectors (their own connector certificate) |
 | SA tokens | connectors (TokenRequest) | connectors only |
 | Provider-side connection state | Provider SDK | Provider SDK, portal |
 
@@ -139,28 +140,31 @@ Single delivery, but the pieces depend on each other. Suggested order, with what
 
 1. **Protocol and APIs** ([01](./xxx-notes-011-v5-impl-01-protocol.md), [02](./xxx-notes-011-v5-impl-02-apis.md)): the contract everyone builds against. Includes protocol test vectors.
 2. **SDK core** ([07](./xxx-notes-011-v5-impl-07-provider-sdk.md)): connection API, store, session server, transport. Can be tested against a fake PM side.
-3. **Session CA** ([04](./xxx-notes-011-v5-impl-04-session-ca.md)) and **kcp bootstrap** of the connection export ([09](./xxx-notes-011-v5-impl-09-deployment.md)).
+3. **Connector CA** ([04](./xxx-notes-011-v5-impl-04-connector-ca.md)) and **kcp bootstrap** of the connection export ([09](./xxx-notes-011-v5-impl-09-deployment.md)).
 4. **Provider controller changes** ([06](./xxx-notes-011-v5-impl-06-provider-controller.md)): binding, connector RBAC, no kubeconfig for remote Providers.
 5. **Operator** ([03](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)) and **connector** ([05](./xxx-notes-011-v5-impl-05-connector.md)), in parallel; they meet only at the `ProviderEndpoint` and the protocol.
 6. **Quickstart** ([08](./xxx-notes-011-v5-impl-08-provider-quickstart.md)).
 7. **Deployment** ([09](./xxx-notes-011-v5-impl-09-deployment.md)) and **e2e, security and load tests** ([10](./xxx-notes-011-v5-impl-10-testing.md)).
 
+## Deployment target
+
+The plan targets PM's current deployment: platform-mesh-operator rendering `pm-helm-charts` from the `PlatformMesh` profile. The newer, not yet released platform-mesh-deployer (`OCMModule`s with `root-shard` and `per-shard` placements) is a later move; the components map onto it without design changes, but the deployer needs three extensions first ([09 Deployment, "Later: moving to platform-mesh-deployer"](./xxx-notes-011-v5-impl-09-deployment.md)).
+
 ## External dependencies
 
 | Dependency | Needed for | Status |
 |---|---|---|
+| Alerting in PM | Turning the documented alert rules (connector CA expiry, connector certificates, rollovers) into notifications for the people running PM | **Outside this plan.** PM collects metrics but has no alerting pipeline (Alertmanager disabled, no rules shipped). This plan ships metrics, `ServiceMonitor`s, documented rules and an optional `PrometheusRule` ([09](./xxx-notes-011-v5-impl-09-deployment.md)) |
+| Connector CA rollover automation | Fewer manual steps per rollover (date-driven state changes) | **Follow-up, not part of this delivery**; the procedure is manual and documented ([04](./xxx-notes-011-v5-impl-04-connector-ca.md)) |
+| platform-mesh-operator: profile validation | Refusing a profile whose `providerconnections` shard list doesn't match `infra`'s, instead of applying it | **Follow-up, not part of this delivery.** Doesn't exist yet and is broader than this plan, which only specifies the rule; until then a shard runbook covers it. Admission-time (needs a webhook, since CEL can't parse the YAML inside the profile ConfigMap) or reconcile-time with the reason on the `PlatformMesh` ([09](./xxx-notes-011-v5-impl-09-deployment.md)) |
 | kcp-operator: cache-server credentials in a `VirtualWorkspace` | Connectors don't need them (v5 observation 18) | Mounted regardless; **accepted** and documented ([09](./xxx-notes-011-v5-impl-09-deployment.md)) |
-| kcp-operator: mount the shard certificate | Connectors sign and handshake with it | **Supported** (`extraVolumes`) |
+| kcp-operator: mount the connector certificate | Connectors sign and handshake with it | **Supported** (`extraVolumes`) |
 | kcp-operator: stable replica identities | Rendezvous hashing keeps connections across restarts | Deployment only; **accepted**: connections move on restart ([05](./xxx-notes-011-v5-impl-05-connector.md)) |
 | kcp: maximal permission policy on writes through the APIExport virtual workspace | The operator writing records | Read from code, not tested (v5 observation 19); see [10 Testing](./xxx-notes-011-v5-impl-10-testing.md) |
 | kcp-operator: `--service-account-lookup=false` | Not needed by v5 for remote Providers | Unchanged |
 
 ## Open questions across documents
 
-To be revisited separately:
+Nothing in this plan is open. Deferred to later changes:
 
-- **Session CA configuration**: declaration format, lifetimes, URI SAN scheme, where generation Secrets live ([04](./xxx-notes-011-v5-impl-04-session-ca.md)).
-
-Still open in individual documents:
-
-- **Provider-side multi-replica** beyond one active replica: a later change ([07](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
+- **Owner replicas for Providers**: an opt-in SDK mode for horizontal scale, needing no PM-side work; this delivery runs one active replica ([07](./xxx-notes-011-v5-impl-07-provider-sdk.md)).

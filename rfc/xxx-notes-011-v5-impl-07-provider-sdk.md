@@ -24,12 +24,12 @@ What a Provider still does itself: its portal and user accounts, its operator co
 
 - **Issue tokens** bound to a portal owner account: `pm1.<base URL>.<id>.<secret>`, single-use, short expiry; store only the hash.
 - **List, freeze and delete** a portal owner's connections. Freezing refuses all control calls and sessions until unfrozen; deleting is final.
-- **Notification hooks** the Provider implements: registration, secret rotation, session CA change, rebind started, completed or cancelled, authentication failures above a threshold. The quickstart implements them as log lines and a portal list ([08 Quickstart](./xxx-notes-011-v5-impl-08-provider-quickstart.md)).
+- **Notification hooks** the Provider implements: registration, secret rotation, connector CA change, rebind started, completed or cancelled, authentication failures above a threshold. The quickstart implements them as log lines and a portal list ([08 Quickstart](./xxx-notes-011-v5-impl-08-provider-quickstart.md)).
 
 ### Connection API
 
 The handlers for the plain-HTTPS endpoints:
-- **Registration**: verify and spend the token, apply idempotency rules, create the connection entry (owner, `clusterID`, front-proxy URL, secret hash, pinned session CAs, negotiated version), return `connectionID` and server keys.
+- **Registration**: verify and spend the token, apply idempotency rules, create the connection entry (owner, `clusterID`, front-proxy URL, secret hash, the pinned connector CA bundle with its sequence, negotiated version), return `connectionID` and server keys.
 - **Rebind**: verify the token's owner matches the connection's, start the waiting period, notify.
 - **Server keys**: return the current list.
 
@@ -37,13 +37,14 @@ The handlers for the plain-HTTPS endpoints:
 
 - **WebSocket upgrade, then the inner TLS server** with the current server key.
 - **Bearer check** inside, against the current or staged secret hash; any success cancels a pending rebind and promotes a staged secret.
-- **Handlers**: status, secret staging, session CA replacement, delete ([01 Protocol, "Control sessions"](./xxx-notes-011-v5-impl-01-protocol.md)).
+- **Handlers**: status, secret staging, connector CA bundle replacement, delete ([01 Protocol, "Control sessions"](./xxx-notes-011-v5-impl-01-protocol.md)).
+- **Connector CA bundle**: parsed as a SPIFFE-format trust bundle (JWKS with `x5c`); every certificate is checked to be a CA before it's pinned. Replacement is monotonic in the bundle's sequence: lower is refused, equal and identical is a no-op, equal and different is refused ([01 Protocol, "Connector CA bundle"](./xxx-notes-011-v5-impl-01-protocol.md)). The pinned sequence and fingerprints are reported in `GET`. The bundle is only ever accepted on the control channel or at registration, never from a session.
 
 ### Session server
 
 1. **Verify the session assertion** in the outer header, exactly as specified ([01 Protocol, "Outer layer"](./xxx-notes-011-v5-impl-01-protocol.md)), including the `jti` cache.
 2. **Accept the WebSocket**, run the **inner TLS server**, and require the client certificate to equal the assertion's leaf.
-3. **Start yamux**; register the session under its connection, with the hosts it serves (from the shard certificate) plus the front-proxy.
+3. **Start yamux**; register the session under its connection, with the hosts it serves (from the assertion's `hosts` claim) plus the front-proxy.
 4. **Honour go-away**: stop opening streams on a session the connector is replacing.
 5. **Close all sessions** of a connection that's deleted or frozen.
 
@@ -91,26 +92,40 @@ Most onboarding failures are edge configuration: a bot challenge on the upgrade,
 
 ## Storage
 
-**An interface**, with entities for: connections (owner, addressing, secret hash and staged hash, pinned session CAs, negotiated version, frozen flag, rebind state), tokens (hash, owner, expiry, spent), server keys (current, announced, retired, private keys), and the `jti` cache.
+**An interface**, with entities for: connections (owner, addressing, secret hash and staged hash, pinned connector CA bundle and its sequence, negotiated version, frozen flag, rebind state), tokens (hash, owner, expiry, spent), server keys (current, announced, retired, private keys), and the `jti` cache.
 
 **The Kubernetes reference store** keeps these in the Provider's runtime cluster: non-secret state as **custom resources** (compare-and-swap through `resourceVersion`, inspectable with kubectl), private keys and hashes in **Secrets**. The SDK ships the CRDs. Requirements on any store:
 - atomic updates of a connection entry (compare-and-swap), since several replicas may handle calls;
 - a shared `jti` cache across replicas, or session upgrades pinned to one replica;
 - private keys never readable by anything but the connection server.
 
-## Replicas: one active for now
+## Replicas
 
-Sessions for different shards can land on different replicas behind the Provider's ingress, while the replica running a connection's controllers needs all of them. This delivery avoids the problem:
-- **One active replica**, chosen by leader election; standby replicas refuse session and control-session upgrades (so the ingress retries elsewhere) until they become leader.
-- **Failover**: connectors reconnect within their backoff; controllers relist, as after any restart.
-- **Later**: forwarding sessions to a per-connection owner replica, or routing dials between replicas (as railgrid's edges provider does). The storage interface already assumes several replicas (compare-and-swap, shared `jti` cache), so this doesn't change the store.
+Sessions for different shards can land on different replicas behind the Provider's ingress, while the replica running a connection's controllers needs all of them: the dial hook only reaches sessions held by its own process. Controllers therefore run in the same process as the connection server.
+
+### This delivery: one active replica
+
+- **Leader election** picks the active replica; the vendor's controllers are leader-elected the usual controller-runtime way, with their reconcile logic unchanged.
+- **Standby replicas answer session and control-session upgrades with `503` and `Retry-After = max(5s, ceil(LeaseDuration / 3))`**, computed once at startup from the leader-election settings. With controller-runtime's default 15-second Lease that's 5 seconds: about three attempts span the worst-case window after a leader crash, when no replica can be leader yet. A vendor's longer Lease gives a longer delay (a new leader can't appear sooner anyway); the 5-second floor keeps an aggressively short Lease from turning reconnects into a storm against the vendor's own edge. Connectors use the value as the lower bound for their normal reconnect backoff ([01 Protocol, "Errors and retries"](./xxx-notes-011-v5-impl-01-protocol.md)); with two or three replicas, sessions are back within roughly 10–20 seconds after a failover, and watches relist as after any restart.
+- **The edge must spread upgrades across replicas**: no client-IP affinity or sticky sessions on the session and control paths. Otherwise a connector can keep reaching the same standby and never find the leader.
+- **Constraints on the vendor**: nothing beyond leader election (Lease RBAC, which leader-elected operators already have), plain WebSocket support at the edge, and no affinity on the session and control paths. No extra Services, routes or permissions.
+- **What vendors accept**: vertical scaling only (one process holds every connection's caches and traffic), and a reconnect lottery plus relists after a failover.
+
+### Follow-up: owner replicas, opt-in
+
+For vendors who need horizontal scale, a later SDK release adds an opt-in mode:
+- **Each connection has an owner replica** (rendezvous hashing over live replicas, or a Lease per connection). Any replica accepts an upgrade and forwards the raw bytes, in-cluster, to the owner, which verifies the assertion and terminates the inner TLS; forwarding replicas see only ciphertext. Control sessions are forwarded the same way.
+- **Each replica runs controllers only for the connections it owns**, through the SDK's connection-aware manager.
+- **When connections move** on scaling, the old owner sends go-away and the connector reconnects to whichever replica the ingress picks, which forwards to the new owner.
+- **Constraints on vendors who opt in**: controllers sharded by connection, so **their reconcile logic must not assume one replica sees all connections** (anything aggregated across connections needs coordination of their own); pod-to-pod connectivity within their namespace; RBAC for Leases or EndpointSlices; relists when connections move.
+- **No PM-side work**: from the connector's side an owner-replica Provider is indistinguishable from any other. This delivery already provides what it needs: go-away from either side, reconnection after any graceful close, `503` with `Retry-After` as a backoff lower bound, and no assumption about which replica a session reaches ([01 Protocol, "Provider replicas"](./xxx-notes-011-v5-impl-01-protocol.md)).
 
 ## Requirements on Providers
 
 Documented for Provider authors ([08 Quickstart, "Documentation for Provider authors"](./xxx-notes-011-v5-impl-08-provider-quickstart.md)):
 - **Service endpoint slices live in the provider workspace**, for exports in that workspace. Connectors open sessions on a shard only if such a slice lists it ([05 Connector, "Which sessions"](./xxx-notes-011-v5-impl-05-connector.md)).
 - **The edge passes the session and control paths as plain WebSocket pipes**: upgrades allowed, no bot challenges, binary messages up to 32 KB untouched, idle timeouts above the ping interval, and a maximum connection age the connector can replace sessions within. Message-based WebSocket API gateways (which route individual messages and cap connection lifetimes) don't qualify. The quickstart's checklist spells this out ([08 Quickstart, "Connection server"](./xxx-notes-011-v5-impl-08-provider-quickstart.md)); the edge self-test verifies it (above).
-- **One active replica** of the connection server (above).
+- **One active replica** of the connection server and its controllers, by leader election (see "Replicas"); the owner-replica mode is a later opt-in.
 - **Rate limits** on registration and rebind per owner: SDK defaults, adjustable.
 
 ## Testing support
@@ -143,7 +158,7 @@ Documented for Provider authors ([08 Quickstart, "Documentation for Provider aut
 
 ## Decided
 
-- **One active replica** (leader election) in this delivery.
+- **One active replica** (leader election, standbys answer `503` with `Retry-After = max(5s, ceil(LeaseDuration / 3))`) in this delivery; **owner replicas** as an opt-in follow-up needing no PM-side work.
 - **Go only.** The protocol specification and test vectors exist, but third-party implementations aren't a supported target.
 - **Reference store**: custom resources plus Secrets.
 - **Module**: `go.platform-mesh.io/provider-sdk`; independent semver; upgrade signals as above.

@@ -19,7 +19,7 @@ All paths are relative to the Provider's **base URL** from the onboarding token.
 | `POST /v1/connections/{id}/rebind` | plain HTTPS | operator | onboarding token | Start recovery after a lost connection Secret |
 | `GET /v1/connections/{id}/server-keys` | plain HTTPS | operator | none (web PKI) | Re-read server keys after a missed rollover |
 | `GET /v1/connections/{id}/control` | WebSocket + inner TLS | operator | inner TLS: pinned server key (server); connection secret inside (client) | Control calls |
-| `GET /v1/connections/{id}/session` | WebSocket + inner mTLS | connector | outer: session assertion; inner TLS: shard certificate (client), pinned server key (server) | A session carrying the multiplexer |
+| `GET /v1/connections/{id}/session` | WebSocket + inner mTLS | connector | outer: session assertion; inner TLS: connector certificate (client), pinned server key (server) | A session carrying the multiplexer |
 
 Plain-HTTPS endpoints are verified with web PKI on the base URL, or with the `Provider`'s `spec.remote.caBundle` when set.
 
@@ -38,7 +38,7 @@ Plain-HTTPS endpoints are verified with web PKI on the base URL, or with the `Pr
 
 ## Registration
 
-Request: idempotency key (the `ProviderOnboardingRequest` UID), `clusterID` (logical cluster of the provider workspace), front-proxy URL, the secret's hash, the session CA certificates (current generations), and the protocol versions the PM-side supports.
+Request: idempotency key (the `ProviderOnboardingRequest` UID), `clusterID` (logical cluster of the provider workspace), front-proxy URL, the secret's hash, the connector CA bundle (see "Connector CA bundle"), and the protocol versions the PM-side supports.
 
 Response: `connectionID`, the Provider-side's **server keys** (public keys, a list to allow rotation), and the chosen protocol version.
 
@@ -59,12 +59,21 @@ Control calls:
 
 | Call | Effect |
 |---|---|
-| `GET /v1/connections/{id}` | Status (see "Status"), server keys, pinned session CA fingerprints, pending secret flag, pending rebind |
+| `GET /v1/connections/{id}` | Status (see "Status"), server keys, pinned connector CA bundle sequence and fingerprints, pending secret flag, pending rebind |
 | `PUT /v1/connections/{id}/secret` | Stage a new secret hash; promoted on first successful authentication with the new secret |
-| `PUT /v1/connections/{id}/session-cas` | Replace the pinned session CA certificates (rollover) |
+| `PUT /v1/connections/{id}/connector-ca-bundle` | Replace the pinned connector CA bundle (rollover); see "Connector CA bundle" |
 | `DELETE /v1/connections/{id}` | Delete the connection; all its sessions close |
 
 - **Any successful authentication with the current secret cancels a pending rebind.**
+
+### Connector CA bundle
+
+The connector CA certificates a connection pins travel as a **trust bundle in SPIFFE's format**: a JWKS whose keys each carry one generation's CA certificate in `x5c`, plus a **sequence number**. The rationale, including how this compares with other trust-anchor APIs, is in v5, "Distributing the connector CA to Providers".
+
+- **Sent at registration** (sequence 1 or the operator's current sequence) and **replaced by `PUT …/connector-ca-bundle`** during rollovers.
+- **Monotonic**: the Provider-side refuses a bundle with a lower sequence than the pinned one; an equal sequence with identical content is a no-op; an equal sequence with different content is refused.
+- **Only on the control channel**, never through a session: a session is authenticated by the CA it would be changing.
+- **`GET` returns the pinned sequence** and the generations' fingerprints, so the operator can confirm what's pinned.
 - **A staged secret** is accepted alongside the current one until promoted, and expires if never used.
 
 ## WebSocket framing
@@ -95,20 +104,20 @@ The SDK also offers Providers an edge self-test against their own base URL ([07 
 
 A WebSocket upgrade on `/v1/connections/{id}/session` with `Authorization: Bearer <session assertion>`.
 
-The **session assertion** is a JWT signed with the shard certificate's key:
-- header: algorithm, and `x5c` with the shard certificate (and at most one intermediate, reserved for later);
-- claims: `aud` = this connection's session URL, `cluster` = the provider workspace's `clusterID`, `sub` = an opaque session-group ID for audit, `iat`, `exp` (at most 5 minutes after `iat`), `jti`.
+The **session assertion** is a JWT signed with the connector certificate's key:
+- header: algorithm, and `x5c` with the connector certificate (and at most one intermediate, reserved for later);
+- claims: `aud` = this connection's session URL, `cluster` = the provider workspace's `clusterID`, `hosts` = the hosts this session serves (see "Hosts a session serves"), `sub` = an opaque session-group ID for audit, `iat`, `exp` (at most 5 minutes after `iat`), `jti`.
 
 The Provider-side verifies, in order:
-1. the `x5c` chain against **only** the connection's pinned session CA certificates, with at most one intermediate, checking validity, CA constraints and the shard certificate's key usages (signing and client authentication);
-2. the JWT signature with the shard certificate's key;
+1. the `x5c` chain against **only** the CA certificates in the connection's pinned connector CA bundle, with at most one intermediate, checking validity, CA constraints and the connector certificate's key usages (signing and client authentication);
+2. the JWT signature with the connector certificate's key;
 3. `aud` exactly, `iat` and `exp` within a **clock-skew tolerance of 1 minute**, `exp − iat` ≤ 5 minutes, and `jti` not seen within its validity (so the replay cache keeps entries for about 6 minutes);
 4. `cluster` equals the `clusterID` stored at registration.
 
 ### Inner layer
 
 After the upgrade, a TLS 1.3 handshake inside the WebSocket:
-- **Client**: the connector presents its shard certificate. The Provider-side requires it to be **the same certificate** as the assertion's `x5c` leaf, which binds the inner handshake to the verified assertion.
+- **Client**: the connector presents its connector certificate. The Provider-side requires it to be **the same certificate** as the assertion's `x5c` leaf, which binds the inner handshake to the verified assertion.
 - **Server**: the Provider-side presents a self-signed certificate for one of its server keys; the connector accepts only keys pinned for this connection (read from the `ProviderEndpoint`, see [02 APIs](./xxx-notes-011-v5-impl-02-apis.md)).
 - **ALPN** names the session protocol and version (e.g. `pm-session/1`), so a future change is negotiated, not guessed.
 
@@ -118,13 +127,23 @@ After the upgrade, a TLS 1.3 handshake inside the WebSocket:
 - **Only the Provider-side opens streams.** The connector refuses streams it didn't expect and never opens any.
 - **Each stream starts with a length-prefixed binary preamble naming its target**: a version byte, a 2-byte length, then `host:port`, with a small maximum length. Plain HTTP/1.1 follows. The connector checks the target against its allow-list before reading any HTTP ([05 Connector, "Proxying"](./xxx-notes-011-v5-impl-05-connector.md)), and requires each request's `Host` to match the preamble.
 - **Flow control per stream** is required: a slow reader on one stream must not stall others or force unbounded buffering.
-- **Go-away**: the connector signals graceful replacement with yamux's go-away; the Provider-side stops opening streams on that session and lets in-flight ones finish.
+- **Go-away from either side**: the connector signals graceful replacement with yamux's go-away, and the Provider-side may send it too (e.g. when a connection moves between its replicas). On go-away from the connector, the Provider-side stops opening streams on that session and lets in-flight ones finish.
 - **Liveness**: WebSocket pings at the outer level (so ingresses see traffic), yamux keepalives inside.
 
 ### Hosts a session serves
 
-- The hosts named in the shard certificate (its shard's virtual-workspace host).
-- The connection's front-proxy host, on every session.
+- **The hosts in the assertion's `hosts` claim**: the shard's virtual-workspace host, taken from the connector's configuration and signed into every new session's assertion.
+- **The connection's front-proxy host**, on every session.
+
+The hosts are **routing information, not authority**. The Provider-side never resolves them (its dial hook opens streams on sessions), so they're labels it can't verify independently, and it doesn't need to: a session that passed the checks above already belongs to PM's connector for this connection, and which host it serves only decides where streams go. Keeping hosts out of the connector certificate means a hostname change on PM's side never waits for certificates to be reissued: during a rename, connectors list both the old and the new host until endpoint slices have switched, so the order of DNS, configuration and endpoint-slice changes doesn't matter.
+
+### What binds a session to its PM installation
+
+The connector CA generations pinned **for this connection** at registration: each PM installation has its own generations, never shared with another installation ([04 Connector CA, "Key sources"](./xxx-notes-011-v5-impl-04-connector-ca.md)). Connector certificates carry no installation identity and no hostnames. If two installations shared a generation, a compromised connector of one could open sessions for the other's connections; the rule is documented, not enforced by the SDK.
+
+## Provider replicas
+
+The protocol makes **no assumption about which Provider replica a session or control session reaches.** Two sessions of one connection, or two consecutive sessions on one shard, may end on different replicas; the Provider-side may close or go-away any session at any time and expects the connector to reconnect. This keeps every replica strategy the SDK offers ([07 SDK, "Replicas"](./xxx-notes-011-v5-impl-07-provider-sdk.md)) invisible to PM.
 
 ## Rebind
 
@@ -132,7 +151,7 @@ After the upgrade, a TLS 1.3 handshake inside the WebSocket:
 - accepted only if the token's owner is the connection's owner;
 - starts a waiting period (**72 hours by default**, configurable on the Provider-side) and returns when it completes;
 - **cancelled by any successful control-session authentication with the current secret** during the waiting period; sessions don't count;
-- on completion, the new hash replaces the old one; the `connectionID`, pinned session CAs, server keys and all Provider-side state stay.
+- on completion, the new hash replaces the old one; the `connectionID`, pinned connector CAs, server keys and all Provider-side state stay.
 
 ## Server keys
 
@@ -150,6 +169,9 @@ The operator turns this into aggregate conditions ([03 Operator, "Readiness and 
 
 ## Errors and retries
 
+- **Upgrades refused with `503` and `Retry-After`** (e.g. by a standby Provider replica): the connector treats the value as the **lower bound for its normal reconnect backoff** (jitter, growth on repeated failures), with no special handling. A standby built on the SDK sends `Retry-After = max(5s, ceil(LeaseDuration / 3))`, derived from its leader-election settings ([07 SDK, "Replicas"](./xxx-notes-011-v5-impl-07-provider-sdk.md)). A `503` from the Provider's edge without `Retry-After` falls back to the normal backoff.
+- **A session closed gracefully by the Provider-side** (go-away, then close): connectors reconnect at once, with jitter.
+
 - **Authentication failures** return a uniform response without detail; the Provider-side records the reason for its own audit and notifications.
 - **Rate limits** return `429` with `Retry-After`; the PM-side honours it with jitter.
 - **Transient failures** (`5xx`, connection errors) are retried with backoff; registration and rebind retries reuse the same idempotency key and hash.
@@ -165,7 +187,7 @@ The operator turns this into aggregate conditions ([03 Operator, "Readiness and 
 ## Deliverables
 
 - **This contract as a versioned specification** in the SDK module, with the message schemas.
-- **Test vectors**: valid and invalid assertions (expired, wrong `aud`, wrong `cluster`, foreign chain, missing EKU, too-long chain, replayed `jti`), inner-TLS mismatches (client certificate not equal to the assertion leaf, unpinned server key), stream preambles outside the allow-list. Shared by the SDK and the connector's tests ([10 Testing](./xxx-notes-011-v5-impl-10-testing.md)).
+- **Test vectors**: valid and invalid assertions (expired, wrong `aud`, wrong `cluster`, missing or malformed `hosts`, foreign chain, missing EKU, too-long chain, replayed `jti`), inner-TLS mismatches (client certificate not equal to the assertion leaf, unpinned server key), stream preambles outside the allow-list. Shared by the SDK and the connector's tests ([10 Testing](./xxx-notes-011-v5-impl-10-testing.md)).
 
 ## Decided
 

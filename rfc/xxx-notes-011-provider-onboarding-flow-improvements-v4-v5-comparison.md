@@ -7,7 +7,7 @@ Working notes for [011](./011-provider-onboarding-flow-improvements.md). Not the
 ## In one paragraph each
 
 - **v4** keeps v2's model, where the Provider-side holds kcp credentials and talks to kcp itself through a dial-proxy tunnel, and hardens it against everything outside the owner's workspace. The PM-side proves a **pinned per-connection key** in an **inner mTLS** handshake that runs inside an ordinary HTTPS WebSocket, so the Provider's ingress or CDN sees nothing but opaque bytes. Access tokens and kcp's CA bundle travel only inside the inner TLS.
-- **v4-b** is v4 with v5's lessons applied, keeping v4's core (kcp credentials on the Provider-side, a dial-proxy tunnel, end-to-end TLS to kcp). A stateful **connection controller** holds every connection key and makes all control calls, including token delivery, over v4's inner mTLS. Stateless **per-shard connectors** only carry tunnels, which run on a plain WebSocket authenticated by short-lived **session assertions** from a pinned **session CA**. It adds v5's connection export with a maximal permission policy, rebind, and egress hardening.
+- **v4-b** is v4 with v5's lessons applied, keeping v4's core (kcp credentials on the Provider-side, a dial-proxy tunnel, end-to-end TLS to kcp). A stateful **connection controller** holds every connection key and makes all control calls, including token delivery, over v4's inner mTLS. Stateless **per-shard connectors** only carry tunnels, which run on a plain WebSocket authenticated by short-lived **session assertions** from a pinned **connector CA**. It adds v5's connection export with a maximal permission policy, rebind, and egress hardening.
 - **v5** removes kcp credentials from the Provider-side altogether. Per-shard **connectors** become authenticating HTTP reverse proxies that add the connection's SA token themselves. Since nothing at the Provider's edge works against kcp any more, v5 declares **the Provider's edge the Provider's responsibility** and drops the inner mTLS, server-key pinning and the pinned connection key. The connection controller makes control calls with a bearer **connection secret**; connectors authenticate sessions with session assertions, as in v4-b.
 
 ## At a glance
@@ -18,16 +18,16 @@ Working notes for [011](./011-provider-onboarding-flow-improvements.md). Not the
 | Trust boundaries | Owner's workspace is the owner's responsibility | Same as v4 | Same, plus, with plain sessions: the Provider's edge is the Provider's responsibility. Inner TLS on sessions (proposed default) removes that assumption |
 | kcp credentials on the Provider-side | SA access token (hours) + kcp CA bundle | Same as v4 | **None** |
 | PM-side identity, control path | Pinned connection key, proven in inner mTLS | Same as v4 | Bearer connection secret (PM-generated; Provider stores its hash) |
-| PM-side identity, tunnel or session path | Same pinned key | Session assertion, signed with a short-lived shard certificate from a pinned session CA | Same as v4-b |
+| PM-side identity, tunnel or session path | Same pinned key | Session assertion, signed with a short-lived connector certificate from a pinned connector CA | Same as v4-b |
 | Provider-side identity | Web PKI at registration, then a pinned server key | Same as v4 (control path); none needed on tunnels | Web PKI |
 | What crosses the WebSocket | Inner TLS 1.3 → connection API, or the dial-proxy tunnel → end-to-end TLS to kcp | Control: inner TLS 1.3 → connection API. Tunnel: dial proxy → end-to-end TLS to kcp | Stream multiplexer → plain HTTP to the connector |
 | TLS layers on kcp traffic | 3 (outer, inner, end to end to kcp) | 2 (outer, end to end to kcp) | Plain sessions: 2 (outer to the Provider, connector to kcp). Inner TLS on sessions: 3 |
 | Who terminates the Provider-side's kcp requests | kcp (front-proxy, shard virtual workspaces) | Same as v4 | The connector, which re-issues them to kcp |
-| PM-side components | One connector (placement open) | Connection controller (stateful, HA) + stateless per-shard connectors + session CA + connection export | Same as v4-b, connectors built as kcp virtual workspaces |
+| PM-side components | One connector (placement open) | Connection controller (stateful, HA) + stateless per-shard connectors + connector CA + connection export | Same as v4-b, connectors built as kcp virtual workspaces |
 | Sessions per connection | Two (API session, tunnel session) from one connector | Control sessions on demand from the controller; at most one tunnel per (connection, shard), only where there's traffic | At most one session per (connection, shard), only where there's traffic |
 | Revoking kcp access | Token TTL (finding 2), unless `DELETE` arrives and the Provider discards the token | Token TTL (finding 2); tunnels close at once | Immediate: connectors stop proxying |
 | Recovery after a lost PM-side credential | Restore from a recent backup, otherwise a new connection with no state | Rebind with a waiting period; same `connectionID`, state kept | Same as v4-b |
-| Main cost | Connector holds every key; complexity on both sides; placement open | Two authentication schemes on the Provider-side; a session CA to run; controller on the token path | A second, lighter virtual-workspace hop for remote Providers' traffic; a session CA to run; with plain sessions, the edge holds the Provider's end of every session, with inner TLS, pinning machinery on the session path |
+| Main cost | Connector holds every key; complexity on both sides; placement open | Two authentication schemes on the Provider-side; a connector CA to run; controller on the token path | A second, lighter virtual-workspace hop for remote Providers' traffic; a connector CA to run; with plain sessions, the edge holds the Provider's end of every session, with inner TLS, pinning machinery on the session path |
 
 ## Architecture
 
@@ -43,7 +43,7 @@ v4-b
 connection controller ══ outer TLS ══▶ ingress ──▶ connection server
                       ╚═ WebSocket /control ═╗
                            ╚═ inner TLS 1.3: pinned connection key ⇄ pinned server key
-                                ╚═ connection API (credentials, key, session CAs, status, delete)
+                                ╚═ connection API (credentials, key, connector CAs, status, delete)
 connector@shard ══ outer TLS ══▶ ingress ──▶ connection server
                 ╚═ WebSocket /tunnel, Bearer <session assertion> ═╗
                      ╚═ dial proxy ═▶ Provider-side's own TLS to kcp, with its token
@@ -56,7 +56,7 @@ connection controller ── HTTPS control calls (bearer connection secret) ─�
 ```
 
 - **v4's connector is a byte pipe** that also holds every connection key and makes every control call. Where it runs (and whether it's per shard) is an open item.
-- **v4-b keeps the byte pipe and moves the keys out.** Connectors forward opaque streams and hold only their shard certificate; everything secret sits in the controller. Connectors are plain per-shard StatefulSets, not virtual workspaces: nothing on their path is request-shaped.
+- **v4-b keeps the byte pipe and moves the keys out.** Connectors forward opaque streams and hold only their connector certificate; everything secret sits in the controller. Connectors are plain per-shard StatefulSets, not virtual workspaces: nothing on their path is request-shaped.
 - **v5's connector is an application-level proxy.** It sees every request, enforces policy on it, audits it and attaches the identity. It's built as a kcp virtual workspace, one per shard, deployed through kcp-operator's `VirtualWorkspace` with `shardRef`.
 - **v4-b and v5 separate control and data.** In v5 the controller is entirely off the traffic path; in v4-b it still delivers access tokens (see "Failure and recovery").
 
@@ -64,10 +64,10 @@ connection controller ── HTTPS control calls (bearer connection secret) ─�
 
 | Question | v4 | v4-b | v5 |
 |---|---|---|---|
-| Who is trusted with a connection's identity? | Whoever can read the connection Secret (owner's workspace) | Same, for control calls. Tunnels need a shard certificate or the session CA (PM's control plane) | Same as v4-b |
+| Who is trusted with a connection's identity? | Whoever can read the connection Secret (owner's workspace) | Same, for control calls. Tunnels need a connector certificate or the connector CA (PM's control plane) | Same as v4-b |
 | Is the Provider's edge trusted? | No. Inner mTLS and server-key pinning defend against it | No, for anything that works against kcp. On tunnels it sees dial targets and timing, and can inject dials that reach the allow-listed kcp hosts anonymously | Plain sessions: yes, as the Provider already trusts it with all its customers' traffic. Inner TLS on sessions (proposed default): no (see "The Provider's edge") |
 | How does the Provider-side know it's talking to the real kcp? | kcp CA bundle, delivered by the connector, verified end to end | kcp CA bundle, delivered by the controller over the control channel, verified end to end | It doesn't separately: in tunnel mode, trusting kcp is trusting the connection (v5 observation 12) |
-| Can an outsider (stolen token, portal account, edge) present a fake kcp? | No: needs the connection key | No: needs the connection key. A tunnel holder can't either | No: needs the connection secret, a shard certificate or the session CA |
+| Can an outsider (stolen token, portal account, edge) present a fake kcp? | No: needs the connection key | No: needs the connection key. A tunnel holder can't either | No: needs the connection secret, a connector certificate or the connector CA |
 | Can the Provider harm PM from its own workspace? | Not addressed: the Provider holds an SA token with admin in its workspace, used directly against kcp | Records are read-only (maximal permission policy, enforced by kcp). Deleting the binding or forging endpoint-slice status can't be denied, but only hurts the Provider or opens idle tunnels | No: maximal permission policy on records, plus the connector's denylist for the binding, endpoint-slice status, token and CSR minting |
 
 **Anchors per trust question** (v4's "Choosing the PM-side anchor", v4-b's "Choosing the anchors", v5's "Session credentials"):
@@ -75,11 +75,11 @@ connection controller ── HTTPS control calls (bearer connection secret) ─�
 | Who verifies whom | v4 | v4-b | v5 |
 |---|---|---|---|
 | Provider-side → PM-side, control calls | Pinned connection key, inner mTLS | Same as v4 | Hash of the bearer connection secret |
-| Provider-side → PM-side, tunnels or sessions | Same pinned key | Session assertion chaining to the pinned session CA | Same as v4-b |
+| Provider-side → PM-side, tunnels or sessions | Same pinned key | Session assertion chaining to the pinned connector CA | Same as v4-b |
 | PM-side → Provider-side | Web PKI at registration, then the pinned server key | Same as v4, on control sessions; not needed on tunnels | Web PKI |
 | Provider-side → kcp | Delivered kcp CA bundle, changeable only with the connection key | Same as v4 | Not separately: the Provider-side trusts responses on an authenticated session |
 
-v4-b's case for a session CA on tunnels is stronger than v5's for its sessions: a v4-b tunnel holder can't read or fake kcp traffic, while a v5 session holder can serve fake data. Both keep the CA away from control calls.
+v4-b's case for a connector CA on tunnels is stronger than v5's for its sessions: a v4-b tunnel holder can't read or fake kcp traffic, while a v5 session holder can serve fake data. Both keep the CA away from control calls.
 
 v4 and v4-b protect a credential from the Provider's edge; v5 stops sending it. With plain sessions, though, the edge holds the Provider's end of every session: it can act as the Provider in kcp while sessions last, fake kcp's responses, and read reconcile traffic, which is largely PM consumers' data. It keeps nothing usable once the sessions close. v5's proposed inner TLS on sessions removes all of that (see "The Provider's edge"). v4-b's one new edge exposure is network reach: dials injected into an unencrypted tunnel reach kcp without credentials, which matters only where kcp's hosts aren't already reachable from the internet (an open item in v4-b).
 
@@ -89,23 +89,23 @@ v4 and v4-b protect a credential from the Provider's edge; v5 stops sending it. 
 |---|---|---|---|
 | Onboarding token | `pm1.<url>.<id>.<secret>`, single-use | Unchanged | Unchanged |
 | Long-lived PM-side credential | Connection **private key** in the owner's workspace; rotated by the connector via `PUT /key` | Same key, read and rotated only by the controller | Connection **secret** (`pmc1_…`, 256 bits); rotated by the controller via `PUT /secret`. Prefixed so secret scanners catch it |
-| Short-lived PM-side credential | Self-signed connection certificate (hours), created on demand | Connection certificate on control sessions; session assertion (≤ 5 min, audience-bound, `jti`) with a shard certificate (hours) on tunnels | Session assertion with a shard certificate |
-| PM-side CA | None, deliberately (v4 rejected a shared PM CA as the anchor) | Session CA, immutable generations, pinned by certificate. Authorizes tunnels only: no control calls, no kcp credentials, no readable kcp traffic | Session CA, same form. Authorizes sessions: no control calls or kcp access, but a forged session can serve fake data |
+| Short-lived PM-side credential | Self-signed connection certificate (hours), created on demand | Connection certificate on control sessions; session assertion (≤ 5 min, audience-bound, `jti`) with a connector certificate (hours) on tunnels | Session assertion with a connector certificate |
+| PM-side CA | None, deliberately (v4 rejected a shared PM CA as the anchor) | Connector CA, immutable generations, pinned by certificate. Authorizes tunnels only: no control calls, no kcp credentials, no readable kcp traffic | Connector CA, same form. Authorizes sessions: no control calls or kcp access, but a forged session can serve fake data |
 | Provider-side key | Server key, pinned, rotated with overlap and refetch | Same as v4 (control sessions only) | None |
 | kcp SA token | Minted by the connector, `PUT` to the Provider-side; optional self-rotation | Minted by the controller, `PUT` over a control session; self-rotation on by default after the claim | Minted by the connector, kept in its memory, never sent |
 | kcp CA bundle | Sent with every `PUT /credentials`, from PM's own trust | Same as v4, sent by the controller | Used by the connector only |
 
 **Where the high-value secrets live:**
 - **v4**: the connector reads every connection's private key. A compromised connector or its node exposes all connections at once (v4's top threat).
-- **v4-b**: the controller holds every connection key and the session CA. A compromised connector yields one shard certificate for hours: denial of service and traffic analysis on that shard's tunnels, nothing more.
-- **v5**: the controller holds every connection secret and the session CA. A compromised connector exposes its shard's sessions until its certificate expires, including plaintext reconcile traffic and the ability to serve fake data, but has no persistent secret.
+- **v4-b**: the controller holds every connection key and the connector CA. A compromised connector yields one connector certificate for hours: denial of service and traffic analysis on that shard's tunnels, nothing more.
+- **v5**: the controller holds every connection secret and the connector CA. A compromised connector exposes its shard's sessions until its certificate expires, including plaintext reconcile traffic and the ability to serve fake data, but has no persistent secret.
 
 **Threats compared** (v4 and v4-b rank theirs explicitly; v5 describes what moved):
 
 | Path | v4 | v4-b | v5 |
 |---|---|---|---|
-| Highest-impact target | The connector or its node: every connection's key (ranked 1) | The controller or its node: every connection's key and the session CA (ranked 1) | The control plane: every connection secret and the session CA |
-| A compromised connector | Same as above | One shard certificate for hours: denial of service and dial metadata (ranked 5) | One shard's sessions for hours: plaintext traffic, fake data |
+| Highest-impact target | The connector or its node: every connection's key (ranked 1) | The controller or its node: every connection's key and the connector CA (ranked 1) | The control plane: every connection secret and the connector CA |
+| A compromised connector | Same as above | One connector certificate for hours: denial of service and dial metadata (ranked 5) | One shard's sessions for hours: plaintext traffic, fake data |
 | The owner's workspace | One connection per leaked key (ranked 2) | Same (ranked 2) | One connection per leaked secret; prefixed secrets are caught by scanners |
 | A compromised portal account | New connections only (ranked 3) | New connections, plus rebinds that get cancelled (ranked 3) | Same as v4-b |
 | Server key plus the Provider's edge | Impersonate the Provider-side, receive access tokens (ranked 4) | Same, on control sessions (ranked 4) | Not applicable: no server key, and the edge is trusted |
@@ -115,11 +115,11 @@ v4 and v4-b protect a credential from the Provider's edge; v5 stops sending it. 
 
 | Step | v4 | v4-b | v5 |
 |---|---|---|---|
-| Register | `POST` with token, addressing and the connection key's public key; get `connectionID` and `serverKeys` | Same, plus the session CA certificates | `POST` with token, addressing, the secret's hash and the session CA certificate; get `connectionID` |
+| Register | `POST` with token, addressing and the connection key's public key; get `connectionID` and `serverKeys` | Same, plus the connector CA certificates | `POST` with token, addressing, the secret's hash and the connector CA certificate; get `connectionID` |
 | After registration | Connector opens a session, `PUT`s the access token and kcp CA bundle, opens the tunnel | Controller writes the `ProviderConnection` record, then `PUT`s token and CA bundle over a control session; connectors discover the record and open tunnels where needed | Controller writes the record; connectors discover it and open sessions where needed |
 | Readiness | Provider-side reports `kcpReachable` | Provider-side reports per required host whether a tunnel covers it and reaches kcp | Same as v4-b |
 | Steady state | Connector `PUT`s a fresh token and CA bundle at half the TTL and after every reconnect | Controller `PUT`s at half the TTL; the Provider-side also rotates its own token | Nothing reaches the Provider-side; connectors refresh tokens in memory |
-| Credential rotation | Key via `PUT /key` and a handshake with the new key (tunnel reconnects); certificates free | Same, by the controller; tunnels unaffected. Shard certificates by cert-manager; session CA rolled over rarely via `PUT /session-cas` | Secret via `PUT /secret`; shard certificates by cert-manager; session CA rolled over rarely |
+| Credential rotation | Key via `PUT /key` and a handshake with the new key (tunnel reconnects); certificates free | Same, by the controller; tunnels unaffected. Connector certificates by cert-manager; connector CA rolled over rarely via `PUT /connector-ca-bundle` | Secret via `PUT /secret`; connector certificates by cert-manager; connector CA rolled over rarely |
 | Offboard | `DELETE` in a session; kcp access lasts until the token expires | Record deleted first, so tunnels close; then `DELETE`; kcp access lasts until the token expires | Record deleted first, so sessions close and kcp access ends; then `DELETE` |
 
 ## Data path and load
@@ -156,7 +156,7 @@ What's really different is small: a slow Provider has to be throttled through th
 |---|---|---|---|
 | Infrastructure | HTTPS endpoint with WebSocket support | Same | Same |
 | Keys and CAs of its own | A server key in a Secret | Same as v4 | None |
-| Software (from the SDK) | WebSocket listener with an mTLS server inside; pinning callbacks on both sides; token and CA bundle handling; client rebuild on change; dial-proxy server | v4's control-path mTLS and pinning, plus assertion and x5c chain verification for tunnels; token and CA bundle handling; dial-proxy server routing dials by host | Bearer check; assertion and x5c chain verification against pinned session CAs (with the `KeyUsages` and chain-length details v5 calls out); multiplexer server; a dial hook for client-go's standard transport |
+| Software (from the SDK) | WebSocket listener with an mTLS server inside; pinning callbacks on both sides; token and CA bundle handling; client rebuild on change; dial-proxy server | v4's control-path mTLS and pinning, plus assertion and x5c chain verification for tunnels; token and CA bundle handling; dial-proxy server routing dials by host | Bearer check; assertion and x5c chain verification against pinned connector CAs (with the `KeyUsages` and chain-length details v5 calls out); multiplexer server; a dial hook for client-go's standard transport |
 | kcp knowledge | Uses the token and CA bundle | Same as v4 | None |
 | Client config per connection | `Host`, token, `CAData`, the tunnel's `Dial`; rebuilt or updated when the token or bundle changes | Same, with `Dial` picking a tunnel by target host | `Host` plus `Transport: sdk.Transport(conn.ID)`; never changes |
 | Multi-replica | Lease routing as in v2 | More pressing: tunnels for different shards can land on different replicas | Same as v4-b |
@@ -166,13 +166,13 @@ What's really different is small: a slow Provider has to be throttled through th
 
 | | v4 | v4-b | v5 |
 |---|---|---|---|
-| Components | Connector | Connection controller, per-shard connector StatefulSets, a session CA, a connection export (APIExport with a maximal permission policy) and its binding in every provider workspace | Same as v4-b, connectors as kcp-operator `VirtualWorkspace`s |
+| Components | Connector | Connection controller, per-shard connector StatefulSets, a connector CA, a connection export (APIExport with a maximal permission policy) and its binding in every provider workspace | Same as v4-b, connectors as kcp-operator `VirtualWorkspace`s |
 | State | Connection Secrets (keys) read by the connector | Connection Secrets read by the controller only; records in provider workspaces; connectors stateless | Same as v4-b |
-| Adding a shard | Nothing: the tunnel's allow-list follows `Shard` objects | Deploy its connector and shard certificate; nothing registered anywhere | Same as v4-b |
+| Adding a shard | Nothing: the tunnel's allow-list follows `Shard` objects | Deploy its connector and connector certificate; nothing registered anywhere | Same as v4-b |
 | Rotating kcp's CAs | Next `PUT` carries the new bundle | Same as v4 | Nothing to do: connectors use PM's own trust |
 | Owner sees PM's shard layout | No | No | No |
 | kcp RBAC changes | Provider controller's RFC 006 RBAC | Same, plus the controller's `create` on `serviceaccounts/token` for each SA, the Provider's own for self-rotation, and the export's maximal-permission-policy RBAC | Same as v4, plus connectors' `create` on `serviceaccounts/token` for each SA and the export's maximal-permission-policy RBAC |
-| New operational duties | Connection key backups (owner's choice), server-key overlap | Running the session CA (immutable generations, `rotationPolicy: Never`, rollover schedule, expiry alerts); controller HA, since it delivers tokens; per-shard connector health; server-key overlap | Running the session CA; per-shard connector health; cache-server credentials kcp-operator mounts by default (v5 observation 18) |
+| New operational duties | Connection key backups (owner's choice), server-key overlap | Running the connector CA (immutable generations, `rotationPolicy: Never`, rollover schedule, expiry alerts); controller HA, since it delivers tokens; per-shard connector health; server-key overlap | Running the connector CA; per-shard connector health; cache-server credentials kcp-operator mounts by default (v5 observation 18) |
 
 ## Failure and recovery
 
@@ -234,14 +234,14 @@ v5, INNER TLS ON SESSIONS (proposed default; the edge is outside the trust bound
                               adds SA token │          │                outer TLS  │                         │
                                             │          │                 ends here │                         │
                                 connector ══╪═ inner TLS 1.3 ════════════════════════▶ SDK                    │
-                                            │  client: shard certificate (chains to the pinned session CA)   │
+                                            │  client: connector certificate (chains to the pinned connector CA)   │
                                             │  server: pinned server key                                     │
                                             │    ╚═ multiplexer + plain HTTP, inside the inner TLS           │
                                             │          │                           └─────────────────────────┘
 
   ingress/CDN sees:               opaque bytes
   acts as the Provider in kcp:    the runtime only
-  can fake kcp to the Provider:   nobody without a shard certificate (PM's side)
+  can fake kcp to the Provider:   nobody without a connector certificate (PM's side)
   sees the connection secret:     nobody (control calls move inside the inner TLS too)
 ```
 
@@ -298,7 +298,7 @@ v5 with inner TLS keeps the edge out as v4-b does, without the injected-dials ga
 **v4 over v4-b and v5:**
 - **The Provider's edge sees nothing**, not even which kcp hosts are dialled, and can't inject dials. v4-b exposes tunnel metadata and anonymous reach; v5 with plain sessions relies on the Provider trusting its own edge, and v5 with inner TLS on sessions matches v4 here.
 - **No CA anywhere.** Every credential concerns exactly one connection.
-- **Fewest PM-side moving parts.** No session CA, no connection export, no per-shard deployment.
+- **Fewest PM-side moving parts.** No connector CA, no connection export, no per-shard deployment.
 - **One authentication scheme** on the Provider-side.
 
 **v4-b over v4:**

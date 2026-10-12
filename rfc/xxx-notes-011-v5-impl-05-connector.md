@@ -13,11 +13,11 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Th
 **Doesn't own:**
 - records or anything else in kcp (it writes only TokenRequests);
 - connection secrets or control calls ([03 Operator](./xxx-notes-011-v5-impl-03-providerconnections-operator.md));
-- issuing its certificate ([04 Session CA](./xxx-notes-011-v5-impl-04-session-ca.md)).
+- issuing its certificate ([04 Connector CA](./xxx-notes-011-v5-impl-04-connector-ca.md)).
 
 ## Principles
 
-- **Stateless** (overview, principle 5): everything comes from its deployment (shard name, its virtual-workspace host, the front-proxy host, its shard certificate) and the connection export.
+- **Stateless** (overview, principle 5): everything comes from its deployment (shard name, its virtual-workspace host, the front-proxy host, its connector certificate) and the connection export.
 - **The Provider's only path into kcp**: whatever it allows, the Provider can do; the policy is the security guarantee and is tested as such ([10 Testing](./xxx-notes-011-v5-impl-10-testing.md)).
 - **kcp's serving stack, not a hand-written proxy**: authentication, authorization, audit, timeouts, limits and metrics come from the generic handler chain.
 - **Forward bytes, don't decode objects.** The connector never parses response bodies.
@@ -68,13 +68,27 @@ Several replicas per shard share the connections:
 
 ## Opening a session
 
-1. **Sign a session assertion** with the mounted shard certificate's key: `aud` the connection's session URL, `cluster` the provider workspace's `clusterID`, short `exp`, fresh `jti` ([01 Protocol, "Outer layer"](./xxx-notes-011-v5-impl-01-protocol.md)).
+1. **Sign a session assertion** with the mounted connector certificate's key: `aud` the connection's session URL, `cluster` the provider workspace's `clusterID`, `hosts` the shard's virtual-workspace host(s) from the connector's configuration (during a host rename, both the old and the new one), short `exp`, fresh `jti` ([01 Protocol, "Outer layer"](./xxx-notes-011-v5-impl-01-protocol.md)).
 2. **Dial the base URL** from the `ProviderEndpoint`, under the egress rules (see "Egress to Providers"), and upgrade to a WebSocket.
-3. **Run the inner TLS client handshake** with the shard certificate, accepting only server keys from the `ProviderEndpoint`.
+3. **Run the inner TLS client handshake** with the connector certificate, accepting only server keys from the `ProviderEndpoint`.
 4. **Start yamux** and accept streams opened by the Provider-side.
-5. **Replace sessions** before the edge's maximum connection age (configurable), gracefully; reconnect with backoff on failure.
+5. **Replace sessions** before the edge's maximum connection age (configurable), gracefully; reconnect with backoff on failure. An upgrade refused with `503` and `Retry-After` is retried using the value as the lower bound for the normal reconnect backoff; a session the Provider-side ends gracefully (go-away) is reopened at once. The connector assumes nothing about which Provider replica a session reaches ([01 Protocol, "Provider replicas"](./xxx-notes-011-v5-impl-01-protocol.md)). No replacement while the connector's own certificate is expired (see below).
 
-The shard certificate is reloaded when cert-manager renews it; existing sessions keep their handshake, new ones use the new certificate.
+The connector certificate is reloaded when cert-manager renews it; existing sessions keep their handshake, new ones use the new certificate. **Before switching**, the connector checks that the new certificate chains to the `Active` generation's certificate in the `ConnectorCABundle` (public data; the connector may read it). On a mismatch it keeps its previous certificate until that expires, and reports it (metric and event), so a wrong certificate in the configuration can't silently break every session ([04 Connector CA, "Connector certificates"](./xxx-notes-011-v5-impl-04-connector-ca.md)).
+
+**Provider downtime doesn't affect certificate renewal.** Providers pin CA generations, not connector certificates, so a renewal needs nothing from them. While a Provider is down, the connector retries with backoff; when it's back, the connector dials with an assertion signed by its current certificate, which chains to the same pinned generation. Open sessions aren't affected when the certificate that opened them expires: the handshake and assertion were checked at upgrade, and TLS doesn't re-check expiry on an open connection. They're replaced on the normal schedule, using the new certificate.
+
+**An expired certificate stops new sessions; open ones carry traffic until they end.** If cert-manager can't renew in time (an outage longer than the 12-hour renewal budget), the connector can't open sessions with any Provider. It then **doesn't replace or close sessions that are still open**: it skips graceful replacement and reports the expired state (metric and readiness). That buys time, not continuity: each connection's traffic on this shard stops when its open session ends, whichever comes first of:
+- **the Provider's edge cutting at its maximum connection age**, normally pre-empted by replacement, so usually the real upper bound (typically hours);
+- **the edge or network dropping the connection** (idle cut, edge redeploy, network failure);
+- **the Provider-side restarting**, which ends all its sessions on every shard;
+- **a connector replica restarting, or connections moving between replicas**: no replica can take over, since they all share the expired certificate.
+
+New sessions can't start either: new connections, a shard getting a connection's first consumer, a changed record. The connector's own kcp access (SA tokens) is unaffected.
+
+Operationally:
+- **No connector rollouts while its certificate is expired**: a rollout would end every session of the shard at once. The runbook says so, and the connector's readiness reports the expired state so rollout tooling can hold.
+- **The real budget** is the renewal budget plus whatever remains of each open session's life, not "unaffected traffic"; the documented alert rules and the runbook state it that way ([04 Connector CA, "Signals"](./xxx-notes-011-v5-impl-04-connector-ca.md)).
 
 ## Serving streams
 
@@ -124,6 +138,7 @@ Settings that matter:
 - **The connector's own identity** comes from the `VirtualWorkspace`'s `kubeconfigSecretRef`, which must always be set: without it, kcp-operator mounts its privileged logical-cluster-admin credential into the pod. All shards' connectors share **one group**. The identity needs:
   - read-only `apiexports/content` on the connection export;
   - in every provider workspace, `access` and `create` on `serviceaccounts/token` for that one SA, granted by the Provider controller ([06 Provider controller, "Connector RBAC"](./xxx-notes-011-v5-impl-06-provider-controller.md)).
+- **In the runtime cluster**: read access to the `ConnectorCABundle` (public data, for the chain check) and its own connector certificate Secret. Nothing else.
 - **No `Shard` objects, no `/services/admin`.** The connector doesn't use the cache server, but kcp-operator mounts cache-server credentials into every `VirtualWorkspace` when a cache server is configured, as in PM. **Accepted and documented** as part of a compromised connector's blast radius ([09 Deployment, "Dependencies on kcp-operator"](./xxx-notes-011-v5-impl-09-deployment.md)).
 
 ## Egress to Providers
@@ -137,7 +152,9 @@ Per connection: concurrent streams, request rate, header sizes, in-flight reques
 
 ## Observability
 
-- **Metrics**: sessions per state, streams per session, requests by connection and outcome (via `apiserver_request_*`), denials by rule, token mint outcomes, buffer pressure.
+- **Metrics**: sessions per state, streams per session, requests by connection and outcome (via `apiserver_request_*`), denials by rule, token mint outcomes, buffer pressure, and the connector certificate's expiry and chain check ([04 Connector CA, "Signals"](./xxx-notes-011-v5-impl-04-connector-ca.md)). Scraped through a `ServiceMonitor` like PM's other components ([09 Deployment, "Observability"](./xxx-notes-011-v5-impl-09-deployment.md)).
+- **Readiness** reflects an expired connector certificate, so rollout tooling can hold.
+- **Audience**: the people running the PM installation. Owners see their connections' state on `Provider` conditions ([03 Operator, "Readiness and health"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)); Providers see theirs through the SDK.
 - **Audit**: every request with the connection principal and the SA it acted as; at metadata level, never bodies.
 - **Logs**: no tokens, no assertions.
 
@@ -156,7 +173,7 @@ Per connection: concurrent streams, request rate, header sizes, in-flight reques
 ## Decided
 
 - **Replica identity**: accept connection moves on restart.
-- **Shard certificate mount**: through the `VirtualWorkspace`'s `extraVolumes` and `extraVolumeMounts` ([09 Deployment, "Connector"](./xxx-notes-011-v5-impl-09-deployment.md)).
+- **Connector certificate mount**: through the `VirtualWorkspace`'s `extraVolumes` and `extraVolumeMounts` ([09 Deployment, "Connector"](./xxx-notes-011-v5-impl-09-deployment.md)).
 - **Workspace creation** below the provider workspace: denied.
 - **Connector identity**: one group for all shards; `kubeconfigSecretRef` always set.
 - **Cache-server credentials**: accepted, documented.

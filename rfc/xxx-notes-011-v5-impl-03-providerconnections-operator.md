@@ -1,6 +1,6 @@
 # v5 implementation plan: providerconnections-operator
 
-Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). The **control plane**: a new operator at `platform-mesh/operators/providerconnections-operator`. It owns every connection's lifecycle on the PM-side: onboarding, registration, records, health, rotation, rebind, session CA rollover and offboarding. It's never on the session path.
+Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). The **control plane**: a new operator at `platform-mesh/operators/providerconnections-operator`. It owns every connection's lifecycle on the PM-side: onboarding, registration, records, health, rotation, rebind, connector CA rollover and offboarding. It's never on the session path.
 
 ## Responsibilities
 
@@ -10,12 +10,12 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Th
 - every call to a Provider's connection API ([01 Protocol](./xxx-notes-011-v5-impl-01-protocol.md));
 - `ProviderEndpoint` records in provider workspaces ([02 APIs](./xxx-notes-011-v5-impl-02-apis.md));
 - `Provider.status.connection` and the connection conditions;
-- fanning out session CA rollovers ([04 Session CA](./xxx-notes-011-v5-impl-04-session-ca.md)).
+- fanning out connector CA rollovers ([04 Connector CA](./xxx-notes-011-v5-impl-04-connector-ca.md)).
 
 **Doesn't own:**
 - the provider workspace, SA, binding or connector RBAC ([06 Provider controller](./xxx-notes-011-v5-impl-06-provider-controller.md));
 - sessions, proxying or SA tokens ([05 Connector](./xxx-notes-011-v5-impl-05-connector.md));
-- issuing shard certificates ([04 Session CA](./xxx-notes-011-v5-impl-04-session-ca.md)).
+- issuing connector certificates ([04 Connector CA](./xxx-notes-011-v5-impl-04-connector-ca.md)).
 
 ## What it consumes
 
@@ -28,7 +28,7 @@ Exactly two endpoint slices, which is the reason it's a separate operator:
 
 Plus, outside kcp:
 - **read access to `Workspace` objects in `:root:providers`**, to find the provider workspace's logical cluster (see "Finding the provider workspace");
-- **the session CA's public certificates** and generation states ([04 Session CA, "Publishing generations"](./xxx-notes-011-v5-impl-04-session-ca.md));
+- **the `ConnectorCABundle`**: the connector CA's generations, their states and public certificates; the operator writes its status ([04 Connector CA, "ConnectorCABundle"](./xxx-notes-011-v5-impl-04-connector-ca.md));
 - **outbound HTTPS to Providers' base URLs**.
 
 ## Principles
@@ -81,7 +81,7 @@ Every step is resumable: the request's status and the connection Secret record h
 ## Registration
 
 1. **Generate the connection secret** and write it to the connection Secret (write before send).
-2. **Call `POST /v1/connections`** with the token, the request's UID as idempotency key, the `clusterID`, the front-proxy URL, the secret's hash and the current session CA certificates ([01 Protocol, "Registration"](./xxx-notes-011-v5-impl-01-protocol.md)).
+2. **Call `POST /v1/connections`** with the token, the request's UID as idempotency key, the `clusterID`, the front-proxy URL, the secret's hash and the current connector CA certificates ([01 Protocol, "Registration"](./xxx-notes-011-v5-impl-01-protocol.md)).
 3. **On success**, record the `connectionID` in the connection Secret, the request's status and `Provider.status.connection`, and keep the returned server keys for the record.
 4. **On a lost response**, retry with the same idempotency key and hash; the same `connectionID` comes back.
 5. **On refusal** (token spent elsewhere, expired, wrong owner), fail the request with a reason the owner can act on. This is the last point at which a request can fail.
@@ -128,12 +128,15 @@ When a registered `Provider`'s connection Secret is missing and the owner create
 
 If the old secret still exists somewhere the operator can use, it never rebinds; it rotates. A rebind cancelled by someone else's successful authentication fails the request with a reason pointing at a possible leak.
 
-## Session CA rollover
+## Connector CA rollover
 
-Driven by the generation states published by [04 Session CA](./xxx-notes-011-v5-impl-04-session-ca.md):
-- **Pin the next generation**: for every connection, `PUT /session-cas` with the current and next generation, spread over time with a rate limit.
-- **Track progress** by reading pinned fingerprints back from `GET`; report the number of connections not yet converged in metrics.
-- **Unpin the old generation** only after every connection pins the next one and shard certificates come from it; connections that can't be reached are reported, not blocked on forever.
+Driven by the `ConnectorCABundle` resource ([04 Connector CA, "ConnectorCABundle"](./xxx-notes-011-v5-impl-04-connector-ca.md)); people change generation states, the operator only follows:
+- **Every shard worker watches the resource's spec**, validates the certificates, derives the sequence and builds the bundle. All workers compute the same bundle for the same spec, so a late call from a previous Lease holder carries a lower sequence and is refused instead of reverting a newer set.
+- **Push on change**: when the sequence increases, each worker sends `PUT /connector-ca-bundle` to its connections whose pinned sequence (read back from `GET`) is lower, rate-limited ([01 Protocol, "Connector CA bundle"](./xxx-notes-011-v5-impl-01-protocol.md)). Registration always sends the current bundle.
+- **Report per shard**: each worker writes its own entry in the resource's `status.shards` (connections, pinned current, unreachable) with a per-shard field manager.
+- **Aggregate**: one aggregator, under its own Lease separate from the shard Leases, computes the sequence, the published generations, totals and the conditions (`Valid`, `BundleConverged`, `ReadyToActivate`, `ReadyToRetire`) from the shard entries and the connector `Certificate` objects.
+- **Unreachable connections** are listed, not blocked on: conditions count reachable connections only.
+- **Catch up as soon as a connection is back.** A Provider that was down during a rollover still pins the old bundle; once connector certificates come from the new generation, it rejects sessions. Its control channel doesn't depend on the connector CA, so on the **first successful control call after a connection was unreachable**, the worker compares the pinned sequence with the current one and pushes the bundle right away, instead of waiting for the next regular poll. The gap after the Provider's return shrinks from a poll interval to seconds.
 
 ## Offboarding
 
@@ -157,7 +160,7 @@ The operator's kcp identity (a kcp-operator `Kubeconfig`) needs:
 - writes to `providerendpoints` through the connection export, granted by the export's maximal permission policy ([02 APIs, "Connection export"](./xxx-notes-011-v5-impl-02-apis.md));
 - `get`, `list`, `watch` on `workspaces` in `:root:providers`.
 
-In the runtime cluster, it needs read access to the session CA's public certificates and generation states, and nothing else.
+In the runtime cluster, it needs: read access to the `ConnectorCABundle` and write access to its status; read access to the connector `Certificate` objects (not their Secrets); Leases in its namespace. Nothing else, and in particular no access to CA keys or issuers.
 
 ## Partitioning by shard
 
@@ -168,11 +171,11 @@ One Deployment with several replicas in **PM's runtime cluster** (next to platfo
 - **Per-shard Leases**: each replica runs a shard manager that takes Leases for the shards rendezvous hashing assigns to it, and for any shard whose Lease is free and whose preferred replica is gone. Leases live in the operator's namespace in PM's cluster.
 - **Why one owner per shard**: every object needs a single writer at a time (rotations, rebinds and rollovers must not race), and the shard is the coarsest unit that gives that cheaply. Work within a shard is mostly waiting on Provider calls, so it scales with reconcile concurrency (configurable per worker), not replicas. If a single shard ever grows too large, it can be split into buckets with one Lease per (shard, bucket); buckets spread work but not memory, since each bucket's worker still caches the whole shard.
 - **One worker per held shard**: a multicluster-runtime provider restricted to that shard's endpoint of the providers export, with its own caches and work queues. It reconciles requests, `Provider`s and connections of owners' workspaces hosted on that shard. Caches therefore hold only the shards a replica currently holds, and a stuck shard doesn't hold up others.
-- **Shared across workers**: the connection export's full endpoint slice (records may live on any shard), the protocol client with its per-Provider rate limits, and the session CA declaration.
+- **Shared across workers**: the connection export's full endpoint slice (records may live on any shard), the protocol client with its per-Provider rate limits, and the `ConnectorCABundle`.
 - **Shard added**: kcp adds its endpoint to the slice; a replica takes its Lease and starts a worker. **Removed**: the endpoint disappears; the holder stops the worker and releases the Lease. **Replica lost**: its Leases expire; others take its shards over.
 - **Rollover fan-out** runs per worker over its own connections; convergence is reported per shard and summed.
 - **Isolation is of memory and failures, not of access**: all replicas share one kcp identity, and `apiexports/content` isn't shard-scoped. Per-shard access isolation would need per-shard identities, out of scope here.
-- **Remote shards in other clusters** are reached through their virtual-workspace URLs, like any multi-shard consumer. If replicas ever have to span clusters, the Leases and the session CA declaration move into a PM workspace in kcp.
+- **Remote shards in other clusters** are reached through their virtual-workspace URLs, like any multi-shard consumer. If replicas ever have to span clusters, the Leases and the `ConnectorCABundle` move into a PM workspace in kcp.
 
 ## Availability
 
@@ -181,7 +184,8 @@ One Deployment with several replicas in **PM's runtime cluster** (next to platfo
 ## Observability
 
 - **Events** on `ProviderOnboardingRequest` and `Provider` for every phase change and failure, without secrets.
-- **Metrics**: calls per Provider and outcome, poll latency, connections per condition state, rotations and rebinds in progress, rollover convergence, egress refusals.
+- **Metrics**: calls per Provider and outcome, poll latency, connections per condition state, rotations and rebinds in progress, egress refusals, and the connector CA signals (generation expiry, `Valid`, rollover convergence; [04 Connector CA, "Signals"](./xxx-notes-011-v5-impl-04-connector-ca.md)). Scraped through a `ServiceMonitor` ([09 Deployment, "Observability"](./xxx-notes-011-v5-impl-09-deployment.md)).
+- **Audiences**: owners act on events and conditions on their `ProviderOnboardingRequest`s and `Provider`s; the people running PM act on metrics, the `ConnectorCABundle` status and the documented alert rules. Owners never see PM-wide signals, and PM-wide signals never name owners' data beyond connection IDs.
 - **Logs** never contain the token, the secret or hashes.
 
 ## Work breakdown
@@ -192,7 +196,7 @@ One Deployment with several replicas in **PM's runtime cluster** (next to platfo
 4. Protocol client: plain-HTTPS calls, control sessions (WebSocket, inner TLS with pinned keys), retries, egress rules. Shared with nothing else on the PM-side; built against the SDK's test server ([07 SDK, "Testing support"](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
 5. Records writer with drift repair and server-key updates.
 6. Health poller and condition aggregation.
-7. Secret rotation, rebind, session CA rollover.
+7. Secret rotation, rebind, connector CA rollover.
 8. Offboarding finalizer, coordinated with the Provider controller.
 9. Metrics, events, docs.
 

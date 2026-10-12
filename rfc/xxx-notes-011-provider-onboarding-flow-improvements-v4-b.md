@@ -1,6 +1,6 @@
 # Notes v4-b: RFC 011 provider onboarding flow
 
-Working notes for [011](./011-provider-onboarding-flow-improvements.md). Not the RFC itself. v4-b is a variant of the [v4 notes](./xxx-notes-011-provider-onboarding-flow-improvements-v4.md) that applies what the [v5 notes](./xxx-notes-011-provider-onboarding-flow-improvements-v5.md) turned up, while keeping v4's core: **the Provider-side holds kcp credentials and reaches kcp through a dial-proxy tunnel, with end-to-end TLS to kcp** verified against a CA bundle the PM-side delivers. It splits the PM-side into a **control plane** (one stateful connection controller that holds every connection key and makes every control call) and a **data plane** (stateless connectors, one per kcp shard, that only carry tunnels). Control calls run in **mutual TLS inside an ordinary HTTPS WebSocket**, authenticated by a pinned **per-connection key** on the PM-side and a pinned **server key** on the Provider-side. Tunnels run on a plain WebSocket, authenticated by short-lived **session assertions** signed with certificates from a pinned **session CA**. The trust boundary is v4's: **the owner's workspace is the owner's responsibility**, and nothing that works against kcp crosses the Provider's edge in readable form.
+Working notes for [011](./011-provider-onboarding-flow-improvements.md). Not the RFC itself. v4-b is a variant of the [v4 notes](./xxx-notes-011-provider-onboarding-flow-improvements-v4.md) that applies what the [v5 notes](./xxx-notes-011-provider-onboarding-flow-improvements-v5.md) turned up, while keeping v4's core: **the Provider-side holds kcp credentials and reaches kcp through a dial-proxy tunnel, with end-to-end TLS to kcp** verified against a CA bundle the PM-side delivers. It splits the PM-side into a **control plane** (one stateful connection controller that holds every connection key and makes every control call) and a **data plane** (stateless connectors, one per kcp shard, that only carry tunnels). Control calls run in **mutual TLS inside an ordinary HTTPS WebSocket**, authenticated by a pinned **per-connection key** on the PM-side and a pinned **server key** on the Provider-side. Tunnels run on a plain WebSocket, authenticated by short-lived **session assertions** signed with certificates from a pinned **connector CA**. The trust boundary is v4's: **the owner's workspace is the owner's responsibility**, and nothing that works against kcp crosses the Provider's edge in readable form.
 
 The [comparison notes](./xxx-notes-011-provider-onboarding-flow-improvements-v4-v5-comparison.md) put v4, v4-b and v5 side by side.
 
@@ -17,9 +17,9 @@ The [comparison notes](./xxx-notes-011-provider-onboarding-flow-improvements-v4-
 - **Connection certificate**: a short-lived, self-signed client certificate for the connection key, created by the controller whenever it needs one. Only the wrapper TLS needs to carry the key; the Provider-side checks the key, not a chain.
 - **Server key**: the keypair the Provider-side's connection server uses in the inner TLS handshake of control sessions. The PM-side pins its public key at registration.
 - **Control session**: a WebSocket from the controller to the Provider's base URL, carrying one **inner mTLS** connection (pinned connection key ⇄ pinned server key) with the connection API inside it.
-- **Session CA**: a PM connections CA that only issues shard certificates, run by the control plane (cert-manager, ideally with a KMS- or Vault-backed issuer). Every connection pins its **certificate** at registration. Each session CA is an **immutable generation**: never renewed, and replaced by a new CA well before it expires.
-- **Shard certificate**: a short-lived certificate (e.g. 24h) from the session CA for one shard's connector, renewed automatically and mounted read-only. It names the virtual-workspace host its tunnels serve.
-- **Session assertion**: a short-lived JWT signed with the shard certificate's key, carrying the shard certificate in `x5c`, bound to one connection. It authenticates a tunnel session upgrade and nothing else.
+- **Connector CA**: a PM connections CA that only issues connector certificates, run by the control plane (cert-manager, ideally with a KMS- or Vault-backed issuer). Every connection pins its **certificate** at registration. Each connector CA is an **immutable generation**: never renewed, and replaced by a new CA well before it expires.
+- **Connector certificate**: a short-lived certificate (e.g. 24h) from the connector CA for one shard's connector, renewed automatically and mounted read-only. It carries no hostnames: the hosts a tunnel serves travel in its session assertion.
+- **Session assertion**: a short-lived JWT signed with the connector certificate's key, carrying the connector certificate in `x5c`, bound to one connection. It authenticates a tunnel session upgrade and nothing else.
 - **Tunnel session**: a WebSocket from one shard's connector to the Provider's base URL, authenticated with a session assertion, carrying the dial-proxy multiplexer. At most one per (connection, shard), opened only where the connection has traffic. **No inner TLS.**
 - **Access token**: the bound SA token the Provider-side uses against kcp.
 - **Connection export**: a PM APIExport serving `ProviderConnection` records, with a local **maximal permission policy** that allows only reads in the workspaces that bind it, and a read-only permission claim on `apiexportendpointslices`. The Provider controller binds it in every provider workspace when it creates the workspace.
@@ -46,7 +46,7 @@ How the PM-side proves "I own this connection" after registration has changed wi
 
 **The owner's workspace is the owner's responsibility.** It holds the `Provider` object, the connection Secret (with the connection key) and, under RFC 006, more credentials that reach the provider workspace. Whoever gets into it can act as the owner. v4-b doesn't try to defend a connection against its own owner's compromise; it makes sure that:
 - **nothing outside the owner's workspace** can take over an existing connection: not a stolen onboarding token, not a compromised Provider portal account, not the Provider's ingress or CDN;
-- **leaks are bounded** in time where possible (short-lived certificates, assertions and access tokens) and in scope (a leaked connection key affects exactly one connection; a leaked shard certificate yields no credentials and no readable traffic);
+- **leaks are bounded** in time where possible (short-lived certificates, assertions and access tokens) and in scope (a leaked connection key affects exactly one connection; a leaked connector certificate yields no credentials and no readable traffic);
 - **Provider-side state can't be hijacked** by registering a new connection for the same workspace;
 - **the Provider can't rewrite PM's records** in its own workspace, even though it's admin there.
 
@@ -66,7 +66,7 @@ control plane
 connection controller ══ outer TLS (web PKI, terminated at ingress/CDN) ══▶ ingress ──▶ connection server
                       ╚═ WebSocket: GET /v1/connections/{id}/control ═══════════════════════╝
                            ╚═ inner TLS 1.3: pinned connection key ⇄ pinned server key ═════╝
-                                ╚═ connection API: credentials, key, session CAs, status, delete
+                                ╚═ connection API: credentials, key, connector CAs, status, delete
 
 data plane (one per shard, only where the connection has traffic)
 connector@shard ══ outer TLS ══▶ ingress ──▶ connection server
@@ -77,7 +77,7 @@ connector@shard ══ outer TLS ══▶ ingress ──▶ connection server
 
 - **Two kinds of session, two planes.** Control sessions carry everything secret and are authenticated by the pinned connection key and the pinned server key in inner mTLS. Tunnel sessions carry only opaque TLS to kcp, so they need authentication but not confidentiality.
 - **The connection's identity is a pinned public key**, held by the controller only. The controller proves possession in every control handshake with a self-signed certificate it creates itself, and rotates the key on its own. No owner step is ever needed.
-- **Tunnels need no per-connection secret.** Each shard's connector signs assertions with its mounted shard certificate; the Provider-side verifies them against the connection's pinned session CA certificates.
+- **Tunnels need no per-connection secret.** Each shard's connector signs assertions with its mounted connector certificate; the Provider-side verifies them against the connection's pinned connector CA certificates.
 - **A forged tunnel can't fake kcp.** The Provider-side verifies kcp end to end against the CA bundle it received over the control channel, and sends its access token only inside that TLS. A tunnel holder can drop traffic and see dial targets, nothing more.
 - **The connector is an L4 hop.** It never sees kcp requests or credentials.
 - **The Provider-side's identity is a pinned server key**, returned at registration over web PKI, checked on control sessions.
@@ -90,7 +90,7 @@ connector@shard ══ outer TLS ══▶ ingress ──▶ connection server
 - **An HTTPS endpoint at the base URL from the token that supports WebSocket upgrades** and long-lived connections: idle timeouts above the session ping interval (e.g. > 60 s), and a maximum connection age the connectors can reconnect after. Any ingress, cloud L7 load balancer or WebSocket-capable CDN qualifies. A WAF must let binary WebSocket frames through after the upgrade.
 - **A connection server** that serves the connection API on control sessions (inner mTLS behind a WebSocket listener), verifies session assertions on tunnel sessions, and runs the dial-proxy server. The Provider SDK ships it.
 - **A server key** for the inner TLS, kept in a Secret on the Provider-side.
-- **Per-connection pins**: the connection key and the session CA certificates, stored at registration and changed only over a control session or by rebind.
+- **Per-connection pins**: the connection key and the connector CA certificates, stored at registration and changed only over a control session or by rebind.
 - **State keyed by `connectionID`**, never by the PM-side's addressing alone (see "Provider-side state").
 - **Owner notifications and controls.** The portal notifies the token owner of every registration, connection key change and rebind (in the portal and by email), and lets the owner freeze or delete their connections.
 
@@ -101,16 +101,16 @@ Not required: a second hostname, TLS passthrough, client-certificate verificatio
 1. **Get a token.** The user gets an onboarding token from the Provider's portal.
 2. **Create the request.** The owner stores the token in a Secret and creates a `ProviderOnboardingRequest` that references it.
 3. **Create or reuse the `Provider`.** The request creates the `Provider` if it's missing, reuses an unregistered one, refuses a registered one, or starts a rebind for a registered one whose connection Secret is gone (see "Resources").
-4. **Register.** The controller waits for the provider workspace and SA, generates the connection key, writes it to the connection Secret, then calls `POST /v1/connections` with the onboarding token, the addressing, the connection key's public key and the session CA certificates. It gets back the `connectionID` and the connection server's public keys, and stores them in the connection Secret. No kcp credential is sent.
+4. **Register.** The controller waits for the provider workspace and SA, generates the connection key, writes it to the connection Secret, then calls `POST /v1/connections` with the onboarding token, the addressing, the connection key's public key and the connector CA certificates. It gets back the `connectionID` and the connection server's public keys, and stores them in the connection Secret. No kcp credential is sent.
 5. **Write the connection record.** The controller validates the base URL (see "Egress") and writes the `ProviderConnection` record into the provider workspace through the connection export, which the Provider controller bound there when it created the workspace.
 6. **Deliver credentials.** The controller opens a control session and `PUT`s an access token and kcp's CA bundle.
 7. **Open tunnels where they're needed.** The connector on the shard hosting the provider workspace opens a tunnel session right away, for front-proxy traffic. Connectors on shards listed in the connection's Service endpoint slices, i.e. shards with at least one consumer binding, open theirs as those shards appear.
 8. **Confirm kcp is reachable.** The controller polls `GET /v1/connections/{id}` until the Provider-side reports that every host it needs is covered by a tunnel and reaches kcp. Only then is the request `Ready`. From here on, the Provider-side has **claimed** the provider workspace.
 9. **Refresh credentials.** The controller `PUT`s a fresh access token and the current kcp CA bundle at about half the token's TTL. After the claim, the Provider-side also mints its own (see "Credentials and rotation").
-10. **Rotate** the connection key, automatically and periodically (see "Connection key rotation"). Shard certificates renew on their own; session CA generations roll over rarely.
+10. **Rotate** the connection key, automatically and periodically (see "Connection key rotation"). Connector certificates renew on their own; connector CA generations roll over rarely.
 11. **Offboard.** Deleting the `Provider` deletes the record first, so every connector closes its tunnels; then the controller calls `DELETE` in a control session.
 
-Steps 6 to 10 handle every restart and outage, of any length: the connection key doesn't expire, the controller can always create a new certificate for it, and shard certificates are renewed by cert-manager.
+Steps 6 to 10 handle every restart and outage, of any length: the connection key doesn't expire, the controller can always create a new certificate for it, and connector certificates are renewed by cert-manager.
 
 ## Design
 
@@ -133,13 +133,13 @@ Steps 6 to 10 handle every restart and outage, of any length: the connection key
  │  · TokenRequests for each connection's SA            │ ───▶ │           claimed endpoint slices)         │
  │  · ProviderConnection records (through the export)   │      │  writes:  nothing                          │
  │  · status on Provider                                │      │  dials tunnels, forwards streams to kcp    │
- │ session CA (cert-manager, KMS/Vault-backed issuer)   │ ───▶ │ connector@shard-B …  connector@shard-C …   │
+ │ connector CA (cert-manager, KMS/Vault-backed issuer)   │ ───▶ │ connector@shard-B …  connector@shard-C …   │
  └──────────────────────────────────────────────────────┘      └───────────────────────────────────────────┘
 ```
 
 | | Connection controller | Connector@shard |
 |---|---|---|
-| Holds | Every connection key; the session CA's issuer | Its shard certificate (hours), mounted |
+| Holds | Every connection key; the connector CA's issuer | Its connector certificate (hours), mounted |
 | Reads | Connection Secrets (owners' workspaces) | Connection export: records and claimed endpoint slices |
 | Writes | Connection records (through the export); TokenRequests | Nothing |
 | Talks to the Provider | Registration, control sessions, rebind | Tunnel sessions |
@@ -162,7 +162,7 @@ Authorization: Bearer <tokenID>.<tokenSecret>
   "frontProxyURL": "https://...",
   "transport": "tunnel" | "direct",
   "connectionKey": "<PEM SPKI of the connection key>",
-  "sessionCAs": [ "<PEM certificate of the session CA>" ]
+  "sessionCAs": [ "<PEM certificate of the connector CA>" ]
 }
 → 201 {
   "connectionID": "...",
@@ -176,7 +176,7 @@ Authorization: Bearer <tokenID>.<tokenSecret>
 - **`serverKeys` is trustworthy** because the response arrives over the outer TLS to the URL inside the token, authenticated by web PKI (or `spec.remote.caBundle`). It's a list, so the Provider-side can rotate its server key with overlap.
 - **Idempotency is bound to the connection key.** `POST` is keyed on `(tokenID, idempotencyKey)`. A retry returns the same `connectionID` **only if `connectionKey` matches the first attempt**; a different key is refused. If the response is lost and the token has expired, a retry within a bounded window still returns the entry. The response contains nothing secret, so a replay of a logged request gains nothing (finding 9).
 - **Addressing is immutable**: `clusterID` and `frontProxyURL` are fixed at registration. Changing them means a new connection.
-- **Only public material leaves the PM-side**: the connection key's public key and the session CA certificates.
+- **Only public material leaves the PM-side**: the connection key's public key and the connector CA certificates.
 - **Nothing about APIExports is negotiated.** The Provider owns its exports and knows its endpoint slices (see "Provider-side: serving many PM instances").
 
 ### Choosing the anchors
@@ -186,7 +186,7 @@ v4-b has four separate trust questions:
 | Who verifies | Whom | Kind of trust | v4-b's answer |
 |---|---|---|---|
 | Provider-side | the PM-side, on control calls | client authentication | **the pinned connection key** |
-| Provider-side | the PM-side, on tunnels | client authentication | **a session assertion chaining to the pinned session CA** |
+| Provider-side | the PM-side, on tunnels | client authentication | **a session assertion chaining to the pinned connector CA** |
 | PM-side | the Provider-side, on control calls | server authentication | web PKI at registration, then the pinned server key |
 | Provider-side | kcp, through a tunnel | server authentication | kcp's CA bundle, delivered over the control channel (see "kcp's CA bundle") |
 
@@ -205,7 +205,7 @@ The PM-side identity must rest on client-authentication trust only. kcp's servin
 
 A per-connection key has the smallest blast radius, needs no CA anywhere, and rotates without anyone else's involvement. Control calls carry access tokens and the kcp CA bundle, so they get the strongest anchor.
 
-**Tunnels: a session CA.** A shared CA would be the wrong anchor for the connection's identity, which is why the control path doesn't use one. Tunnels are different: a tunnel session can't make control calls, can't obtain kcp credentials, and can't read or alter kcp traffic, which is end-to-end TLS verified against a CA bundle from the control channel. A leaked shard certificate or CA key therefore allows denial of service and traffic analysis for the connections it covers, until the certificate expires or the generation is unpinned. In exchange, connectors need no per-connection secret, and adding shards or replicas involves no one (see "The session CA").
+**Tunnels: a connector CA.** A shared CA would be the wrong anchor for the connection's identity, which is why the control path doesn't use one. Tunnels are different: a tunnel session can't make control calls, can't obtain kcp credentials, and can't read or alter kcp traffic, which is end-to-end TLS verified against a CA bundle from the control channel. A leaked connector certificate or CA key therefore allows denial of service and traffic analysis for the connections it covers, until the certificate expires or the generation is unpinned. In exchange, connectors need no per-connection secret, and adding shards or replicas involves no one (see "The connector CA").
 
 ### Connection key and certificates
 
@@ -269,7 +269,7 @@ PUT /v1/connections/{id}/key                  # connection key rotation
 { "connectionKey": "<PEM SPKI of the NEW connection key>" }
 → 202                                         # pending until a handshake with a certificate for it
 
-PUT /v1/connections/{id}/session-cas          # session CA rollover (rare)
+PUT /v1/connections/{id}/connector-ca-bundle          # connector CA rollover (rare)
 { "sessionCAs": [ "<PEM certificate>", ... ] } # current generation, plus the next one during a rollover
 → 204
 
@@ -287,19 +287,20 @@ Outside control sessions, on plain HTTPS: `POST /v1/connections` (registration),
 ```
 GET /v1/connections/{id}/tunnel         (WebSocket upgrade, on the base URL; dial-proxy multiplexer inside)
 Authorization: Bearer <session assertion>
-  header: { "alg": "ES256", "x5c": [ "<shard certificate>", "<intermediate, if any>" ] }
+  header: { "alg": "ES256", "x5c": [ "<connector certificate>", "<intermediate, if any>" ] }
   claims: { "aud": "<base URL>/v1/connections/{id}/tunnel",
             "cluster": "<clusterID of the provider workspace>",
+            "hosts": [ "<virtual-workspace host(s) this tunnel serves>" ],
             "sub": "<opaque session-group ID>",            # e.g. a hash of shard and connectionID; audit only
             "iat": …, "exp": iat + ≤ 5m, "jti": "<random>" }
 ```
 
 **Verifying a session assertion** (in the Provider SDK):
-1. The chain in `x5c` verifies with the standard verifier (`x509.Verify`) against **only** the connection's pinned session CA certificates as roots, with at most one intermediate. That checks every certificate's validity and the CA constraints. The shard certificate must be allowed for signing (key usage `digitalSignature`, plus whatever EKU the session CA uses to mark shard certificates). Two details the SDK must get right: Go's verifier requires EKU `serverAuth` unless `VerifyOptions.KeyUsages` says otherwise, so it has to pass the shard certificates' EKU explicitly; and "at most one intermediate" has to be enforced, by the root's path-length constraint or by checking the chain length.
-2. The JWT signature verifies with the shard certificate's public key.
+1. The chain in `x5c` verifies with the standard verifier (`x509.Verify`) against **only** the connection's pinned connector CA certificates as roots, with at most one intermediate. That checks every certificate's validity and the CA constraints. The connector certificate must be allowed for signing (key usage `digitalSignature`, plus whatever EKU the connector CA uses to mark connector certificates). Two details the SDK must get right: Go's verifier requires EKU `serverAuth` unless `VerifyOptions.KeyUsages` says otherwise, so it has to pass the connector certificates' EKU explicitly; and "at most one intermediate" has to be enforced, by the root's path-length constraint or by checking the chain length.
+2. The JWT signature verifies with the connector certificate's public key.
 3. `aud` is exactly this connection's tunnel URL; `exp` and `iat` are within a clock-skew tolerance, and `exp - iat` is at most 5 minutes; the `jti` hasn't been seen within the validity window.
 4. `cluster` equals the `clusterID` stored for this connection at registration. The connector takes it from the logical cluster of the connection record it acts on.
-5. The session serves the hosts named in the shard certificate (URI SANs listing its virtual-workspace host), plus the connection's front-proxy, which every tunnel may carry.
+5. The session serves the hosts in the assertion's `hosts` claim (routing, not authority: the Provider-side never resolves them), plus the connection's front-proxy, which every tunnel may carry.
 
 **What runs inside**: a dial proxy, in remotedialer's designed direction. The Provider-side, which accepted the WebSocket, dials through the connector, which opened it. For each stream, the connector checks the target against its allow-list (see "Egress") and forwards it as a TCP connection to kcp. The Provider-side then runs its own TLS to kcp on that stream.
 
@@ -309,15 +310,15 @@ Authorization: Bearer <session assertion>
 
 **Liveness and replacement.** WebSocket pings at the outer level, so ingresses see traffic and don't time the connection out; multiplexer keepalives inside. The connector replaces tunnels before the Provider's edge cuts them at its maximum connection age: it opens a new tunnel, sends the multiplexer's go-away on the old one, and closes it when its streams finish. An abrupt cut drops that tunnel's streams at once, as with any apiserver connection; client-go retries and relists.
 
-### The session CA
+### The connector CA
 
-- **A CA is a keypair plus a certificate.** The private key signs shard certificates and never leaves PM's control plane. Providers pin the **certificate**, so they get its name, validity and constraints, and verify with standard library code.
-- **Each session CA is an immutable generation.** Its lifetime is well beyond the planned rollover interval (e.g. a 5-year CA replaced yearly), and it's never renewed. Changing anything about the CA means a **new** CA, added alongside the old one with an overlap. So the pinned certificate never changes under a connection.
+- **A CA is a keypair plus a certificate.** The private key signs connector certificates and never leaves PM's control plane. Providers pin the **certificate**, so they get its name, validity and constraints, and verify with standard library code.
+- **Each connector CA is an immutable generation.** Its lifetime is well beyond the planned rollover interval (e.g. a 5-year CA replaced yearly), and it's never renewed. Changing anything about the CA means a **new** CA, added alongside the old one with an overlap. So the pinned certificate never changes under a connection.
 - **The pinned certificate's expiry is a hard deadline.** A generation that was never rolled over stops being trusted, including at Providers that couldn't be reached when it was replaced.
-- **cert-manager must never renew the CA by itself.** With `rotationPolicy: Always` (the default in recent cert-manager versions), a renewal silently replaces the key: new shard certificates are signed by a key no Provider has pinned, and new tunnels fail everywhere. It's the same trap as kcp's per-shard SA keys (finding 4). A cert-manager-managed session CA sets `rotationPolicy: Never` as a safety net. A Vault- or KMS-backed issuer keeps the key out of Kubernetes Secrets and makes the policy irrelevant.
+- **cert-manager must never renew the CA by itself.** With `rotationPolicy: Always` (the default in recent cert-manager versions), a renewal silently replaces the key: new connector certificates are signed by a key no Provider has pinned, and new tunnels fail everywhere. It's the same trap as kcp's per-shard SA keys (finding 4). A cert-manager-managed connector CA sets `rotationPolicy: Never` as a safety net. A Vault- or KMS-backed issuer keeps the key out of Kubernetes Secrets and makes the policy irrelevant.
 - **An optional intermediate** lets PM rotate the issuing key without involving Providers. Nothing revokes an intermediate, so it must be short-lived (e.g. weeks).
-- **Shard certificates are the opposite**: nobody pins them, so they keep `rotationPolicy: Always` and a short lifetime, with a new key on every renewal.
-- **Rollover**: the controller `PUT`s the next generation on every connection's control session, lets cert-manager issue shard certificates from it, then unpins the old one. It's the one operation that fans out to every connection, and it's scheduled, not urgent.
+- **Connector certificates are the opposite**: nobody pins them, so they keep `rotationPolicy: Always` and a short lifetime, with a new key on every renewal.
+- **Rollover**: the controller `PUT`s the next generation on every connection's control session, lets cert-manager issue connector certificates from it, then unpins the old one. It's the one operation that fans out to every connection, and it's scheduled, not urgent.
 - **A compromised shard**: stop issuing to it; its certificate expires within hours. Roll over the CA only if its key is in doubt.
 
 **What it removes**, compared with per-connection credentials on connectors: no connection keys on the data path, no registration call per shard, replica or key rotation, and no state in the connector. Adding a shard or a replica involves neither the controller nor any Provider.
@@ -337,12 +338,12 @@ Provider ingress
 1. **Which tunnels exist.** A shard's connector keeps a tunnel for a connection when either:
    - **the connection's record came from its own shard's virtual-workspace endpoint** of the connection export. The provider workspace is hosted on this shard, and this connector carries the connection's front-proxy tunnel, from the start and even with no consumers yet; or
    - **one of the connection's Service endpoint slices lists its own shard's virtual-workspace URL**. kcp lists a shard there exactly when it has at least one binding to the export. Only slices in the provider workspace that point at an export **in that same workspace** count; otherwise a Provider could create slices for someone else's export.
-2. **Shards come and go with their deployments.** A new shard's connector gets a shard certificate and starts watching the connection export. When kcp adds the shard to a connection's endpoint slices, the connector dials. Nobody registers anything. "Is there a connector for every shard?" is a deployment-health question, not something checked at runtime.
+2. **Shards come and go with their deployments.** A new shard's connector gets a connector certificate and starts watching the connection export. When kcp adds the shard to a connection's endpoint slices, the connector dials. Nobody registers anything. "Is there a connector for every shard?" is a deployment-health question, not something checked at runtime.
 3. **Discovery: the connection export.** kcp's per-shard virtual workspaces only see their own shard, while `Provider` objects live in owners' workspaces on any shard. Each connector instead consumes PM's connection export like any multi-shard controller: it reads the export's APIExportEndpointSlice through the front-proxy, then list/watches through every shard virtual-workspace URL in it (multicluster-runtime's endpoint-slice provider):
    - **`ProviderConnection` records**: every object arrives with its logical cluster, the provider workspace's `clusterID`, and which endpoint delivered it tells the connector which shard hosts the workspace;
    - **the connections' Service `apiexportendpointslices`**, read-only, through the export's permission claim. That's how the connector learns which shards have consumers, without any shard-wide read of APIBindings.
 4. **Allow-list from deployment configuration**: its own shard's virtual-workspace host and the front-proxy host. No `Shard` objects, no `/services/admin`.
-5. **Deployment**: one StatefulSet per shard from PM's chart or operator, plus a cert-manager `Certificate` for its shard certificate. The connector isn't request-shaped, so it needs neither the virtual workspace framework nor kcp-operator's `VirtualWorkspace` resource, and doesn't get the cache-server credentials that resource mounts (finding 15).
+5. **Deployment**: one StatefulSet per shard from PM's chart or operator, plus a cert-manager `Certificate` for its connector certificate. The connector isn't request-shaped, so it needs neither the virtual workspace framework nor kcp-operator's `VirtualWorkspace` resource, and doesn't get the cache-server credentials that resource mounts (finding 15).
 6. **Front-proxy traffic on any tunnel.** The front-proxy routes workspace traffic to the right shard anyway, so every tunnel may carry it. The hosting shard's tunnel guarantees there's always one, even before any consumer binds.
 
 **Replicas.** Within one shard, the connector runs several replicas and shares the connections among them:
@@ -385,7 +386,7 @@ The owner has no rights in the provider workspace; only PM's own components and 
 ### No re-onboarding
 
 v2 let a new request re-onboard an existing connection using only an onboarding token, which comes from the Provider's portal, outside the owner's workspace. Combined with a CA bundle delivered by the connection, a stolen token or a compromised portal account could take over an existing connection and point it at a fake kcp (finding 7). v4-b doesn't allow that:
-- **Changes to an existing connection** (credentials, kcp CA bundle, key rotation, session CAs, deletion) only happen inside a control session authenticated by the connection key.
+- **Changes to an existing connection** (credentials, kcp CA bundle, key rotation, connector CAs, deletion) only happen inside a control session authenticated by the connection key.
 - **Registration only creates new connections.**
 - **Recovering a connection whose key is lost** goes through rebind, which the current key holder cancels automatically.
 - **A server key rollover missed during a long outage** is recovered by re-reading `serverKeys` from `/server-keys` (web PKI), as trustworthy as registration, and only used after the pinned keys fail.
@@ -444,7 +445,7 @@ Authorization: Bearer <tokenID>.<tokenSecret>
 - **Keep the access-token TTL short (e.g. 1 hour).** In PM's kcp deployments, deleting the SA doesn't revoke tokens already issued (finding 2), so the TTL is the revocation window for kcp access if `DELETE` never arrives.
 - **A controller outage stops token delivery.** Traffic would continue only as long as the last delivered token lasts. So **Provider-side self-rotation is on by default after the claim**: the Provider controller grants the connection's SA `create` on `serviceaccounts/token` with `resourceNames` for that SA, in the provider workspace. The controller's `PUT` stays the baseline and recovers a Provider-side whose token expired. Self-minted tokens live until they expire (finding 2), so their TTL must be short too.
 - **Controller HA** (leader election, or connections sharded by hash) is a requirement, not an option.
-- **Long-lived key, rotated automatically; short-lived everything else.** The connection key stays in the owner's workspace and is rotated by the controller. Connection certificates, shard certificates, session assertions and access tokens are short-lived and re-issued freely.
+- **Long-lived key, rotated automatically; short-lived everything else.** The connection key stays in the owner's workspace and is rotated by the controller. Connection certificates, connector certificates, session assertions and access tokens are short-lived and re-issued freely.
 - **Access tokens never pass a TLS-terminating hop in readable form.** They only travel inside the inner TLS of control sessions, and inside the Provider-side's own TLS to kcp.
 - **No static kubeconfig for remote `Provider`s.** The owner's workspace holds no long-lived credential for the provider workspace.
 
@@ -461,8 +462,8 @@ Authorization: Bearer <tokenID>.<tokenSecret>
 | Provider portal account | long-lived | Provider-side | Same as issuing tokens, plus whatever the portal allows (deleting or freezing connections). Can't take over an existing connection or its state. |
 | Connection key (private) | long-lived, rotated automatically | Owner's workspace; read only by the controller | **Owner compromise, for one connection**: control calls, including a fake kcp CA bundle, rotating to the thief's own key and cancelling the owner's rebinds. No other connection is affected, and nothing in kcp is granted. The owner is notified of key changes. A copy from before the last rotation is useless. |
 | Connection certificate | hours | Controller memory | Public: useless without the private key. |
-| Shard certificate key | hours | Mounted in that shard's connector | Tunnels on that shard for every connection, until it expires: denial of service, dial metadata. No control calls, no kcp credentials, no readable kcp traffic. |
-| Session CA key | one generation, rolled over with overlap | Control plane (ideally KMS or Vault) | The same for every shard, until the generation is unpinned or expires. The control plane already holds every connection key, so this doesn't widen a control-plane compromise. |
+| Connector certificate key | hours | Mounted in that shard's connector | Tunnels on that shard for every connection, until it expires: denial of service, dial metadata. No control calls, no kcp credentials, no readable kcp traffic. |
+| Connector CA key | one generation, rolled over with overlap | Control plane (ideally KMS or Vault) | The same for every shard, until the generation is unpinned or expires. The control plane already holds every connection key, so this doesn't widen a control-plane compromise. |
 | Intermediate key (if used) | short (e.g. weeks) | Control plane | Same as the CA's, until the intermediate expires. |
 | Session assertion | minutes | On the wire only | Bound to one connection; a `jti` cache stops replays. Useless at any other Provider. |
 | Provider's server private key | long-lived, rotatable | Provider-side Secret | Only useful together with control of the path to the connection server (the Provider's own edge, or DNS for the base URL). Then the thief can impersonate the Provider-side on control sessions and receive access tokens. Rotate the server key with overlap and re-check the edge. |
@@ -475,13 +476,13 @@ Authorization: Bearer <tokenID>.<tokenSecret>
 
 | How | Notes |
 |---|---|
-| **A compromised controller** | The controller reads every connection's key and runs the session CA's issuer. Code execution in it, a supply-chain compromise of its image, or root on its node exposes **all** connections at once. The highest-impact path; it's one component, off the traffic path, and can be locked down. |
+| **A compromised controller** | The controller reads every connection's key and runs the connector CA's issuer. Code execution in it, a supply-chain compromise of its image, or root on its node exposes **all** connections at once. The highest-impact path; it's one component, off the traffic path, and can be locked down. |
 | **Read access to the connection Secret** | Anyone with `get`/`list` on Secrets where it's stored: workspace admins, GitOps tools, other controllers with wildcard Secret permissions. |
 | **Backups and etcd snapshots** | kcp's etcd and backup tools contain the Secret. Without encryption at rest it's just base64. Periodic rotation makes old copies useless. |
 | **Dumps** | `kubectl get secret -o yaml` pasted into a ticket, support bundles, audit logging at `RequestResponse` level for Secrets. |
 | **Insiders** | PM administrators. |
 
-**Shard certificates** live in connectors. A compromised connector or its node yields one shard's certificate for hours, which allows denial of service and dial metadata on that shard's tunnels, nothing more.
+**Connector certificates** live in connectors. A compromised connector or its node yields one shard's certificate for hours, which allows denial of service and dial metadata on that shard's tunnels, nothing more.
 
 **The onboarding token.**
 
@@ -505,7 +506,7 @@ Authorization: Bearer <tokenID>.<tokenSecret>
   - keep connection Secrets where only the controller can read them, and never in the provider workspace, which the Provider-side's own SA can reach;
   - enable kcp etcd encryption at rest, and encrypt backups or exclude these Secrets from them;
   - rotate connection keys periodically, so leaked copies expire;
-  - keep the session CA key in Vault or a KMS;
+  - keep the connector CA key in Vault or a KMS;
   - later: connection keys in a KMS or HSM, with the controller only requesting the one signature per handshake.
 - **Provider-side:** key all state by `connectionID`; protect the server key like any TLS key; rotate it with a generous overlap.
 - **Portal:** MFA, no tokens in URLs, a list of issued and used tokens, owner notifications on registrations, key changes and rebinds, freezing or deleting connections, and a command instead of a manifest for the token Secret. GitOps users should use Sealed Secrets or External Secrets.
@@ -626,12 +627,12 @@ spec:
 | One shard's connector is down | Only that shard's endpoint traffic stops; front-proxy traffic uses other tunnels of the connection where there are any. |
 | Controller down | Onboarding, rotations, rebinds and offboarding wait. Tunnels keep working. Token delivery stops: self-rotation keeps the Provider-side going; without it, kcp access ends when the last token expires. |
 | Provider-side restarts | Tunnels drop and connectors reconnect; the controller's next `PUT` restores credentials if the Provider-side lost them. |
-| Outage of any length | Nothing the PM-side needs expires: the controller creates a new certificate for its key, cert-manager renews shard certificates, and the next `PUT` restores an expired token. |
+| Outage of any length | Nothing the PM-side needs expires: the controller creates a new certificate for its key, cert-manager renews connector certificates, and the next `PUT` restores an expired token. |
 | Ingress drops a long-lived session | The connector reconnects; pings keep idle timeouts from triggering, and tunnels are replaced before the edge's maximum connection age. |
 | Shard added or removed | Its connector comes or goes with it. Nobody registers anything. |
 | First consumer binding on a shard | kcp adds the shard to the endpoint slice; that shard's connector sees it through the permission claim and dials. The URL may briefly appear before the tunnel is up; client-go retries. |
-| Shard certificate expires or renews | cert-manager renews it under the same pinned CA. Nothing reaches the Provider. |
-| Session CA generation nears expiry without a rollover | Hard deadline: tunnels under it fail everywhere after it. Alert on its remaining lifetime. |
+| Connector certificate expires or renews | cert-manager renews it under the same pinned CA. Nothing reaches the Provider. |
+| Connector CA generation nears expiry without a rollover | Hard deadline: tunnels under it fail everywhere after it. Alert on its remaining lifetime. |
 | PM rotates kcp's CA | Nothing to coordinate: the next `PUT` carries the CA bundle PM's own components now trust. |
 | Wrong or incomplete kcp CA bundle | `kcpReachable` is `false` with the TLS error for the affected hosts. During registration the request stays in `VerifyingKcp` and fails after a timeout; later, `KcpReachable=False`. Fix PM's trust; the next `PUT` repairs it. |
 | `POST` response lost | Retry with the same token, idempotency key and connection key: same `connectionID`. A different key is refused. |
@@ -660,7 +661,7 @@ Findings 1 to 13 come from v4 (checked on 2026-10-07 to 09). Findings 14 to 17 c
 1. **kcp bound tokens carry the cluster and the SA UID.** The claims are nested under `kubernetes.io`: `clusterName` (a kcp addition), `namespace`, and `serviceaccount.{name, uid}`. `sub` doesn't include the cluster, so it isn't unique across workspaces. Legacy Secret-based tokens use a flat `kubernetes.io/serviceaccount/clusterName` claim. Sources: `kcp/vendor/k8s.io/kubernetes/pkg/serviceaccount/claims.go:53-94`, `legacy.go:65`, `kcp/pkg/server/filters/serviceaccounts.go:70`.
 2. **In PM's kcp, deleting an SA doesn't revoke its bound tokens.** kcp-operator always passes `--service-account-lookup=false` to every shard (`kcp-operator/internal/resources/compiledrootshard/deployment.go:232`, `compiledshard/deployment.go:271`), and a kcp carry patch then skips the SA existence and UID check (`claims.go:196`). kcp itself has supported cross-shard SA lookup since v0.32, with a 1-minute cache (`kcp/pkg/server/serviceaccount/cache.go`, `pkg/shardlookup/ttl_cache.go`); the operator's flag predates that. Not yet checked on a running PM cluster.
 3. **Each shard has its own SA signing key.** kcp-operator issues one cert-manager certificate per shard (RSA 4096, valid 1 year, renewed 7 days before expiry; `kcp-operator/internal/resources/shard/certificates.go:125`). Every shard and the front-proxy trust all shards' public keys (`utils/authentication.go:82`), so a token minted through the front-proxy works against every shard's virtual workspace.
-4. **kcp signing-key rotation has no overlap.** The same certificate is both the signing key and the verification key, and kcp reads it only at startup. When a shard restarts with a renewed key, it signs with the new key at once. Whether renewal creates a new key depends on cert-manager's `rotationPolicy`; recent versions default to `Always`. The same trap applies to any long-lived CA managed by cert-manager, including the session CA.
+4. **kcp signing-key rotation has no overlap.** The same certificate is both the signing key and the verification key, and kcp reads it only at startup. When a shard restarts with a renewed key, it signs with the new key at once. Whether renewal creates a new key depends on cert-manager's `rotationPolicy`; recent versions default to `Always`. The same trap applies to any long-lived CA managed by cert-manager, including the connector CA.
 5. **kcp serves its JWKS per workspace through the front-proxy** (`/openid/v1/jwks`, tested on 2026-10-08). Key distribution wasn't what ruled out v3; finding 4 was.
 6. **Railgrid's edges provider** uses bound SA tokens as the only credential after enrolment, with Lease-based tunnel routing between replicas (`internal/tunnel/registry.go`, `remote.go`, `connman.go`). Its agent refreshes a token by presenting the current one, so an agent offline for longer than the 24h TTL needs a new join token: the power-off budget v4-b avoids. Its tunnel uses `revdial`, which opens a new connection per dial.
 7. **A connection-supplied kcp CA bundle plus token-only re-onboarding lets outsiders present a fake kcp.** This affected v2 and v3: whoever holds the connection identity can set the CA bundle and answer the Provider-side's dials with a fake kcp. With re-onboarding, a stolen onboarding token was enough. v4-b has no re-onboarding, rebinds are cancelled by the current key holder, and Provider-side state is keyed by connection.
@@ -681,7 +682,7 @@ Findings 1 to 13 come from v4 (checked on 2026-10-07 to 09). Findings 14 to 17 c
 |---|---|---|---|
 | kcp credentials on the Provider-side | Access token + CA bundle | Access token + CA bundle | None |
 | PM-side identity, control path | Pinned connection key, inner mTLS | Pinned connection key, inner mTLS | Bearer connection secret |
-| Tunnel authentication | Same key, inner mTLS | Session assertion, shard certificate from a pinned session CA | Same as v4-b |
+| Tunnel authentication | Same key, inner mTLS | Session assertion, connector certificate from a pinned connector CA | Same as v4-b |
 | Who reads connection keys or secrets | The connector | The controller only | The controller only |
 | A compromised connector yields | Every connection's key | One shard's tunnels for hours (DoS, metadata) | One shard's sessions for hours, with plaintext traffic and fake data |
 | TLS layers on kcp traffic | 3 | 2 | 2 |
@@ -695,15 +696,15 @@ Findings 1 to 13 come from v4 (checked on 2026-10-07 to 09). Findings 14 to 17 c
 | Traffic during a control-plane outage | Same component | Until tokens expire, or indefinitely with self-rotation | Indefinitely |
 | Recovery after a lost PM-side credential | Recent backup, else new connection | Rebind, state kept | Rebind, state kept |
 | Provider-side software | Inner mTLS both ways, pinning, token and CA handling, dial-proxy server | Inner mTLS for control, assertion verification for tunnels, token and CA handling, dial-proxy server with host routing | Bearer check, assertion verification, multiplexer server, dial hook |
-| PM-side components | Connector | Controller, per-shard connectors, session CA, connection export | Same as v4-b, connectors as virtual workspaces |
-| Main cost | Connector holds every key; placement open | Two authentication schemes on the Provider-side; a session CA to run; controller on the token path | A second, lighter virtual-workspace hop for remote Providers' traffic; a session CA to run; edge sees traffic |
+| PM-side components | Connector | Controller, per-shard connectors, connector CA, connection export | Same as v4-b, connectors as virtual workspaces |
+| Main cost | Connector holds every key; placement open | Two authentication schemes on the Provider-side; a connector CA to run; controller on the token path | A second, lighter virtual-workspace hop for remote Providers' traffic; a connector CA to run; edge sees traffic |
 
 ## Changes from v4
 
 | v4 | v4-b | Why |
 |---|---|---|
 | One connector reads every connection key and does everything | Connection controller (keys, control calls, tokens) plus stateless per-shard connectors (tunnels) | Removes v4's top threat; control/data split from v5 |
-| Tunnel inside inner mTLS, authenticated by the connection key | Tunnel on a plain WebSocket, authenticated by a session assertion from a pinned session CA | Connectors need no per-connection secret; the payload is already end-to-end TLS |
+| Tunnel inside inner mTLS, authenticated by the connection key | Tunnel on a plain WebSocket, authenticated by a session assertion from a pinned connector CA | Connectors need no per-connection secret; the payload is already end-to-end TLS |
 | Three TLS layers on kcp traffic | Two | The inner layer only added authentication on tunnels |
 | Connector placement an open item; allow-list from `Shard` objects | One connector per shard; allow-list from deployment configuration; tunnels only where there's traffic | Locality, failure isolation, tiny allow-lists (finding 16) |
 | No PM objects in the provider workspace | Connection export and records, read-only for the Provider by maximal permission policy | Per-shard discovery without shard-wide reads (finding 14) |
@@ -719,7 +720,7 @@ Findings 1 to 13 come from v4 (checked on 2026-10-07 to 09). Findings 14 to 17 c
 - **An owner CA, generated or supplied by the owner** (an earlier revision of v4). A generated CA per connection has the same blast radius as a pinned key, with an extra layer. Owner-supplied CAs brought manual rotation steps and a lock-out risk.
 - **kcp's client CA as the anchor.** Connection certificates would be kcp credentials, and the PM-side would need the power to mint any kcp identity (finding 13).
 - **kcp's serving CA as the anchor.** Answers the wrong question, and every kcp serving process holds a key from it.
-- **A dedicated PM connections CA as the whole connection identity.** One leaked CA key would expose every connection's control path. The session CA authorizes tunnels only (see "Choosing the anchors").
+- **A dedicated PM connections CA as the whole connection identity.** One leaked CA key would expose every connection's control path. The connector CA authorizes tunnels only (see "Choosing the anchors").
 - **Pinning kcp's CA at registration**, changeable only with a fresh onboarding token. Every kcp CA rotation would then need a portal step per connection.
 - **A PM-published trust bundle the Provider-side follows.** Depends on PM publishing bundles with an overlap before every switch; kcp-operator's merged bundle isn't a reliable source (finding 11), and its `Bundle` never was one (finding 12).
 - **Re-onboarding existing connections with an onboarding token.** Lets outsiders take over a connection (finding 7).
@@ -728,14 +729,14 @@ Findings 1 to 13 come from v4 (checked on 2026-10-07 to 09). Findings 14 to 17 c
 - **Other ways to tunnel TLS through an ingress** (HTTP `CONNECT`, HTTP/2 extended `CONNECT`, raw TCP upgrades). Less widely supported than WebSockets.
 - **kcp SA tokens as the only credential** (v3). Every connection depends on kcp's SA signing keys, which rotate without overlap (finding 4).
 - **Revocation through CRLs or OCSP.** Not needed: the Provider-side checks the connection entry on every handshake and session.
-- **Keeping inner mTLS on tunnels, with the shard certificate as the client certificate.** Closes the edge's injected dials, at the cost of a third TLS layer on all kcp traffic and inner-TLS handling on both ends of every tunnel. Worth reconsidering only for deployments where kcp's hosts aren't otherwise reachable from the internet (see "Open items").
+- **Keeping inner mTLS on tunnels, with the connector certificate as the client certificate.** Closes the edge's injected dials, at the cost of a third TLS layer on all kcp traffic and inner-TLS handling on both ends of every tunnel. Worth reconsidering only for deployments where kcp's hosts aren't otherwise reachable from the internet (see "Open items").
 - **Connectors delivering access tokens over tunnels.** Would keep traffic independent of the controller, but without inner TLS on tunnels the tokens would cross the Provider's edge in plaintext (finding 10); with it, connectors would need the connection keys again.
 - **Connectors keeping the connection keys** (v4 with per-shard placement only). Multiplies the top threat by the number of shards.
 - **Connectors terminating the Provider-side's kcp traffic and injecting tokens** (v5). Removes kcp credentials from the Provider-side and allows a request-level policy, but adds a second virtual-workspace hop in front of the APIExport virtual workspace (lighter than it, but with its own timeouts and multiplexer backpressure), and, with plain sessions, requires trusting the Provider's edge with reconcile traffic and the session's authority. v5's proposed inner TLS on sessions removes that requirement, which leaves v5 ahead of v4-b on principles (see the comparison notes, "The Provider's edge"). The alternative design, not a variant of this one.
 - **One connector for all shards.** One tunnel per connection would carry every shard's traffic, so losing it relists everything; load wouldn't scale with shards; the allow-list would need the whole shard list.
 - **Every shard's connector opening a tunnel for every connection.** N connections × N shards tunnels, mostly idle.
-- **Per-shard keys registered on every connection.** Needs connectors to persist keys and costs a call per connection whenever a shard is added or rotates its key. The session CA removes all of that.
-- **Pinning the session CA's bare public key** instead of its certificate. Loses the built-in expiry of trust, the CA constraints, standard verification and room for an intermediate.
+- **Per-shard keys registered on every connection.** Needs connectors to persist keys and costs a call per connection whenever a shard is added or rotates its key. The connector CA removes all of that.
+- **Pinning the connector CA's bare public key** instead of its certificate. Loses the built-in expiry of trust, the CA constraints, standard verification and room for an intermediate.
 - **Per-shard status in the owner's workspace.** Exposes PM's topology to owners and needs connector writes.
 - **`/services/admin` for the connector's allow-list.** Exposes the whole installation's shard layout to a component that only needs its own shard's host.
 - **Discovery from owners' `Provider` objects.** Owners can edit those objects, including the URL connectors would dial.
@@ -750,7 +751,7 @@ Findings 1 to 13 come from v4 (checked on 2026-10-07 to 09). Findings 14 to 17 c
 - **Controller on the token path.** Token TTL, self-rotation by default and controller HA together decide how long traffic survives a controller outage.
 - **The verification helpers.** One small, tested implementation of the control-path callbacks (pinning `serverKeys` and the connection key) and of session-assertion verification, shipped in the SDK and used by the controller.
 - **Connection key parameters.** Key type (ECDSA P-256 or Ed25519), certificate lifetime, rotation period, pending-key expiry, how quickly old-key control sessions are closed after promotion, and clock-skew tolerance.
-- **Session CA.** Issuer (cert-manager with a KMS- or Vault-backed issuer), generation lifetime and rollover interval, whether to use an intermediate, alerting on a generation's remaining lifetime, shard certificate lifetime, how the host is encoded in the shard certificate (URI SAN format), assertion lifetime, `jti` cache size.
+- **Connector CA.** Issuer (cert-manager with a KMS- or Vault-backed issuer), generation lifetime and rollover interval, whether to use an intermediate, alerting on a generation's remaining lifetime, connector certificate lifetime, assertion lifetime, `jti` cache size.
 - **Connection export.** Which PM workspace hosts it; confirm that the permission claim on `apiexportendpointslices` works and is readable through the export's virtual workspace; the binding's lifecycle in the Provider controller (create with the workspace, recreate if deleted); an e2e test of the maximal permission policy, modelled on `TestMaximalPermissionPolicyAuthorizer`, including the controller's writes through the export's virtual workspace with only the prefixed-user grant.
 - **Where Service endpoint slices live.** The tunnel rule reads them in the provider workspace and only counts slices for exports in that workspace. RFC 006 leaves APIExport bootstrap out of scope, so state it as a requirement.
 - **Naming.** pm-operator already has a `ProviderConnection` type (`corev1alpha1.ProviderConnection`, `pm-operator/pkg/subroutines/defaults.go`) for its own components' kubeconfigs. Pick a different name for the record.

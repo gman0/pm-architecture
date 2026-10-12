@@ -28,10 +28,15 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). `p
   - **idle timeout above the session ping interval** (some load balancers default to 60 seconds);
   - **a maximum connection age long enough** for connectors to replace sessions gracefully (hours, not minutes);
   - **no request-body buffering or size limits** that break long-lived streams;
+  - **no client-IP affinity or sticky sessions** on those paths, so a connector that reaches a standby replica can reach the leader on its next attempt;
   - **a plain load balancer or ingress, not a message-based WebSocket API gateway**: gateways that route individual messages to backends, cap message sizes and limit connection lifetimes (such as cloud "WebSocket API" products) don't work.
 
   The quickstart's README walks through running the SDK's **edge self-test** against the deployed base URL, which checks each point ([07 SDK, "Edge self-test"](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
 - Storage: the SDK's Kubernetes reference store, in the quickstart's namespace.
+
+### Replicas
+
+The quickstart runs the connection server and its controllers **with leader election**, as one active replica; standbys answer upgrades with `503` and `Retry-After = max(5s, ceil(LeaseDuration / 3))` ([07 SDK, "Replicas"](./xxx-notes-011-v5-impl-07-provider-sdk.md)). Its README states the constraints for vendors: controllers live in the same process as the connection server and scale vertically until the owner-replica mode is available, and the edge must not pin the session and control paths to one backend (no client-IP affinity or sticky sessions). The Gateway API example routes those paths without affinity.
 
 ### Bootstrap per connection
 
