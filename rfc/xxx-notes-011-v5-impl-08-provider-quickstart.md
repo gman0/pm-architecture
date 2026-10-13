@@ -40,14 +40,15 @@ The quickstart runs the connection server and its controllers **with leader elec
 
 ### Bootstrap per connection
 
-When a connection appears, the quickstart's bootstrap (today `pkg/bootstrap`) creates its APIExport, schemas, `ProviderMetadata`, `ContentConfiguration` and endpoint slice in that connection's provider workspace, through the connection's client config. Idempotent; reruns on reconnect.
+When a connection appears, the quickstart's bootstrap (today `pkg/bootstrap`) creates its APIExport, schemas, `ProviderMetadata`, `ContentConfiguration` and endpoint slice in that connection's provider workspace, through the connection's client config. Idempotent; reruns on reconnect. It only creates or adopts: it never deletes and recreates the APIExport or its identity Secret, so a connection that comes back (onboarded again, imported after a disaster) finds consumers' bindings intact ([07 SDK, "Requirements on Providers"](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
 
 ### Operator
 
 The Wild West operator (`operator/wild-west`) reads its clusters from the mode abstraction (see "Two modes"); in connection mode, that's the SDK's connection registry:
 - on each connection, start an endpoint-slice provider for its `Cowboys` export's slice;
 - compose all providers with `connectionID`-prefixed cluster names;
-- keep all state keyed by connection and cluster ([07 SDK, "Connections for multicluster-runtime"](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
+- keep all state keyed by connection and cluster ([07 SDK, "Connections for multicluster-runtime"](./xxx-notes-011-v5-impl-07-provider-sdk.md));
+- show the rules for consumer data ([07 SDK, "Requirements on Providers"](./xxx-notes-011-v5-impl-07-provider-sdk.md)), with a stand-in external resource per `Cowboy` (e.g. an object in the Provider's own cluster) if the example has none: it's found again from the `Cowboy` (an ID in its status) before anything new is created, and deleted only when the `Cowboy` is, through its finalizer, never when a connection goes away.
 
 ### Portal
 
@@ -64,6 +65,7 @@ The quickstart README becomes the Provider-facing guide:
 - what a Provider must run (connection server, ingress settings, storage);
 - how to adapt an existing single-kubeconfig operator to connections;
 - what the Provider can and can't do in its provider workspace (admin, minus the connector's denylist, and records are read-only);
+- the rules for consumer data and bootstrap, and why: keyed with the `connectionID`, adopt before creating, nothing deleted when a connection goes away, no recreated APIExport identity; and keeping the SDK store as durable as consumer data;
 - the trust model in one paragraph: no kcp credentials, sessions end-to-end encrypted to the Provider's runtime.
 
 ## Work breakdown

@@ -57,7 +57,6 @@ spec:
         ...
 status:
   observedGeneration: 7
-  sequence: 5                           # derived: Next=1, Active=2, Retiring=3, Retired=4, summed
   published:                            # what Providers should pin: Next, Active, Retiring
     generations: [g1, g2]
   generations:
@@ -90,7 +89,7 @@ status:
   conditions:
     - type: Valid                       # every certificate parses, is a CA, can sign, isn't expired
       status: "True"
-    - type: BundleConverged             # every reachable connection pins the current sequence
+    - type: BundleConverged             # every reachable connection pins the published generations, by fingerprint
       status: "False"
       reason: ConnectionsUnreachable
     - type: ReadyToActivate             # a Next generation is pinned by every reachable connection, and none is degraded
@@ -101,7 +100,7 @@ status:
       reason: ConnectorCertificatesValid
 ```
 
-Printer columns: Active, Next, Sequence, Converged, Age.
+Printer columns: Active, Next, Converged, Age.
 
 ### Validation
 
@@ -114,7 +113,7 @@ CEL in the CRD's schema, so it applies to every writer, including hand edits:
 - a generation's certificate is immutable;
 - certificates have PEM shape. Real checks (a CA, allowed to sign, not expired) are done by the operator and reported in `Valid`.
 
-Together with the derived sequence, this guarantees the sequence only increases. Providers' own check (a lower sequence is refused) remains as a backstop ([01 Protocol, "Connector CA bundle"](./xxx-notes-011-v5-impl-01-protocol.md)).
+Forward-only states keep every rollover in order. There's no sequence number: Providers' copies are compared by fingerprints and replaced by compare-and-swap ([01 Protocol, "Connector CA bundle"](./xxx-notes-011-v5-impl-01-protocol.md)).
 
 ### Why the certificate is inline
 
@@ -134,8 +133,8 @@ Shard workers build the bundle from the **spec**, not from the aggregator's stat
 
 1. **Watch** the singleton; every shard worker sees the same spec.
 2. **Validate** the certificates; a failing `Valid` stops rollout work, nothing is pushed.
-3. **Derive** the sequence and build the bundle: a SPIFFE-format JWKS with the certificates of `Next`, `Active` and `Retiring` generations.
-4. **Use it**: registration sends the current bundle; when the sequence increases, each shard worker pushes it to its connections whose pinned sequence is lower; health polls compare pinned and current sequences ([03 Operator, "Connector CA rollover"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)).
+3. **Build** the bundle: a SPIFFE-format JWKS with the certificates of `Next`, `Active` and `Retiring` generations.
+4. **Use it**: registration sends the current bundle; each shard worker pushes it, with compare-and-swap, to its connections whose pinned fingerprints differ; health polls compare pinned fingerprints with the published generations, and flag any pinned certificate that isn't one of PM's generations as tampering ([03 Operator, "Connector CA rollover"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)).
 5. **Report** per-shard progress into `status.shards`; the aggregator computes totals and conditions.
 
 `ReadyToRetire` comes from the connector `Certificate` objects (read-only, not their Secrets): their issuer and validity show whether any certificate from a `Retiring` generation is still valid.
@@ -159,7 +158,7 @@ Four changes to values, each gated by a condition:
 3. **Set the old one `Retired`.** The operator unpins it everywhere. Wait for **`BundleConverged`**.
 4. **Delete the old generation's key**: its Secret, or retire it in the external PKI.
 
-**The procedure is manual by design**: people create generations and change their states; the operator, cert-manager and connectors do everything else. A generation lives **10 years**, aligned with kcp-operator's CA default. Unlike kcp's CAs, which cert-manager renews 30 days before expiry because nobody outside PM pins them, a connector CA rollover must **start at least a year before the active generation expires**, to leave time for the procedure and for Providers that are unreachable for a while. It's otherwise planned, never urgent unless a key is in doubt. Connections that stay **unreachable** (down: no control calls, no sessions) don't block the conditions but are listed per shard, and catch up as soon as their control calls succeed again; **degraded** connections block activation as described in step 1. if they're still unreachable past the old generation's expiry, they need a rebind or a new connection.
+**The procedure is manual by design**: people create generations and change their states; the operator, cert-manager and connectors do everything else. A generation lives **10 years**, aligned with kcp-operator's CA default. Unlike kcp's CAs, which cert-manager renews 30 days before expiry because nobody outside PM pins them, a connector CA rollover must **start at least a year before the active generation expires**, to leave time for the procedure and for Providers that are unreachable for a while. It's otherwise planned, never urgent unless a key is in doubt. Connections that stay **unreachable** (down: no control calls, no sessions) don't block the conditions but are listed per shard, and catch up as soon as their control calls succeed again; **degraded** connections block activation as described in step 1. Even after the old generation has expired, their first successful control call still brings them the current bundle, since control sessions don't depend on the connector CA. Only a connection that also can't authenticate (a lost or rejected secret) stays stuck: repairing its secret needs a session, and no session verifies against its out-of-date bundle. The Provider's administrators then re-pin the bundle out-of-band ([07 SDK, "Administration"](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
 
 ## Documentation and follow-ups
 
@@ -183,6 +182,7 @@ For the **people running the PM installation** (owners and Providers never see t
 | Chain check failed | `providerconnections_connector_certificate_chain_valid{shard}` (connector) | Event on the `ConnectorCABundle` | == 0: critical (the configured certificate doesn't match the key) |
 | Invalid generation in the configuration | `providerconnections_connector_ca_valid` (operator) | `Valid=False` on the `ConnectorCABundle` | == 0: critical |
 | Rollover stalled | `providerconnections_connector_ca_connections{state="pinned_current\|behind\|unreachable"}` (operator) | `BundleConverged=False` | Behind (reachable but not current) > 0 for more than an hour: warning |
+| A pinned bundle held a CA PM never issued | `providerconnections_connector_ca_bundle_tampered_total` (operator) | `ConnectorCABundleTampered` on the `Provider`, and an event ([03 Operator, "Connector CA rollover"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)) | Increase: critical (a connection secret was used by someone other than PM) |
 
 ## Later: KMS- or Vault-backed keys
 

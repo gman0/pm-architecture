@@ -11,7 +11,7 @@ Start here, then follow the walkthrough below, or jump to a component.
 | [00 Overview](./xxx-notes-011-v5-impl-00-overview.md) | Decisions, component map, end-to-end walkthrough, cross-cutting principles, ownership, build order |
 | [01 Protocol](./xxx-notes-011-v5-impl-01-protocol.md) | The wire contract between PM and the Provider-side: endpoints, credentials, session assertion, inner TLS, multiplexer, status, versioning |
 | [02 APIs](./xxx-notes-011-v5-impl-02-apis.md) | kcp-side types and exports: `ProviderOnboardingRequest`, `Provider`, the connection Secret, `ProviderEndpoint`, the connection export and its maximal permission policy |
-| [03 providerconnections-operator](./xxx-notes-011-v5-impl-03-providerconnections-operator.md) | The control plane: onboarding, registration, records, health, secret rotation, rebind, connector CA rollover, offboarding |
+| [03 providerconnections-operator](./xxx-notes-011-v5-impl-03-providerconnections-operator.md) | The control plane: onboarding, registration, records, health, secret changes, connector CA rollover, offboarding |
 | [04 Connector CA](./xxx-notes-011-v5-impl-04-connector-ca.md) | CA generations, connector certificates, rollover, and how the operator and connectors get them |
 | [05 Connector](./xxx-notes-011-v5-impl-05-connector.md) | The data plane: the per-shard `providerconnections` virtual workspace, sessions, proxying, policy |
 | [06 Provider controller changes](./xxx-notes-011-v5-impl-06-provider-controller.md) | What the RFC 006 Provider controller in platform-mesh-operator changes for remote Providers |
@@ -39,10 +39,13 @@ Start here, then follow the walkthrough below, or jump to a component.
 | Naming | `xxx-notes-011-v5-impl-*.md` in `rfc/`. |
 | Operator partitioning | **One Deployment in PM's cluster, partitioned by kcp shard** with per-shard Leases; replicas and shards independent ([03](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)). |
 | Chart | One new `providerconnections` chart (operator + per-shard connector resources), deployed by platform-mesh-operator as a profile service, with an explicit `kcpTopology` that duplicates `infra`'s shards (must match; profile validation enforcing it is a follow-up) ([09](./xxx-notes-011-v5-impl-09-deployment.md)). |
-| Operator Secret access | **No Secret informers**: the token and connection Secrets are read and written by name, uncached ([03](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)). |
+| Operator Secret access | **Connection Secrets in the operator's namespace** in PM's runtime cluster, never in owners' workspaces; token Secrets read by name, uncached, with **no Secret informers in kcp** ([02](./xxx-notes-011-v5-impl-02-apis.md), [03](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)). |
+| Connection secret changes | **Only through the PM-written `ProviderEndpoint`** (`pendingSecretHash`), adopted by the Provider-side over a session; no call changes a secret, so a thief can't lock PM out. **No rebind**: lost or rejected secrets are repaired by the operator; a connection the Provider-side no longer knows is replaced by onboarding the same `Provider` again ([01](./xxx-notes-011-v5-impl-01-protocol.md), [03](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)). |
+| Connector CA bundle at Providers | **Compare-and-swap** (`etag`, `If-Match`), no sequence; a CA PM never issued is treated as tampering: PM restores the bundle and changes the secret ([01](./xxx-notes-011-v5-impl-01-protocol.md), [03](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)). |
+| Recovery | **Out-of-band, but always possible**: stable `connectionID`s, an SDK import of connection entries, re-pinning a bundle, and administrator input for base URL and server keys on the PM-side. Procedures aren't part of this plan ([01](./xxx-notes-011-v5-impl-01-protocol.md), [07](./xxx-notes-011-v5-impl-07-provider-sdk.md)). |
 | Requests | Owners create them (one ClusterRole with `Provider`s), no creator checks; the oldest request per `Provider` wins; no terminal failure after registration; spent token data deleted ([02](./xxx-notes-011-v5-impl-02-apis.md), [03](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)). |
 | Migration | None: `spec.remote` is unused today ([06](./xxx-notes-011-v5-impl-06-provider-controller.md)). |
-| Protocol | Current and previous version supported; 1 minute clock skew; 72-hour rebind wait; length-prefixed binary stream preamble ([01](./xxx-notes-011-v5-impl-01-protocol.md)). |
+| Protocol | Current and previous version supported; 1 minute clock skew; length-prefixed binary stream preamble; registration is the only plain-HTTPS call ([01](./xxx-notes-011-v5-impl-01-protocol.md)). |
 | Connector | Connections move on replica restart; cache-server credentials accepted; child workspaces denied; one identity group for all shards ([05](./xxx-notes-011-v5-impl-05-connector.md)). |
 | SDK | One active replica by leader election (standbys answer `503`), owner replicas as a later opt-in; Go only; CRDs plus Secrets as reference store ([07](./xxx-notes-011-v5-impl-07-provider-sdk.md)). |
 | Quickstart | Keeps kubeconfig mode alongside connection mode ([08](./xxx-notes-011-v5-impl-08-provider-quickstart.md)). |
@@ -55,9 +58,10 @@ Start here, then follow the walkthrough below, or jump to a component.
  ┌──────────────────────────────────────────┐              ┌──────────────────────────────────────────────┐
  │ ProviderOnboardingRequest                │   providers  │ platform-mesh-operator                       │
  │ Provider (spec.remote, status.connection)│◀── export ──▶│   Provider controller (RFC 006, doc 06)      │
- │ token Secret, connection Secret          │   (owner     │ providerconnections-operator (doc 03)        │
+ │ token Secret                             │   (owner     │ providerconnections-operator (doc 03)        │
  └──────────────────────────────────────────┘    side)     │   consumes: providers export,                │
                                                            │             connection export                │
+                                                           │   connection Secrets (own namespace)         │
  :root:providers:system                                    │ connector CA (cert-manager, doc 04)            │
  ┌──────────────────────────────────────────┐              └──────────────┬───────────────────────────────┘
  │ connection export connections.pm.io      │                             │ connector certificates
@@ -90,8 +94,8 @@ Each step names the document and section that owns it; read them in this order t
 7. **Connectors discover the record and open sessions** where needed: [05 Connector, "Discovery" and "Which sessions"](./xxx-notes-011-v5-impl-05-connector.md); the session handshake: [01 Protocol, "Sessions"](./xxx-notes-011-v5-impl-01-protocol.md); the Provider's side: [07 SDK, "Session server"](./xxx-notes-011-v5-impl-07-provider-sdk.md).
 8. **The Provider's controllers reconcile through the sessions**: transport and client configs in [07 SDK, "Transport" and "Connections for multicluster-runtime"](./xxx-notes-011-v5-impl-07-provider-sdk.md); the proxy on PM's side in [05 Connector, "Proxying"](./xxx-notes-011-v5-impl-05-connector.md); the reference wiring in [08 Quickstart](./xxx-notes-011-v5-impl-08-provider-quickstart.md).
 9. **The operator confirms readiness** from the Provider-side's per-host status: [03 Operator, "Readiness and health"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md); [01 Protocol, "Status"](./xxx-notes-011-v5-impl-01-protocol.md).
-10. **Steady state**: the operator polls health and rotates the connection secret; cert-manager renews connector certificates; connectors refresh SA tokens: [03 Operator, "Secret rotation"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md), [04 Connector CA, "Connector certificates"](./xxx-notes-011-v5-impl-04-connector-ca.md), [05 Connector, "Identity towards kcp"](./xxx-notes-011-v5-impl-05-connector.md).
-11. **Rare operations**: rebind after a lost connection Secret ([03 Operator, "Rebind"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md), [07 SDK, "Rebind"](./xxx-notes-011-v5-impl-07-provider-sdk.md)); connector CA rollover ([04 Connector CA, "Rollover"](./xxx-notes-011-v5-impl-04-connector-ca.md)); server key rotation ([07 SDK, "Server keys"](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
+10. **Steady state**: the operator polls health and changes the connection secret when needed, through the record; cert-manager renews connector certificates; connectors refresh SA tokens: [03 Operator, "Secret changes"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md), [01 Protocol, "Changing the secret"](./xxx-notes-011-v5-impl-01-protocol.md), [07 SDK, "The connection's record"](./xxx-notes-011-v5-impl-07-provider-sdk.md), [04 Connector CA, "Connector certificates"](./xxx-notes-011-v5-impl-04-connector-ca.md), [05 Connector, "Identity towards kcp"](./xxx-notes-011-v5-impl-05-connector.md).
+11. **Rare operations**: secret repair and onboarding a `Provider` again ([01 Protocol, "Recovery"](./xxx-notes-011-v5-impl-01-protocol.md), [03 Operator, "Recovery"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)); out-of-band administration ([07 SDK, "Administration"](./xxx-notes-011-v5-impl-07-provider-sdk.md)); connector CA rollover ([04 Connector CA, "Rollover"](./xxx-notes-011-v5-impl-04-connector-ca.md)); server key rotation ([07 SDK, "Server keys"](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
 12. **Offboarding**: the operator deletes the record (sessions close), calls `DELETE`, then lets the Provider controller tear down the workspace: [03 Operator, "Offboarding"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md), [06 Provider controller, "Deletion order"](./xxx-notes-011-v5-impl-06-provider-controller.md).
 
 Deployment of all PM-side pieces: [09 Deployment](./xxx-notes-011-v5-impl-09-deployment.md). How each step is tested: [10 Testing](./xxx-notes-011-v5-impl-10-testing.md).
@@ -103,7 +107,7 @@ Every component follows these; the component documents refer back here instead o
 1. **No kcp credential leaves the PM-side.** The Provider-side never receives a token, kubeconfig or kcp CA bundle. Only connectors hold SA tokens, in memory.
 2. **Authority only through authenticated, end-to-end encrypted sessions.** The Provider's edge sees opaque bytes on sessions and control sessions. Nothing that grants anything is sent on plain HTTPS except the onboarding token (single-use) and public material.
 3. **Records are PM-written.** `ProviderEndpoint` objects are written only by the operator, through the connection export; kcp enforces it with the export's maximal permission policy. Connectors only read them.
-4. **Never trust owner-writable fields for links.** The link between a `Provider` and its provider workspace, SA and connection is derived from PM-controlled data (names kcp sets, objects in `:root:providers`), never from fields the owner can edit (`spec`, `status`, annotations of the `Provider`, or the connection Secret's non-secret fields).
+4. **Never trust owner-writable fields for links.** The link between a `Provider` and its provider workspace, SA and connection is derived from PM-controlled data (names kcp sets, objects in `:root:providers`), never from fields the owner can edit (`spec`, `status` or annotations of the `Provider`).
 5. **The data plane is stateless.** Connectors hold no persistent state, write nothing to kcp except TokenRequests, and learn everything else from their deployment and the connection export.
 6. **Control-plane outages never stop traffic.** Nothing the operator does is on the session path.
 7. **Write before send.** Every generated secret or key is persisted before it's sent anywhere, so a crash can always resume.
@@ -125,7 +129,8 @@ Clear ownership avoids two controllers fighting over the same fields.
 | `Provider.spec` | owner (or operator, when the request creates it) | Provider controller, operator |
 | `Provider.status` bootstrap fields and conditions | Provider controller | owner, operator (as a hint only, principle 4) |
 | `Provider.status.connection` and connection conditions | operator | owner |
-| connection Secret | operator | operator only |
+| connection Secret (operator's namespace, runtime cluster) | operator | operator only |
+| `ProviderEndpoint.pendingSecretHash` | operator | Provider SDK, over sessions |
 | provider workspace, SA, binding, connector RBAC | Provider controller | operator, connectors |
 | `ProviderEndpoint` | operator | connectors (and readable by the Provider) |
 | connector CA generations, connector certificates | deployment and cert-manager | operator (public certificates), connectors (their own connector certificate) |
@@ -165,6 +170,13 @@ The plan targets PM's current deployment: platform-mesh-operator rendering `pm-h
 
 ## Open questions across documents
 
-Nothing in this plan is open. Deferred to later changes:
+Open:
+
+- **Periodic secret rotation** (e.g. every 30 days). With the secret out of kcp and changeable only by PM, changes on demand and after tampering may be enough ([03](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)).
+- **Whether a degraded connection counts as reachable for `BundleConverged`.** `ReadyToActivate` already treats degraded connections as blocking; `BundleConverged` only speaks of reachable ones ([04](./xxx-notes-011-v5-impl-04-connector-ca.md)).
+
+Deferred to later changes:
 
 - **Owner replicas for Providers**: an opt-in SDK mode for horizontal scale, needing no PM-side work; this delivery runs one active replica ([07](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
+- **SDK administration commands and the PM-side administrator input** for recovery; the design supports them from the start ([03](./xxx-notes-011-v5-impl-03-providerconnections-operator.md), [07](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
+- **Deletion protection for `Provider`s with consumer bindings.** Deleting a `Provider` deletes its workspace and the APIExport's identity, which kcp can't re-pair with existing bindings; it's the one owner mistake recovery can't undo.

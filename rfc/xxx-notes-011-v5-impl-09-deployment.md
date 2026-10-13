@@ -46,7 +46,7 @@ kcpTopology:
 ### providerconnections-operator
 
 - **One Deployment in PM's runtime cluster**, several replicas, partitioned internally by kcp shard with per-shard Leases ([03 Operator, "Partitioning by shard"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)). Replica count is independent of the shard count; adding or removing shards needs no deployment change.
-- RBAC in its namespace for its Leases.
+- RBAC in its namespace for its Leases and the connection Secrets ([02 APIs, "The connection Secret"](./xxx-notes-011-v5-impl-02-apis.md)). That namespace is separate from the one holding connector CA keys, which only cert-manager reads.
 - A kcp identity (kcp-operator `Kubeconfig`) with the rights listed in [03 Operator, "Identity and permissions"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md).
 - In the runtime cluster: read the `ConnectorCABundle` and write its status, read connector `Certificate` objects (not their Secrets) ([04 Connector CA, "ConnectorCABundle"](./xxx-notes-011-v5-impl-04-connector-ca.md)).
 - Network policy: outbound to the front-proxy, to every shard's virtual-workspace host (from the providers and connection export endpoint slices), and to the internet (Providers), nothing else.
