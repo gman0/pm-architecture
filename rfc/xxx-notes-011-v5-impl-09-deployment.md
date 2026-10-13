@@ -46,9 +46,9 @@ kcpTopology:
 ### providerconnections-operator
 
 - **One Deployment in PM's runtime cluster**, several replicas, partitioned internally by kcp shard with per-shard Leases ([03 Operator, "Partitioning by shard"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)). Replica count is independent of the shard count; adding or removing shards needs no deployment change.
-- RBAC in its namespace for its Leases and the connection Secrets ([02 APIs, "The connection Secret"](./xxx-notes-011-v5-impl-02-apis.md)). That namespace is separate from the one holding connector CA keys, which only cert-manager reads.
+- RBAC in its namespace for its Leases, the connection Secrets ([02 APIs, "The connection Secret"](./xxx-notes-011-v5-impl-02-apis.md)) and the trusted-set ConfigMap ([04 Connector CA, "The trusted set"](./xxx-notes-011-v5-impl-04-connector-ca.md)). That namespace is separate from cert-manager's, which holds the connector CA's key.
 - A kcp identity (kcp-operator `Kubeconfig`) with the rights listed in [03 Operator, "Identity and permissions"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md).
-- In the runtime cluster: read the `ConnectorCABundle` and write its status, read connector `Certificate` objects (not their Secrets) ([04 Connector CA, "ConnectorCABundle"](./xxx-notes-011-v5-impl-04-connector-ca.md)).
+- In the runtime cluster: read the `ConnectorCABundle` and write its status; read `CertificateRequest`s in cert-manager's cluster resource namespace, for the CA's public certificates ([04 Connector CA](./xxx-notes-011-v5-impl-04-connector-ca.md)).
 - Network policy: outbound to the front-proxy, to every shard's virtual-workspace host (from the providers and connection export endpoint slices), and to the internet (Providers), nothing else.
 
 ### Connector (providerconnections-vw)
@@ -57,17 +57,20 @@ kcpTopology:
 - **`kubeconfigSecretRef` always set**: without it, kcp-operator mounts its privileged logical-cluster-admin credential into the pod.
 - **No front-proxy path mapping**: nobody reaches connectors inbound; they only dial out. The resource's `external` field is required, so it's set to the connector's in-cluster address; nothing routes to it.
 - **Per-shard configuration**, from its `kcpTopology` entry: shard name, its virtual-workspace host, the front-proxy host, and the in-cluster address for each (see "Network").
-- **Connector certificate**: one cert-manager `Certificate` per shard, rendered in the same loop, from the `Active` generation's issuer (see "Connector CA" below), mounted into that shard's connector through the `VirtualWorkspace`'s `extraVolumes` and `extraVolumeMounts` ([04 Connector CA, "Connector certificates"](./xxx-notes-011-v5-impl-04-connector-ca.md)).
+- **Connector certificate**: one cert-manager `Certificate` per shard, rendered in the same loop, from the connector CA's `ClusterIssuer` (see "Connector CA" below), mounted into that shard's connector through the `VirtualWorkspace`'s `extraVolumes` and `extraVolumeMounts` ([04 Connector CA, "Connector certificates"](./xxx-notes-011-v5-impl-04-connector-ca.md)).
 - **The connectors' kcp identity**: one group shared by all shards, used in the connector RBAC the Provider controller creates in each provider workspace ([06 Provider controller, "Connector RBAC"](./xxx-notes-011-v5-impl-06-provider-controller.md)).
 - **Resources**: requests and limits sized from the shard's expected watch count; anti-affinity from the shard's own pods so a burst can't starve the shard.
 
 ### Connector CA
 
 In the `providerconnections` chart ([04 Connector CA](./xxx-notes-011-v5-impl-04-connector-ca.md)):
-- **The `ConnectorCABundle` CRD** and its singleton, rendered from values: generations with state and public certificate. Key sources (`caSecretRef`, `issuerRef`) stay in values and never reach the resource.
-- **A cert-manager CA issuer per `caSecretRef` generation** in state `Next` or `Active`; `issuerRef` generations use the referenced issuer directly. Key Secrets sit in a namespace only cert-manager reads.
-- **Per-shard connector `Certificate`s** from the `Active` generation's issuer.
-- **Development only**: a self-signed generation created by cert-manager, behind an explicit flag.
+- **The CA `Certificate`** (`isCA: true`, 1 year, renewed 90 days before expiry, `rotationPolicy: Always`) in cert-manager's cluster resource namespace, issued by a self-signed issuer by default or by the `issuerRef` from values (e.g. Vault or a cloud CA).
+- **A `ClusterIssuer` of type CA** on the CA's Secret, issuing the connector certificates.
+- **Per-shard connector `Certificate`s** from that `ClusterIssuer`.
+- **The status-only `ConnectorCABundle` CRD** and its singleton; the operator fills in its status.
+- **The operator's `distrust` list** (CA fingerprints to drop at once after a compromise), from values.
+
+The same templates serve development and production; nothing about the CA has to be prepared outside the chart.
 
 ## Observability
 
@@ -97,9 +100,9 @@ Checked against kcp-operator `8994ed7`.
 
 ## Rollout order
 
-1. kcp bootstrap (schemas, exports, RBAC) and the connector CA's first generation.
+1. kcp bootstrap (schemas, exports, RBAC).
 2. platform-mesh-operator with the Provider controller changes ([06](./xxx-notes-011-v5-impl-06-provider-controller.md)): bindings and connector RBAC appear in remote Providers' workspaces.
-3. The `providerconnections` chart: connectors on every shard, and the operator. Within the chart, connectors come first; the operator tolerates their absence either way.
+3. The `providerconnections` chart: the connector CA, connectors on every shard, and the operator. Within the chart, the CA and connectors come first; the operator tolerates their absence either way.
 4. Owners can now create `ProviderOnboardingRequest`s.
 
 Upgrades keep this order. Connectors and the operator tolerate each other's absence: without the operator, no records appear; without connectors, readiness stays false.
@@ -120,12 +123,12 @@ The components here already split along the deployer's placements, so moving lat
 | Connectors | kcp-operator `VirtualWorkspace` per shard, from `kcpTopology` | A `per-shard` component: one instance per shard in that shard's cluster, following the deployer's topology. Can be a plain workload (still on the virtual workspace framework) with a minted kubeconfig, which drops kcp-operator's `VirtualWorkspace` and its accepted limitations (cache-server credentials, Deployment only) |
 | kcp bootstrap | platform-mesh-operator's kcp manifests; connection export in `:root:providers:system` | Module setup: schemas, connection export, endpoint slice and policy RBAC in the module's workspace `root:modules:providerconnections`. The export's home moves, so records and bindings must be migrated or recreated |
 | Shard list | `kcpTopology` in the service's values, duplicating `infra`'s shards, must match `infra`'s (profile validation, a follow-up) | The deployer's topology; nothing to maintain. The per-shard context replaces `kcpTopology` entries field for field |
-| Connector CA | Issuers and key sources in PM's cluster, from chart values | Module `values`. Keys and issuers stay on the management cluster; connector certificates are minted there and synced to each shard's cluster, so the CA key never leaves the management cluster |
+| Connector CA | The CA `Certificate` and its issuers in PM's cluster, from the chart | Module `values`. Keys and issuers stay on the management cluster; connector certificates are minted there and synced to each shard's cluster, so the CA key never leaves the management cluster |
 | Identities | kcp-operator `Kubeconfig`s with the groups and rights this plan lists | Minted users `module:providerconnections:<kubeconfig>`, cluster-admin only in the module workspace. Every right outside it (the providers export's content, `Workspace`s in `:root:providers`, TokenRequest in provider workspaces) is granted elsewhere, e.g. by the Provider controller to that username instead of a group |
 
 **Gaps to close in the deployer first:**
 1. **Per-shard instances need their hosts**: the shard's URL and virtual-workspace URL, the front-proxy URL, and in-cluster addresses. The deployer computes them from its exposure templates but doesn't pass them to module instances yet.
-2. **Client certificates per instance** from a configurable issuer (the connector CA's active generation), with chosen key usages, as it already mints serving certificates.
+2. **Client certificates per instance** from a configurable issuer (the connector CA's `ClusterIssuer`), with chosen key usages, as it already mints serving certificates.
 3. **Rights outside the module workspace** for minted identities, or a documented place where other components grant them.
 
 Nothing in the protocol, the APIs other than the export's home, the operator's or the connector's logic, or the SDK depends on how PM is deployed.
@@ -133,4 +136,4 @@ Nothing in the protocol, the APIs other than the export's home, the operator's o
 ## Decided
 
 - **Per-shard connector resources** come from a new `providerconnections` chart, deployed as a profile service, from an explicit `kcpTopology` in its values that duplicates `infra`'s shards, shaped like the deployer's per-instance context. The two must match; platform-mesh-operator's profile validation will enforce it as a follow-up, and the shard runbook covers it until then. No watcher of `Shard` resources and no runtime drift detection.
-- **Connector CA**: the `ConnectorCABundle` CR rendered by the chart from values; changes go through the `PlatformMesh` profile like any other configuration ([04 Connector CA](./xxx-notes-011-v5-impl-04-connector-ca.md)).
+- **Connector CA**: a cert-manager `Certificate` rendered by the chart, renewed and rolled over automatically; only the optional `issuerRef` and the `distrust` list come from values ([04 Connector CA](./xxx-notes-011-v5-impl-04-connector-ca.md)).

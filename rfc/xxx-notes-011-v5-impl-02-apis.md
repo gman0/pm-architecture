@@ -15,7 +15,7 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Th
 Exists today (`provideronboardingrequest_types.go`), with a CRD in platform-mesh-operator, but **not yet served by the providers APIExport**. Changes:
 - **Add `provideronboardingrequests` to the providers export** and its `APIResourceSchema` ([09 Deployment, "kcp bootstrap"](./xxx-notes-011-v5-impl-09-deployment.md)).
 - **Spec**: the token Secret reference and the `Provider` to create or reuse (name and `spec.remote`). The owner doesn't choose where the connection secret goes: it never enters the owner's workspace (see "The connection Secret").
-- **Status**: phase (`WaitingForProvider → Registering → VerifyingKcp → Ready`, with `Failed` only before registration succeeds), `providerRef`, `connectionID`, conditions with reasons for every problem the owner can act on.
+- **Status**: phase (`WaitingForProvider → Registering → VerifyingControl → VerifyingKcp → Ready`, with `Failed` only before registration succeeds), `providerRef`, `connectionID`, conditions with reasons for every problem the owner can act on.
 - **For an already registered `Provider`**, a request is accepted only when the Provider-side reports its connection unknown; it then registers a new connection, with a new `connectionID`, on the same workspace. It's meant for switching Providers or a connection the Provider won't restore ([03 Operator, "Onboarding"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)).
 - **Lifecycle**: a request is done once `Ready` or `Failed`. Re-running needs a new request. **Once registration has succeeded, a request never fails**: if readiness doesn't arrive in time, it stays in `VerifyingKcp` with a warning condition and becomes `Ready` when the problem goes away ([03 Operator, "Onboarding"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)).
 - **Who may create them**: the owner, i.e. whoever manages `Provider`s in that workspace. The operator acts with its own rights, so `create` on `provideronboardingrequests` is equivalent to managing `Provider`s there; PM ships one default ClusterRole that grants both together, and the operator doesn't check the creator's identity.
@@ -45,7 +45,7 @@ The Provider controller and the operator both write `Provider.status`. They use 
 |---|---|
 | `secret` | the current connection secret (`pmc1_…`) |
 | `pendingSecret` | only while the secret changes ([03 Operator, "Secret changes"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)) |
-| `connectionID` | the registered connection, written before the record |
+| `connectionID`, `serverKeys` | the registration's result, persisted together in one write before anything else happens; the server keys are trust anchors, so they never live in owner-writable status |
 
 - **Read and written only by the operator.** Neither owners nor Providers can reach it. In an owner's workspace, every Provider with an accepted Secrets claim there could read it, since PM's bindings accept that claim with `matchAll`; and an owner deleting it would have needed a recovery flow.
 - **Deleted by the operator** at offboarding ([03 Operator, "Offboarding"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)); there's no owner reference across kcp and the runtime cluster.

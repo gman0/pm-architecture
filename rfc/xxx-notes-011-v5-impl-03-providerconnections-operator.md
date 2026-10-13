@@ -1,6 +1,6 @@
 # v5 implementation plan: providerconnections-operator
 
-Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). The **control plane**: a new operator at `platform-mesh/operators/providerconnections-operator`. It owns every connection's lifecycle on the PM-side: onboarding, registration, records, health, secret changes, connector CA rollover and offboarding. It's never on the session path.
+Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). The **control plane**: a new operator at `platform-mesh/operators/providerconnections-operator`. It owns every connection's lifecycle on the PM-side: onboarding, registration, records, health, secret changes, the connector CA trusted set and offboarding. It's never on the session path.
 
 ## Responsibilities
 
@@ -10,7 +10,7 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Th
 - every call to a Provider's connection API ([01 Protocol](./xxx-notes-011-v5-impl-01-protocol.md));
 - `ProviderEndpoint` records in provider workspaces ([02 APIs](./xxx-notes-011-v5-impl-02-apis.md));
 - `Provider.status.connection` and the connection conditions;
-- fanning out connector CA rollovers ([04 Connector CA](./xxx-notes-011-v5-impl-04-connector-ca.md)).
+- the connector CA trusted set: keeping it and pushing it to every connection ([04 Connector CA](./xxx-notes-011-v5-impl-04-connector-ca.md)).
 
 **Doesn't own:**
 - the provider workspace, SA, binding or connector RBAC ([06 Provider controller](./xxx-notes-011-v5-impl-06-provider-controller.md));
@@ -28,7 +28,7 @@ Exactly two endpoint slices, which is the reason it's a separate operator:
 
 Plus, outside kcp:
 - **read access to `Workspace` objects in `:root:providers`**, to find the provider workspace's logical cluster (see "Finding the provider workspace");
-- **the `ConnectorCABundle`**: the connector CA's generations, their states and public certificates; the operator writes its status ([04 Connector CA, "ConnectorCABundle"](./xxx-notes-011-v5-impl-04-connector-ca.md));
+- **the connector CA's `CertificateRequest`s** in cert-manager's namespace, for the CA's public certificates, and the **`ConnectorCABundle`**, whose status it writes ([04 Connector CA](./xxx-notes-011-v5-impl-04-connector-ca.md));
 - **outbound HTTPS to Providers' base URLs**.
 
 ## Principles
@@ -81,19 +81,22 @@ Reconciles each `ProviderOnboardingRequest`:
 
 3. **Wait for the provider workspace** (see "Finding the provider workspace"). Phase `WaitingForProvider`.
 4. **Register** (see "Registration"). Phase `Registering`.
-5. **Write the record** (see "Records").
-6. **Verify readiness** (see "Readiness and health"). Phase `VerifyingKcp`, then `Ready`. **No terminal failure after registration**: past a timeout (e.g. 15 minutes), the request gets a warning condition with the Provider-side's last error and keeps reconciling, so it becomes `Ready` once the problem is fixed. The connection stays registered and is reconciled like any other.
-7. **Delete the token Secret's content** ([02 APIs, "ProviderOnboardingRequest"](./xxx-notes-011-v5-impl-02-apis.md)). Only after the registration's result (the `connectionID`) is persisted in the connection Secret and the request's status: until then, a lost response may still need a retry with the same token. The operator doesn't delete the Secret object itself, which the owner may manage through GitOps, only its token data.
+5. **Make a first control call** (`GET` over a control session). Phase `VerifyingControl`. The record isn't written until it succeeds, so a control path that's broken from the start shows up here, with its edge-diagnosis reason (see "Readiness and health"), before any session opens. Every live connection has therefore had a working control path at least once.
+6. **Write the record** (see "Records").
+7. **Verify readiness** (see "Readiness and health"). Phase `VerifyingKcp`, then `Ready`.
 
-Every step is resumable: the request's status and the connection Secret record how far it got.
+   **No terminal failure after registration**, in steps 5 to 7: past a timeout (e.g. 15 minutes), the request gets a warning condition with the Provider-side's last error and keeps reconciling, so it becomes `Ready` once the problem is fixed. The connection stays registered and is reconciled like any other.
+8. **Delete the token Secret's content** ([02 APIs, "ProviderOnboardingRequest"](./xxx-notes-011-v5-impl-02-apis.md)). Only after the registration's result (the `connectionID` and server keys) is persisted in the connection Secret: until then, a lost response may still need a retry with the same token. The operator doesn't delete the Secret object itself, which the owner may manage through GitOps, only its token data.
+
+Every step is resumable from persisted state: the connection Secret holds the secret, then the `connectionID` and server keys; the request's status records the phase. A crash at any point resumes at the step after the last persisted one; a crash between `POST` and persisting its result resumes with a retry of the same `POST`.
 
 ## Registration
 
 1. **Generate the connection secret** and write it to the connection Secret in the operator's namespace (write before send). When onboarding a registered `Provider` again, this replaces the old connection's Secret.
 2. **Call `POST /v1/connections`** with the token, the request's UID as idempotency key, the `clusterID`, the front-proxy URL, the secret's hash and the current connector CA certificates ([01 Protocol, "Registration"](./xxx-notes-011-v5-impl-01-protocol.md)).
-3. **On success**, record the `connectionID` in the connection Secret, the request's status and `Provider.status.connection`, and keep the returned server keys for the record.
-4. **On a lost response**, retry with the same idempotency key and hash; the same `connectionID` comes back.
-5. **On refusal** (token spent elsewhere, expired, wrong owner), fail the request with a reason the owner can act on. This is the last point at which a request can fail.
+3. **On success**, persist the `connectionID` **and the returned server keys** in the connection Secret, in one write; then record the `connectionID` in the request's status and `Provider.status.connection` for the owner's information. The server keys are trust anchors for the control session and the record, so they're never kept in owner-writable status, and never only in memory.
+4. **On a lost response, or a crash before step 3**, retry with the same idempotency key and hash; the same `connectionID` and server keys come back. The Provider-side honours such retries for a generous window (7 days by default, [01 Protocol, "Registration"](./xxx-notes-011-v5-impl-01-protocol.md)), far longer than any expected operator outage.
+5. **On refusal** (token spent elsewhere, expired, wrong owner, or a retry after the window), fail the request with a reason the owner can act on. This is the last point at which a request can fail. A retry refused after the window leaves an orphaned connection on the Provider-side, which the SDK expires because it never saw a control call or session ([07 SDK, "Connection API"](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
 
 ## Records
 
@@ -106,16 +109,17 @@ The operator writes one `ProviderEndpoint` per provider workspace through the co
 
 ## Readiness and health
 
-- **Polls `GET /v1/connections/{id}`** over a control session, every few minutes per connection with jitter; more often while `VerifyingKcp`.
+- **Polls `GET /v1/connections/{id}`** over a control session, every few minutes per connection with jitter; more often while `VerifyingControl` or `VerifyingKcp`.
+- **Never gives up on a connection it can't reach.** Failed polls back off, capped at about the normal poll interval, so a Provider that returns after any outage is caught up within minutes (see "Connector CA trusted set").
 - **Turns per-host status into aggregate conditions**:
   - `SessionsConnected`: every required host has at least one session;
   - `KcpReachable`: every required host reaches kcp;
   - `Registered`: false with `ConnectionUnknown` (the Provider-side lost or deleted the connection; the owner can onboard the `Provider` again) or `ConnectionFrozen`;
   - `SecretCurrent`: no secret change pending;
-  - `ConnectorCABundleTampered` (warning): the pinned bundle held a CA PM never issued (see "Connector CA rollover");
+  - `ConnectorCABundleTampered` (warning): the pinned bundle held a CA PM never trusted (see "Connector CA trusted set");
   - `ProtocolOutdated` (warning): the connection still negotiates the previous protocol version, so the Provider should upgrade its SDK ([07 SDK, "Releases and protocol versions"](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
 - **Readiness for onboarding**: at least the front-proxy host is covered and reachable (before any consumer binds, that's the only required host).
-- **Edge diagnosis**: on the first control session after registration and on every failed reconnect, the operator classifies failures as described in [01 Protocol, "Diagnosing the edge"](./xxx-notes-011-v5-impl-01-protocol.md) and reports them with distinct reasons on the request's warning condition (while `VerifyingKcp`) and on the `Provider`'s connection conditions: `EdgeUpgradeRefused` (non-`101` response), `EdgeBotChallenge` (an HTML page instead of an upgrade), `EdgePayloadBlocked` (closed right after a binary message), `EdgeTimeout` (closed at a regular idle time or age). Each reason's message points the owner at the Provider's edge checklist and self-test ([08 Quickstart, "Connection server"](./xxx-notes-011-v5-impl-08-provider-quickstart.md)). The operator only observes its own control sessions; connectors' session failures go to their metrics, where the same classification applies.
+- **Edge diagnosis**: on the first control session after registration and on every failed reconnect, the operator classifies failures as described in [01 Protocol, "Diagnosing the edge"](./xxx-notes-011-v5-impl-01-protocol.md) and reports them with distinct reasons on the request's warning condition (while `VerifyingControl` or `VerifyingKcp`) and on the `Provider`'s connection conditions: `EdgeUpgradeRefused` (non-`101` response), `EdgeBotChallenge` (an HTML page instead of an upgrade), `EdgePayloadBlocked` (closed right after a binary message), `EdgeTimeout` (closed at a regular idle time or age). Each reason's message points the owner at the Provider's edge checklist and self-test ([08 Quickstart, "Connection server"](./xxx-notes-011-v5-impl-08-provider-quickstart.md)). The operator only observes its own control sessions; connectors' session failures go to their metrics, where the same classification applies.
 - **Per-shard and per-host detail goes to metrics**, never to conditions (overview, principle 9).
 
 ## Secret changes
@@ -128,7 +132,7 @@ The only way a connection's secret changes ([01 Protocol, "Changing the secret"]
 
 **When:**
 - **On demand**: an annotation on the `Provider`. It only triggers a change, so trusting it is harmless (overview, principle 4 is about links).
-- **After tampering** with the connector CA bundle (see "Connector CA rollover").
+- **After tampering** with the connector CA bundle (see "Connector CA trusted set").
 - **Periodically** (e.g. every 30 days): **open**. With the secret out of kcp and unchangeable by anyone but PM, changes on demand and after tampering may be enough ([00 Overview, "Open questions across documents"](./xxx-notes-011-v5-impl-00-overview.md)).
 - **Repair**: when the connection Secret is missing, or the Provider-side rejects both `secret` and `pendingSecret` while the inner TLS against its pinned server key succeeds (e.g. its store was restored from an older backup). The `connectionID` comes from the record. Repairs are rate-limited per connection (e.g. at most one per hour), so an edge or Provider bug that breaks authentication can't make the operator change secrets in a loop.
 
@@ -145,24 +149,21 @@ Each case is covered elsewhere ([01 Protocol, "Recovery"](./xxx-notes-011-v5-imp
 - **No session verifies**: `SessionsConnected=False`; the Provider's administrators re-pin the connector CA bundle out-of-band.
 - **Disasters on either side**: out-of-band, using the administrator input in "Records" and the SDK's administration commands ([07 SDK, "Administration"](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
 
-## Connector CA rollover
+## Connector CA trusted set
 
-Driven by the `ConnectorCABundle` resource ([04 Connector CA, "ConnectorCABundle"](./xxx-notes-011-v5-impl-04-connector-ca.md)); people change generation states, the operator only follows:
-- **Every shard worker watches the resource's spec**, validates the certificates and builds the bundle. All workers compute the same bundle for the same spec.
-- **Push on difference**: each worker compares every connection's pinned fingerprints (from `GET`) with the published generations, and sends `PUT /connector-ca-bundle` with `If-Match: <the etag it just read>` where they differ, rate-limited ([01 Protocol, "Connector CA bundle"](./xxx-notes-011-v5-impl-01-protocol.md)). A `412` means someone changed the bundle since: the worker reads it again and decides anew. A late call from a previous Lease holder fails its `If-Match` the same way instead of reverting a newer set. Registration always sends the current bundle.
-- **Tampering**: a pinned certificate that isn't one of PM's generations can only have come from someone holding the connection secret. The worker then:
-  1. restores the published bundle with the current secret (with `If-Match`), so PM's sessions verify again;
+cert-manager renews the connector CA; the operator makes sure every Provider trusts the new CA before connectors use it ([04 Connector CA, "Rollover"](./xxx-notes-011-v5-impl-04-connector-ca.md)):
+- **New CA certificates** come from the CA's `CertificateRequest`s (public status, no key access). The operator validates each one and adds it to the **trusted set**: the current CA, plus the previous one until 48 hours after the current one was first seen, or until it's listed in the `distrust` configuration, whichever is first.
+- **History**: the fingerprints of every CA ever trusted, kept with the trusted set in a ConfigMap in the operator's namespace. The tamper check below compares against it.
+- **Push on difference**: each shard worker compares every connection's pinned fingerprints (from `GET`) with the trusted set, and sends `PUT /connector-ca-bundle` with `If-Match: <the etag it just read>` where they differ, rate-limited ([01 Protocol, "Connector CA bundle"](./xxx-notes-011-v5-impl-01-protocol.md)). A `412` means someone changed the bundle since: the worker reads it again and decides anew. A late call from a previous Lease holder fails its `If-Match` the same way instead of reverting a newer set. Registration always sends the current set. Pushes go out when the set changes and on every poll that finds a difference.
+- **Catch up as soon as a connection is back.** A Provider that was unreachable during a rollover, however long, still pins an old set; its control channel doesn't depend on the connector CA, so on the **first successful control call after a connection was unreachable** the worker pushes the current set right away, instead of waiting for the next regular poll. The SDK accepts the push even if every CA it pins has expired.
+- **Tampering**: a pinned certificate that isn't in the history can only have come from someone holding the connection secret. The worker then:
+  1. restores the trusted set with the current secret (with `If-Match`), so PM's sessions verify again; the Provider-side closes every session that doesn't chain to it, including any the thief opened ([01 Protocol, "Connector CA bundle"](./xxx-notes-011-v5-impl-01-protocol.md));
   2. changes the secret through the record (see "Secret changes"), which makes the stolen secret useless;
   3. reports `ConnectorCABundleTampered` on the `Provider`, an event and a metric.
 
-  If the thief pushes again before the change completes, step 1 repeats; the change completes on the Provider-side's first read of the record over a session. A bundle that merely lacks some of PM's generations isn't treated as tampering; the push above converges it.
-- **Report per shard**: each worker writes its own entry in the resource's `status.shards` (connections, pinned current, unreachable) with a per-shard field manager.
-- **Aggregate**: one aggregator, under its own Lease separate from the shard Leases, computes the published generations, totals and the conditions (`Valid`, `BundleConverged`, `ReadyToActivate`, `ReadyToRetire`) from the shard entries and the connector `Certificate` objects.
-- **Connections the bundle can't reach** fall into two classes, judged from what the worker knows (it can't see sessions directly):
-  - **Unreachable**: control calls fail at the network level (DNS, connection refused, timeout), or the last status the Provider-side reported showed no live sessions. The Provider is down; activating a new generation takes nothing away from it, and it catches up on return (below). **Doesn't block.**
-  - **Degraded**: control calls fail with an answer from a live edge or Provider (an HTTP error, an HTML page, a failed inner handshake), and the last status it reported showed live sessions. Traffic is probably flowing while the control path is broken, so activating a new generation would cut it. **Blocks `ReadyToActivate`** (reason `ConnectionsDegraded`) unless the resource carries the annotation `providerconnections.platform-mesh.io/ignore-degraded-connections-for` naming the `Next` generation ([04 Connector CA, "Rollover"](./xxx-notes-011-v5-impl-04-connector-ca.md)). When in doubt, a connection counts as degraded.
-  Both are listed per shard in the `ConnectorCABundle` status, with each connection's last control-call error. Owners see a failing control path on their `Provider` through the edge-diagnosis reasons.
-- **Catch up as soon as a connection is back.** A Provider that was down during a rollover still pins the old bundle; once connector certificates come from the new generation, it rejects sessions. Its control channel doesn't depend on the connector CA, so on the **first successful control call after a connection was unreachable**, the worker compares the pinned fingerprints with the published generations and pushes the bundle right away, instead of waiting for the next regular poll. The gap after the Provider's return shrinks from a poll interval to seconds.
+  If the thief pushes again before the change completes, step 1 repeats; the change completes on the Provider-side's first read of the record over a session. A bundle that holds only CAs from the history, old or missing some, isn't tampering; the push above converges it.
+- **Report per shard**: each worker writes its own entry in the `ConnectorCABundle`'s `status.shards` (connections, pinned current, not reached) with a per-shard field manager. A connection whose control calls fail counts as **not reached**, whatever the cause (Provider down, control path broken), and is listed with its last error; owners see the cause on their `Provider` through the edge-diagnosis reasons.
+- **Aggregate**: one aggregator, under its own Lease separate from the shard Leases, mirrors the trusted set into the `ConnectorCABundle`'s status and computes each CA's `converged` flag and the conditions (`Valid`, `Converged`). **A CA has converged when every connection the operator reaches pins it.** Nothing waits for connections it doesn't reach; connectors read the flag to decide when to switch certificates ([05 Connector, "Connector certificate"](./xxx-notes-011-v5-impl-05-connector.md)).
 
 ## Offboarding
 
@@ -185,7 +186,7 @@ The operator's kcp identity (a kcp-operator `Kubeconfig`) needs:
 - writes to `providerendpoints` through the connection export, granted by the export's maximal permission policy ([02 APIs, "Connection export"](./xxx-notes-011-v5-impl-02-apis.md));
 - `get`, `list`, `watch` on `workspaces` in `:root:providers`.
 
-In the runtime cluster, it needs: read access to the `ConnectorCABundle` and write access to its status; read access to the connector `Certificate` objects (not their Secrets); Secrets (connection Secrets) and Leases in its own namespace. Nothing else, and in particular no access to CA keys or issuers, which live in a namespace only cert-manager reads.
+In the runtime cluster, it needs: read access to `CertificateRequest`s in cert-manager's cluster resource namespace (public certificates only); read access to the `ConnectorCABundle` and write access to its status; Secrets (connection Secrets), the trusted-set ConfigMap and Leases in its own namespace. Nothing else, and in particular no access to the CA's key Secret or issuers, which only cert-manager reads.
 
 ## Partitioning by shard
 
@@ -198,18 +199,18 @@ One Deployment with several replicas in **PM's runtime cluster** (next to platfo
 - **One worker per held shard**: a multicluster-runtime provider restricted to that shard's endpoint of the providers export, with its own caches and work queues. It reconciles requests, `Provider`s and connections of owners' workspaces hosted on that shard. Caches therefore hold only the shards a replica currently holds, and a stuck shard doesn't hold up others.
 - **Shared across workers**: the connection export's full endpoint slice (records may live on any shard), the protocol client with its per-Provider rate limits, and the `ConnectorCABundle`.
 - **Shard added**: kcp adds its endpoint to the slice; a replica takes its Lease and starts a worker. **Removed**: the endpoint disappears; the holder stops the worker and releases the Lease. **Replica lost**: its Leases expire; others take its shards over.
-- **Rollover fan-out** runs per worker over its own connections; convergence is reported per shard and summed.
+- **Trusted-set pushes** run per worker over its own connections; convergence is reported per shard and summed.
 - **Isolation is of memory and failures, not of access**: all replicas share one kcp identity, and `apiexports/content` isn't shard-scoped. Per-shard access isolation would need per-shard identities, out of scope here.
 - **Remote shards in other clusters** are reached through their virtual-workspace URLs, like any multi-shard consumer. If replicas ever have to span clusters, the Leases and the `ConnectorCABundle` move into a PM workspace in kcp.
 
 ## Availability
 
-- **Outages delay** onboarding, secret changes, rollovers and offboarding for the affected shards; they never stop traffic.
+- **Outages delay** onboarding, secret changes, rollovers and offboarding for the affected shards; they don't stop traffic. The one exception: an outage of more than about 12 hours right when cert-manager renews the connector CA. The new CA then never converges, connectors fall back to it as their old certificates expire, and new sessions fail at Providers that don't pin it, until the operator is back and pushes it. Open sessions keep running. The aggregator's Lease and ordinary operator alerts keep such an outage short.
 
 ## Observability
 
 - **Events** on `ProviderOnboardingRequest` and `Provider` for every phase change and failure, without secrets.
-- **Metrics**: calls per Provider and outcome, poll latency, connections per condition state, secret changes in progress (by trigger), repairs refused by the rate limit, tampering detected, egress refusals, and the connector CA signals (generation expiry, `Valid`, rollover convergence; [04 Connector CA, "Signals"](./xxx-notes-011-v5-impl-04-connector-ca.md)). Scraped through a `ServiceMonitor` ([09 Deployment, "Observability"](./xxx-notes-011-v5-impl-09-deployment.md)).
+- **Metrics**: calls per Provider and outcome, poll latency, connections per condition state, secret changes in progress (by trigger), repairs refused by the rate limit, tampering detected, egress refusals, and the connector CA signals (CA expiry, `Valid`, convergence; [04 Connector CA, "Signals"](./xxx-notes-011-v5-impl-04-connector-ca.md)). Scraped through a `ServiceMonitor` ([09 Deployment, "Observability"](./xxx-notes-011-v5-impl-09-deployment.md)).
 - **Audiences**: owners act on events and conditions on their `ProviderOnboardingRequest`s and `Provider`s; the people running PM act on metrics, the `ConnectorCABundle` status and the documented alert rules. Owners never see PM-wide signals, and PM-wide signals never name owners' data beyond connection IDs.
 - **Logs** never contain the token, the secret or hashes.
 
@@ -221,7 +222,7 @@ One Deployment with several replicas in **PM's runtime cluster** (next to platfo
 4. Protocol client: plain-HTTPS calls, control sessions (WebSocket, inner TLS with pinned keys), retries, egress rules. Shared with nothing else on the PM-side; built against the SDK's test server ([07 SDK, "Testing support"](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
 5. Records writer with drift repair, server-key updates and `pendingSecretHash`.
 6. Health poller and condition aggregation.
-7. Secret changes (on demand, repair, after tampering); connector CA rollover with compare-and-swap and the tamper response.
+7. Secret changes (on demand, repair, after tampering); the connector CA trusted set, its pushes with compare-and-swap, and the tamper response.
 8. Offboarding finalizer, coordinated with the Provider controller.
 9. Metrics, events, docs.
 
@@ -232,4 +233,6 @@ One Deployment with several replicas in **PM's runtime cluster** (next to platfo
 - **After registration, no terminal failure**: a warning condition after the readiness timeout, and continued reconciliation.
 - **Partitioning**: one Deployment in PM's cluster, partitioned by kcp shard with per-shard Leases (see "Partitioning by shard").
 - **Secret scope**: connection Secrets in the operator's namespace; token Secrets read by name, with no Secret informers in kcp (see "Secrets").
+- **Onboarding order**: register, first control call, then the record; `connectionID` and server keys persisted together.
+- **Connector CA**: the operator keeps and pushes a trusted set derived from cert-manager's CA; only connections it reaches count for convergence.
 - **Recovery**: the secret changes only through the record; an owner onboards a registered `Provider` again only after the Provider-side reports its connection unknown (see "Onboarding", "Secret changes").

@@ -74,9 +74,16 @@ Several replicas per shard share the connections:
 4. **Start yamux** and accept streams opened by the Provider-side.
 5. **Replace sessions** before the edge's maximum connection age (configurable), gracefully; reconnect with backoff on failure. An upgrade refused with `503` and `Retry-After` is retried using the value as the lower bound for the normal reconnect backoff; a session the Provider-side ends gracefully (go-away) is reopened at once. The connector assumes nothing about which Provider replica a session reaches ([01 Protocol, "Provider replicas"](./xxx-notes-011-v5-impl-01-protocol.md)). No replacement while the connector's own certificate is expired (see below).
 
-The connector certificate is reloaded when cert-manager renews it; existing sessions keep their handshake, new ones use the new certificate. **Before switching**, the connector checks that the new certificate chains to the `Active` generation's certificate in the `ConnectorCABundle` (public data; the connector may read it). On a mismatch it keeps its previous certificate until that expires, and reports it (metric and event), so a wrong certificate in the configuration can't silently break every session ([04 Connector CA, "Connector certificates"](./xxx-notes-011-v5-impl-04-connector-ca.md)).
+### Connector certificate
 
-**Provider downtime doesn't affect certificate renewal.** Providers pin CA generations, not connector certificates, so a renewal needs nothing from them. While a Provider is down, the connector retries with backoff; when it's back, the connector dials with an assertion signed by its current certificate, which chains to the same pinned generation. Open sessions aren't affected when the certificate that opened them expires: the handshake and assertion were checked at upgrade, and TLS doesn't re-check expiry on an open connection. They're replaced on the normal schedule, using the new certificate.
+cert-manager renews the connector certificate every 12 hours, for 24 hours each ([04 Connector CA, "Connector certificates"](./xxx-notes-011-v5-impl-04-connector-ca.md)). The connector keeps its current certificate and key in memory and decides when to use a renewed one:
+- **Switch rule**: use the renewed certificate once its CA is in the trusted set and marked `converged` in the `ConnectorCABundle`'s status (public data; the connector may read it), or when the current certificate has less than about an hour left, whichever comes first. A renewal under the same CA switches at once; one from a new CA waits until every connection the operator reaches trusts that CA, normally minutes. Open sessions keep their handshake either way.
+- **After switching to a certificate from a new CA that has converged, replace the old-certificate sessions** gracefully within the 48 hours before the old CA is dropped: open the new session first, then go-away on the old one, spread with jitter, the same mechanism as replacement before the edge's maximum connection age. So by the time the old CA is dropped, no session of PM's still depends on it, and the Provider-side's session check closes nothing ([01 Protocol, "Connector CA bundle"](./xxx-notes-011-v5-impl-01-protocol.md)).
+- **A forced switch** (the current certificate about to expire, its successor's CA not converged, e.g. because the operator is down) replaces nothing: open sessions keep running, and only new sessions use the new certificate, failing at Providers that don't pin its CA yet.
+- **After a restart**, only the newest certificate is on disk, so the connector uses it at once. If its CA hasn't converged yet, sessions to connections that don't pin it yet fail until the operator's push lands, normally within minutes.
+- **Reported**: how long a renewed certificate has been waiting to be used, and the current certificate's expiry (metrics, see [04 Connector CA, "Signals"](./xxx-notes-011-v5-impl-04-connector-ca.md)).
+
+**Provider downtime doesn't affect certificate renewal.** Providers pin the connector CA, not connector certificates, so a renewal needs nothing from them. While a Provider is down, the connector retries with backoff; when it's back, the connector dials with an assertion signed by its current certificate. If a rollover happened meanwhile, the operator's first successful control call brings the Provider the current trusted set, and the next dial succeeds. Open sessions aren't affected when the certificate that opened them expires: the handshake and assertion were checked at upgrade, and TLS doesn't re-check expiry on an open connection. They're replaced on the normal schedule, using the new certificate.
 
 **An expired certificate stops new sessions; open ones carry traffic until they end.** If cert-manager can't renew in time (an outage longer than the 12-hour renewal budget), the connector can't open sessions with any Provider. It then **doesn't replace or close sessions that are still open**: it skips graceful replacement and reports the expired state (metric and readiness). That buys time, not continuity: each connection's traffic on this shard stops when its open session ends, whichever comes first of:
 - **the Provider's edge cutting at its maximum connection age**, normally pre-empted by replacement, so usually the real upper bound (typically hours);
@@ -138,7 +145,7 @@ Settings that matter:
 - **The connector's own identity** comes from the `VirtualWorkspace`'s `kubeconfigSecretRef`, which must always be set: without it, kcp-operator mounts its privileged logical-cluster-admin credential into the pod. All shards' connectors share **one group**. The identity needs:
   - read-only `apiexports/content` on the connection export;
   - in every provider workspace, `access` and `create` on `serviceaccounts/token` for that one SA, granted by the Provider controller ([06 Provider controller, "Connector RBAC"](./xxx-notes-011-v5-impl-06-provider-controller.md)).
-- **In the runtime cluster**: read access to the `ConnectorCABundle` (public data, for the chain check) and its own connector certificate Secret. Nothing else.
+- **In the runtime cluster**: read access to the `ConnectorCABundle` (public data, for the switch rule) and its own connector certificate Secret. Nothing else.
 - **No `Shard` objects, no `/services/admin`.** The connector doesn't use the cache server, but kcp-operator mounts cache-server credentials into every `VirtualWorkspace` when a cache server is configured, as in PM. **Accepted and documented** as part of a compromised connector's blast radius ([09 Deployment, "Dependencies on kcp-operator"](./xxx-notes-011-v5-impl-09-deployment.md)).
 
 ## Egress to Providers
@@ -152,7 +159,7 @@ Per connection: concurrent streams, request rate, header sizes, in-flight reques
 
 ## Observability
 
-- **Metrics**: sessions per state, streams per session, requests by connection and outcome (via `apiserver_request_*`), denials by rule, token mint outcomes, buffer pressure, and the connector certificate's expiry and chain check ([04 Connector CA, "Signals"](./xxx-notes-011-v5-impl-04-connector-ca.md)). Scraped through a `ServiceMonitor` like PM's other components ([09 Deployment, "Observability"](./xxx-notes-011-v5-impl-09-deployment.md)).
+- **Metrics**: sessions per state, streams per session, requests by connection and outcome (via `apiserver_request_*`), denials by rule, token mint outcomes, buffer pressure, and the connector certificate's expiry and how long a renewed one has waited ([04 Connector CA, "Signals"](./xxx-notes-011-v5-impl-04-connector-ca.md)). Scraped through a `ServiceMonitor` like PM's other components ([09 Deployment, "Observability"](./xxx-notes-011-v5-impl-09-deployment.md)).
 - **Readiness** reflects an expired connector certificate, so rollout tooling can hold.
 - **Audience**: the people running the PM installation. Owners see their connections' state on `Provider` conditions ([03 Operator, "Readiness and health"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)); Providers see theirs through the SDK.
 - **Audit**: every request with the connection principal and the SA it acted as; at metadata level, never bodies.
@@ -163,7 +170,7 @@ Per connection: concurrent streams, request rate, header sizes, in-flight reques
 1. Service scaffold on the virtual workspace framework (reusing patterns from `services/virtual-workspaces` and kcp's initializing-workspaces virtual workspace, including a copy of its proxy helper).
 2. Discovery and the session rule.
 3. Replica membership and rendezvous hashing.
-4. Session client: assertion signing, WebSocket, inner TLS with pinning, yamux, replacement.
+4. Session client: assertion signing, WebSocket, inner TLS with pinning, yamux, replacement; the certificate switch rule and replacing old-certificate sessions.
 5. Stream serving: preamble, in-process listener, context tagging, path rewriting.
 6. Authenticator, authorizer, denylist, Secret-type inspection.
 7. Proxy handler: header stripping, token injection, host mapping, streaming, settings.

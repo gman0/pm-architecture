@@ -31,14 +31,15 @@ What a Provider still does itself: its portal and user accounts, its operator co
 ### Connection API
 
 The handler for the one plain-HTTPS endpoint:
-- **Registration**: verify and spend the token, apply idempotency rules, create the connection entry (owner, `clusterID`, front-proxy URL, secret hash, the pinned connector CA bundle, negotiated version), return `connectionID` and server keys.
+- **Registration**: verify and spend the token, apply idempotency rules (retries with the same idempotency key and hash return the same response for 7 days by default), create the connection entry (owner, `clusterID`, front-proxy URL, secret hash, the pinned connector CA bundle, negotiated version), return `connectionID` and server keys.
+- **Orphan expiry**: a connection that has seen neither a control call nor a session by the end of the retry window is removed; it's a registration whose result PM never stored. A connection that was used once is never expired for being idle, however long its Provider or PM is away.
 
 ### Control sessions
 
 - **WebSocket upgrade, then the inner TLS server** with the server key the connection's record lists (see "Server keys").
 - **Bearer check** inside, against the current secret hash only.
 - **Handlers**: status, connector CA bundle replacement, delete ([01 Protocol, "Control sessions"](./xxx-notes-011-v5-impl-01-protocol.md)). None changes the secret.
-- **Connector CA bundle**: parsed as a SPIFFE-format trust bundle (JWKS with `x5c`); every certificate is checked to be a CA before it's pinned. Replacement is compare-and-swap on the pinned bundle's `etag`: a missing or stale `If-Match` is refused with `412`, an identical body is a no-op ([01 Protocol, "Connector CA bundle"](./xxx-notes-011-v5-impl-01-protocol.md)). The `etag` and fingerprints are reported in `GET`. The bundle is only ever accepted on the control channel or at registration, never from a session.
+- **Connector CA bundle**: parsed as a SPIFFE-format trust bundle (JWKS with `x5c`); every certificate is checked to be a CA before it's pinned. Replacement is compare-and-swap on the pinned bundle's `etag`: a missing or stale `If-Match` is refused with `412`, an identical body is a no-op ([01 Protocol, "Connector CA bundle"](./xxx-notes-011-v5-impl-01-protocol.md)). The `etag` and fingerprints are reported in `GET`. The bundle is only ever accepted on the control channel or at registration, never from a session. A push is accepted even if every pinned CA has expired: it's authenticated by the secret, not by the pinned CAs.
 
 ### The connection's record
 
@@ -55,6 +56,7 @@ The record is trusted because of how it arrives: over a session that verified ag
 3. **Start yamux**; register the session under its connection, with the hosts it serves (from the assertion's `hosts` claim) plus the front-proxy.
 4. **Honour go-away**: stop opening streams on a session the connector is replacing.
 5. **Close all sessions** of a connection that's deleted or frozen.
+6. **Re-check open sessions when the pinned bundle changes** (a push or a re-pin): a session whose client certificate, kept from its handshake, no longer chains to a CA in the new bundle gets go-away, a short grace period for in-flight requests (e.g. 30 seconds, configurable), then is closed. Only the issuer counts, not the certificate's expiry. This ends sessions opened with a leaked CA or connector certificate key once PM drops it; why it matters, and its limits, are in [01 Protocol, "Connector CA bundle"](./xxx-notes-011-v5-impl-01-protocol.md).
 
 ### Transport
 
@@ -158,7 +160,7 @@ Documented for Provider authors ([08 Quickstart, "Documentation for Provider aut
 3. Tokens and portal primitives, notification hooks.
 4. Connection API handlers.
 5. Control sessions (inner TLS server, bearer check, compare-and-swap on the bundle).
-6. Session server (assertion verification, inner TLS, yamux, registry).
+6. Session server (assertion verification, inner TLS, yamux, registry, re-checking sessions on a bundle change).
 7. Transport and connection registry; multicluster-runtime helper.
 8. Status, server keys, the record watch (`pendingSecretHash`, `serverKeys`).
 9. Framing enforcement; the edge-check endpoint and the self-test command.

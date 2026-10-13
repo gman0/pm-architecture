@@ -26,7 +26,7 @@ Registration is the only plain-HTTPS call. It's verified with web PKI on the bas
 - **Format**: `pm1.<base64url(base URL)>.<tokenID>.<tokenSecret>`. The base URL inside ensures the token is only ever sent to its issuer.
 - **Single-use and short-lived**; the Provider-side stores only a hash of `tokenSecret`.
 - **Bound to the issuing owner account** on the Provider-side, which owns the connection it registers (portal listing, billing, freezing).
-- **Spent on first successful `POST`**, but a retry with the same idempotency key and secret hash within a bounded window returns the same result (see "Idempotency").
+- **Spent on first successful `POST`**, but a retry with the same idempotency key and secret hash within a window (7 days by default) returns the same result (see "Idempotency").
 
 ## Connection secret
 
@@ -57,7 +57,8 @@ Response: `connectionID`, the Provider-side's **server keys** (public keys, a li
 
 Rules:
 - **Only new connections.** Registration never changes an existing connection.
-- **Idempotency**: keyed on `(tokenID, idempotencyKey)`. A retry with the same `secretHash` returns the same `connectionID`; a different hash is refused. After the token's expiry, a retry is still honoured for a bounded window.
+- **Idempotency**: keyed on `(tokenID, idempotencyKey)`. A retry with the same `secretHash` returns the same response (`connectionID` and server keys); a different hash is refused. After the token's expiry, a retry is still honoured for a **generous window, 7 days by default**, so an operator that crashed between the call and persisting its result can always recover it.
+- **Orphans expire**: a connection that has seen neither a control call nor a session by the end of that window is removed by the Provider-side. That's a registration whose result PM never stored. A connection that was used once is never expired for being idle.
 - **Addressing is immutable**: `clusterID` and front-proxy URL are fixed for the connection's life.
 - **Trust in the response** comes from web PKI on the base URL; it's what makes the returned server keys safe to pin.
 
@@ -80,12 +81,16 @@ There's no call that changes the secret (see "Changing the secret").
 
 ### Connector CA bundle
 
-The connector CA certificates a connection pins travel as a **trust bundle in SPIFFE's format**: a JWKS whose keys each carry one generation's CA certificate in `x5c`. The rationale, including how this compares with other trust-anchor APIs, is in v5, "Distributing the connector CA to Providers".
+The connector CA certificates a connection pins travel as a **trust bundle in SPIFFE's format**: a JWKS whose keys each carry one CA certificate of PM's **trusted set** in `x5c`: the current connector CA, and during a rollover the previous one ([04 Connector CA, "The trusted set"](./xxx-notes-011-v5-impl-04-connector-ca.md)). The rationale, including how this compares with other trust-anchor APIs, is in v5, "Distributing the connector CA to Providers".
 
-- **Sent at registration** and **replaced by `PUT …/connector-ca-bundle`** during rollovers.
-- **Compare-and-swap**: `GET` returns the pinned bundle's `etag` (a hash of its canonical content, computed by the Provider-side) and the generations' fingerprints. A `PUT` must carry `If-Match: <etag>`; a mismatch is refused with `412` and the current `etag`, and a body identical to the pinned bundle is a no-op. Reordered or duplicated calls, for example from two operator workers during a handover, therefore can't overwrite a newer bundle unnoticed.
-- **PM can always restore its bundle**, even after someone holding the connection secret replaced it (see [03 Operator, "Connector CA rollover"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)).
+- **Sent at registration** and **replaced by `PUT …/connector-ca-bundle`** whenever the trusted set changes, which is a few times a year.
+- **Compare-and-swap**: `GET` returns the pinned bundle's `etag` (a hash of its canonical content, computed by the Provider-side) and the CAs' fingerprints. A `PUT` must carry `If-Match: <etag>`; a mismatch is refused with `412` and the current `etag`, and a body identical to the pinned bundle is a no-op. Reordered or duplicated calls, for example from two operator workers during a handover, therefore can't overwrite a newer bundle unnoticed.
+- **PM can always restore its bundle**, even after someone holding the connection secret replaced it (see [03 Operator, "Connector CA trusted set"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)).
+- **Accepted even if every pinned CA has expired.** A push is authenticated by the connection secret and protected by compare-and-swap; the pinned CAs play no part. A Provider that was down through any number of rollovers is caught up by its first successful control call.
 - **Only on the control channel**, never through a session: a session is authenticated by the CA it would be changing.
+- **Open sessions are checked against a new bundle.** Sessions are only verified when they open, so on its own, removing a CA wouldn't affect sessions already opened under it. When the Provider-side accepts a new bundle (a push, or a re-pin by its administrators), it checks each open session of that connection: if the session's client certificate, kept from its handshake, no longer chains to a CA in the new bundle, the Provider-side sends go-away, lets in-flight requests finish within a short grace period (e.g. 30 seconds), then closes the session. Only the issuer counts, not the certificate's expiry, so sessions still outlive an expired connector certificate. A bundle that only adds CAs closes nothing. PM's connectors reconnect at once with a certificate from a trusted CA; anyone else can't.
+
+  Why: someone who gets a connector CA's key or a connector certificate's key on its own (from a compromised external PKI, or a single Secret leaked in a backup or log) can open sessions and act as PM's connector, feeding the Provider made-up objects and receiving what it writes back, without any kcp access. PM's response is to renew the CA and drop the leaked one; this rule is what ends the sessions already opened with it. It doesn't help against an attacker who still has access to PM's runtime cluster, who would also have kcp access and could do it again. In a normal rollover connectors have already moved their sessions to the new CA before the old one is dropped ([05 Connector, "Connector certificate"](./xxx-notes-011-v5-impl-05-connector.md)), so nothing is closed.
 
 ## WebSocket framing
 
@@ -150,7 +155,7 @@ The hosts are **routing information, not authority**. The Provider-side never re
 
 ### What binds a session to its PM installation
 
-The connector CA generations pinned **for this connection** at registration: each PM installation has its own generations, never shared with another installation ([04 Connector CA, "Key sources"](./xxx-notes-011-v5-impl-04-connector-ca.md)). Connector certificates carry no installation identity and no hostnames. If two installations shared a generation, a compromised connector of one could open sessions for the other's connections; the rule is documented, not enforced by the SDK.
+The connector CA pinned **for this connection**: each PM installation has its own CA, managed by its own cert-manager; with an external PKI, each installation has its own intermediate, and that's what Providers pin ([04 Connector CA, "The CA"](./xxx-notes-011-v5-impl-04-connector-ca.md)). Connector certificates carry no installation identity and no hostnames. If two installations shared a CA, a compromised connector of one could open sessions for the other's connections.
 
 ## Provider replicas
 
@@ -161,7 +166,7 @@ The protocol makes **no assumption about which Provider replica a session or con
 What each side can lose, and how it comes back:
 - **The PM-side loses the secret, or the Provider-side rejects it** (e.g. its store was restored from an older backup): the operator changes the secret through the record (see "Changing the secret"). The `connectionID` and all Provider-side state stay.
 - **The Provider-side no longer knows the connection** (deleted in the portal, or its store lost): it answers with the stable "unknown connection" status (see "Errors and retries"). Two ways back: the Provider's administrators import the old entry, which keeps the `connectionID` and is preferred when the Provider still has the data; or the owner onboards the same `Provider` again, which registers a **new** connection, meant for switching Providers or a connection the Provider won't restore ([03 Operator, "Onboarding"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)).
-- **No session verifies** (for example, a pinned bundle that missed a whole rollover): nothing in the protocol can fix this, because every channel that could carry a new bundle is either unauthenticated for it or broken. The Provider's administrators re-pin the bundle out-of-band ([07 SDK, "Administration"](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
+- **No session verifies and control calls fail authentication** (a pinned bundle that missed a rollover, and a secret the Provider-side lost or rejects): nothing in the protocol can fix this. Pushing a bundle needs the secret, and repairing the secret needs a session. A missed rollover alone isn't this case: the operator's first successful control call pushes the current bundle. The Provider's administrators re-pin the bundle out-of-band ([07 SDK, "Administration"](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
 
 Disasters on either side (a Provider's cluster rebuilt, for example) are handled the same way: out-of-band steps between the people running both sides, on top of the properties above. The protocol keeps them possible: `connectionID`s are stable, the Provider-side can import a connection entry, and the PM-side can take a connection's base URL and server keys from an administrator. The procedures themselves aren't part of this plan.
 
