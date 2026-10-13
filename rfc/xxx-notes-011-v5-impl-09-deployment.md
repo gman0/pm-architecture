@@ -57,7 +57,7 @@ kcpTopology:
 - **`kubeconfigSecretRef` always set**: without it, kcp-operator mounts its privileged logical-cluster-admin credential into the pod.
 - **No front-proxy path mapping**: nobody reaches connectors inbound; they only dial out. The resource's `external` field is required, so it's set to the connector's in-cluster address; nothing routes to it.
 - **Per-shard configuration**, from its `kcpTopology` entry: shard name, its virtual-workspace host, the front-proxy host, and the in-cluster address for each (see "Network").
-- **Connector certificate**: one cert-manager `Certificate` per shard, rendered in the same loop, from the active connector CA issuer (issuer setup is part of the open connector CA configuration), mounted into that shard's connector through the `VirtualWorkspace`'s `extraVolumes` and `extraVolumeMounts` ([04 Connector CA, "Connector certificates"](./xxx-notes-011-v5-impl-04-connector-ca.md)).
+- **Connector certificate**: one cert-manager `Certificate` per shard, rendered in the same loop, from the `Active` generation's issuer (see "Connector CA" below), mounted into that shard's connector through the `VirtualWorkspace`'s `extraVolumes` and `extraVolumeMounts` ([04 Connector CA, "Connector certificates"](./xxx-notes-011-v5-impl-04-connector-ca.md)).
 - **The connectors' kcp identity**: one group shared by all shards, used in the connector RBAC the Provider controller creates in each provider workspace ([06 Provider controller, "Connector RBAC"](./xxx-notes-011-v5-impl-06-provider-controller.md)).
 - **Resources**: requests and limits sized from the shard's expected watch count; anti-affinity from the shard's own pods so a burst can't starve the shard.
 
