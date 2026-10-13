@@ -22,7 +22,7 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Ho
 ## Integration tests against kcp
 
 Against a kcp test server, without Providers:
-- **Maximal permission policy**, modelled on kcp's `TestMaximalPermissionPolicyAuthorizer`: an admin of a provider workspace is refused every write on `providerendpoints` and their status, and can read them; the operator's identity can write through the connection export's virtual workspace with only its prefixed-user grant, and can't without it. This closes v5 observation 19's untested point.
+- **Maximal permission policy**, modelled on kcp's `TestMaximalPermissionPolicyAuthorizer`: an admin of a provider workspace is refused every write on `providerendpoints` and their status, and can read them; the operator's identity can write through the connection export's virtual workspace with only its prefixed-user grant, and can't without it. This closes v5 observation 8's untested point.
 - **Record scope**: the operator can write the cluster-scoped, fixed-name `ProviderEndpoint` through the connection export's virtual workspace.
 - **Permission claim**: connectors can read `apiexportendpointslices` through the connection export.
 - **Connector token minting** with the RBAC from [06](./xxx-notes-011-v5-impl-06-provider-controller.md): only for the named SA.

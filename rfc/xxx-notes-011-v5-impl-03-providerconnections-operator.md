@@ -139,7 +139,7 @@ The only way a connection's secret changes ([01 Protocol, "Changing the secret"]
 
 ## Recovery
 
-There's no rebind. Each case is covered elsewhere ([01 Protocol, "Recovery"](./xxx-notes-011-v5-impl-01-protocol.md)):
+Each case is covered elsewhere ([01 Protocol, "Recovery"](./xxx-notes-011-v5-impl-01-protocol.md)):
 - **A lost or rejected secret**: repaired automatically (see "Secret changes").
 - **A connection the Provider-side no longer knows**: `Registered=False` with `ConnectionUnknown`; the owner onboards the same `Provider` again, which registers a new connection (see "Onboarding").
 - **No session verifies**: `SessionsConnected=False`; the Provider's administrators re-pin the connector CA bundle out-of-band.
@@ -232,4 +232,4 @@ One Deployment with several replicas in **PM's runtime cluster** (next to platfo
 - **After registration, no terminal failure**: a warning condition after the readiness timeout, and continued reconciliation.
 - **Partitioning**: one Deployment in PM's cluster, partitioned by kcp shard with per-shard Leases (see "Partitioning by shard").
 - **Secret scope**: connection Secrets in the operator's namespace; token Secrets read by name, with no Secret informers in kcp (see "Secrets").
-- **No rebind**: the secret changes only through the record; an owner onboards a registered `Provider` again only after the Provider-side reports its connection unknown (see "Onboarding", "Secret changes").
+- **Recovery**: the secret changes only through the record; an owner onboards a registered `Provider` again only after the Provider-side reports its connection unknown (see "Onboarding", "Secret changes").

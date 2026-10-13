@@ -179,5 +179,5 @@ Documented for Provider authors ([08 Quickstart, "Documentation for Provider aut
 - **One active replica** (leader election, standbys answer `503` with `Retry-After = max(5s, ceil(LeaseDuration / 3))`) in this delivery; **owner replicas** as an opt-in follow-up needing no PM-side work.
 - **Go only.** The protocol specification and test vectors exist, but third-party implementations aren't a supported target.
 - **Reference store**: custom resources plus Secrets.
-- **No rebind**: secrets change only through the record; recovery beyond that is out-of-band, through the administration commands.
+- **Recovery**: secrets change only through the record; recovery beyond that is out-of-band, through the administration commands.
 - **Module**: `go.platform-mesh.io/provider-sdk`; independent semver; upgrade signals as above.

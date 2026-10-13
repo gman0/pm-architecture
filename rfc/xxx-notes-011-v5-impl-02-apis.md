@@ -93,6 +93,6 @@ One per provider workspace, cluster-scoped, with a fixed name (e.g. `default`), 
 
 - **Request authorization**: owners create requests; a default ClusterRole grants requests and `Provider`s together; no identity checks in the operator.
 - **Concurrent requests**: the oldest wins.
-- **Connection Secrets** live in the operator's namespace, not in owners' workspaces; no `connectionSecretRef`, no `Rebinding` phase.
+- **Connection Secrets** live in the operator's namespace, not in owners' workspaces.
 - **Version** of the new group: `v1alpha1`. The protocol coupling is carried by the protocol version ([01 Protocol, "Versioning"](./xxx-notes-011-v5-impl-01-protocol.md)), not the API version.
 - **`ProviderEndpoint` scope**: cluster-scoped with a fixed name; the integration tests confirm the operator can write it through the APIExport virtual workspace ([10 Testing, "Integration tests against kcp"](./xxx-notes-011-v5-impl-10-testing.md)).

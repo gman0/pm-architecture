@@ -113,7 +113,7 @@ CEL in the CRD's schema, so it applies to every writer, including hand edits:
 - a generation's certificate is immutable;
 - certificates have PEM shape. Real checks (a CA, allowed to sign, not expired) are done by the operator and reported in `Valid`.
 
-Forward-only states keep every rollover in order. There's no sequence number: Providers' copies are compared by fingerprints and replaced by compare-and-swap ([01 Protocol, "Connector CA bundle"](./xxx-notes-011-v5-impl-01-protocol.md)).
+Forward-only states keep every rollover in order. Providers' copies are compared by fingerprints and replaced by compare-and-swap ([01 Protocol, "Connector CA bundle"](./xxx-notes-011-v5-impl-01-protocol.md)).
 
 ### Why the certificate is inline
 

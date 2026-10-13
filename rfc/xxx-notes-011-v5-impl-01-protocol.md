@@ -84,7 +84,7 @@ The connector CA certificates a connection pins travel as a **trust bundle in SP
 
 - **Sent at registration** and **replaced by `PUT …/connector-ca-bundle`** during rollovers.
 - **Compare-and-swap**: `GET` returns the pinned bundle's `etag` (a hash of its canonical content, computed by the Provider-side) and the generations' fingerprints. A `PUT` must carry `If-Match: <etag>`; a mismatch is refused with `412` and the current `etag`, and a body identical to the pinned bundle is a no-op. Reordered or duplicated calls, for example from two operator workers during a handover, therefore can't overwrite a newer bundle unnoticed.
-- **No sequence number.** A stolen secret could push a bundle with a higher sequence that PM could never replace; compare-and-swap lets PM restore the right bundle (see [03 Operator, "Connector CA rollover"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)).
+- **PM can always restore its bundle**, even after someone holding the connection secret replaced it (see [03 Operator, "Connector CA rollover"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)).
 - **Only on the control channel**, never through a session: a session is authenticated by the CA it would be changing.
 
 ## WebSocket framing
@@ -158,7 +158,7 @@ The protocol makes **no assumption about which Provider replica a session or con
 
 ## Recovery
 
-There's no rebind or re-onboarding call. What each side can lose, and how it comes back:
+What each side can lose, and how it comes back:
 - **The PM-side loses the secret, or the Provider-side rejects it** (e.g. its store was restored from an older backup): the operator changes the secret through the record (see "Changing the secret"). The `connectionID` and all Provider-side state stay.
 - **The Provider-side no longer knows the connection** (deleted in the portal, or its store lost): it answers with the stable "unknown connection" status (see "Errors and retries"). Two ways back: the Provider's administrators import the old entry, which keeps the `connectionID` and is preferred when the Provider still has the data; or the owner onboards the same `Provider` again, which registers a **new** connection, meant for switching Providers or a connection the Provider won't restore ([03 Operator, "Onboarding"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)).
 - **No session verifies** (for example, a pinned bundle that missed a whole rollover): nothing in the protocol can fix this, because every channel that could carry a new bundle is either unauthenticated for it or broken. The Provider's administrators re-pin the bundle out-of-band ([07 SDK, "Administration"](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
@@ -208,4 +208,4 @@ The operator turns this into aggregate conditions ([03 Operator, "Readiness and 
 - Clock-skew tolerance: 1 minute.
 - Stream preamble: length-prefixed binary.
 - Rate limits on registration per owner: SDK defaults, configurable by each Provider ([07 SDK](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
-- The secret changes only through the record; no rebind or re-onboarding call; the connector CA bundle is replaced by compare-and-swap, without a sequence.
+- The secret changes only through the record; the connector CA bundle is replaced by compare-and-swap.
