@@ -212,16 +212,16 @@ Each case is covered elsewhere ([01 Protocol, "Recovery"](./xxx-notes-011-v5-imp
 ## Connector CA trusted set
 
 cert-manager renews the connector CA; platform-mesh-operator makes sure every Provider trusts the new CA before connectors use it ([04 Connector CA, "Rollover"](./xxx-notes-011-v5-impl-04-connector-ca.md)):
-- **New CA certificates** come from the CA's `CertificateRequest`s (public status, no key access). Each is validated and added to the **trusted set**: the current CA, plus the previous one until 48 hours after the current one was first seen, or until it's listed in the `distrust` configuration, whichever is first.
-- **History**: the fingerprints of every CA ever trusted, kept with the trusted set in a ConfigMap in platform-mesh-operator's namespace. The tamper check below compares against it.
-- **Push on difference**: on each poll, the connection's pinned fingerprints (from `GET`) are compared with the trusted set, and `PUT /connector-ca-bundle` is sent with `If-Match: <the etag just read>` where they differ, rate-limited ([01 Protocol, "Connector CA bundle"](./xxx-notes-011-v5-impl-01-protocol.md)). A `412` means the bundle changed since: read it again and decide anew. When the trusted set changes, every connection is requeued, so pushes go out within minutes. Registration always sends the current set.
+- **Derived, not stored**: the CA's `CertificateRequest`s, which cert-manager creates per issuance and keeps the last three of, give the current CA, the **trusted set**, each connection's drop time for the previous CA, and PM's unexpired CAs ([04 Connector CA, "The trusted set"](./xxx-notes-011-v5-impl-04-connector-ca.md)). platform-mesh-operator watches them and reads only their status, which holds public certificates. A restart or failover derives the same result.
+- **Why `CertificateRequest`s**: they're the only place the CA certificates of past issuances are kept without the key. The CA's Secret holds the key and only the current certificate, and the CA `Certificate` object holds neither.
+- **Push on difference**: on each poll, the connection's pinned fingerprints (from `GET`) are compared with the bundle this connection should pin (the trusted set, without the previous CA once the connection's drop time has passed), and `PUT /connector-ca-bundle` is sent with `If-Match: <the etag just read>` where they differ, rate-limited ([01 Protocol, "Connector CA bundle"](./xxx-notes-011-v5-impl-01-protocol.md)). A `412` means the bundle changed since: read it again and decide anew. When a new CA appears, every connection is requeued, so pushes go out within minutes; drops happen on the regular polls after each connection's drop time. Registration always sends the current set.
 - **Catch up as soon as a connection is back.** A Provider that was unreachable during a rollover, however long, still pins an old set; its control channel doesn't depend on the connector CA, so the **first successful control call after a connection was unreachable** pushes the current set right away. The SDK accepts the push even if every CA it pins has expired.
-- **Tampering**: a pinned certificate that isn't in the history can only have come from someone holding the connection secret. Then:
+- **Tampering**: a pinned certificate that's unexpired and isn't one of PM's unexpired CAs can only have come from someone holding the connection secret. Then:
   1. restore the trusted set with the current secret (with `If-Match`), so PM's sessions verify again; the Provider-side closes every session that doesn't chain to it, including any the thief opened ([01 Protocol, "Connector CA bundle"](./xxx-notes-011-v5-impl-01-protocol.md));
   2. change the secret through the record (see "Secret changes"), which makes the stolen secret useless;
   3. record an **event** on the `Provider`, so the owner sees it happened, and count it in a metric with a critical alert rule for the people running PM ([04 Connector CA, "Signals"](./xxx-notes-011-v5-impl-04-connector-ca.md)).
 
-  If the thief pushes again before the change completes, step 1 repeats; the change completes on the Provider-side's first read of the record over a session. A bundle that holds only CAs from the history, old or missing some, isn't tampering; the push above converges it.
+  If the thief pushes again before the change completes, step 1 repeats; the change completes on the Provider-side's first read of the record over a session. Expired pinned CAs verify nothing, so they're never tampering, whoever issued them; neither is a bundle merely missing some of PM's CAs. The push above converges both.
 - **Convergence**: a CA has converged when every connection whose control calls succeed pins it. A connection whose control calls fail counts as **not reached**, whatever the cause, and is listed with its last error; owners see the cause on their `Provider`. Nothing waits for connections that aren't reached. platform-mesh-operator writes the whole `ConnectorCABundle` status: the trusted CAs with their `converged` flags, counts per shard, and the conditions `Valid` and `Converged`. Connectors read the flags to decide when to switch certificates ([05 Connector, "Connector certificate"](./xxx-notes-011-v5-impl-05-connector.md)).
 
 ## Deletion
@@ -258,7 +258,7 @@ The code for remote Providers makes outbound calls to Providers on the internet 
 
 Beyond what platform-mesh-operator needs for local Providers:
 - **In kcp**: `apiexports/content` on the connection export, including writes to `providerendpoints`, granted by the export's maximal permission policy ([02 APIs, "Connection export"](./xxx-notes-011-v5-impl-02-apis.md)); `bind` on the connection export; the rights to create the connector RBAC in provider workspaces.
-- **In the runtime cluster**: Secrets (connection Secrets) and the trusted-set ConfigMap in its own namespace; read access to `CertificateRequest`s in cert-manager's cluster resource namespace (public certificates only); write access to the `ConnectorCABundle`'s status. No access to the CA's key Secret or issuers, which only cert-manager reads.
+- **In the runtime cluster**: Secrets (connection Secrets) in its own namespace; a Role in cert-manager's cluster resource namespace allowing only `get`, `list` and `watch` on `certificaterequests`, whose status holds public certificates; write access to the `ConnectorCABundle`'s status. No access to the CA's key Secret or issuers, which only cert-manager reads.
 - **Network**: outbound HTTPS to the internet, for Providers' base URLs.
 
 ## Replicas and availability
@@ -301,7 +301,7 @@ Beyond what platform-mesh-operator needs for local Providers:
 - **Secret scope**: connection Secrets in platform-mesh-operator's namespace; token Secrets read by name, with no Secret informers in kcp.
 - **Onboarding order**: register, first control call, then the record; `connectionID` and server keys persisted together.
 - **Secret changes**: on demand (annotation), after tampering, and repair.
-- **Connector CA**: the trusted set derived from cert-manager's CA is kept and pushed here; only connections that are reached count for convergence.
+- **Connector CA**: the trusted set is derived from the CA's `CertificateRequest`s, with nothing stored, and pushed here; the previous CA is dropped per connection, spread over 6 hours after the 48-hour mark; the tamper check only considers unexpired CAs; only connections that are reached count for convergence.
 - **Connector identity**: one group for all shards' connectors.
 - **The admin SA has cluster-admin** in the provider workspace, as in RFC 006; the connector's denylist and the record's maximal permission policy narrow it where PM needs to.
 - **No migration**: no remote Providers exist yet.

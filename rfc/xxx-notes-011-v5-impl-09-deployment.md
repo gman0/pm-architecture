@@ -46,9 +46,9 @@ kcpTopology:
 ### platform-mesh-operator
 
 The control plane is platform-mesh-operator ([03 Operator](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)), with its Deployment and leader election (one active replica). For remote Providers it needs:
-- **RBAC in its namespace** for the connection Secrets ([02 APIs, "The connection Secret"](./xxx-notes-011-v5-impl-02-apis.md)) and the trusted-set ConfigMap ([04 Connector CA, "The trusted set"](./xxx-notes-011-v5-impl-04-connector-ca.md)). That namespace is separate from cert-manager's, which holds the connector CA's key.
+- **RBAC in its namespace** for the connection Secrets ([02 APIs, "The connection Secret"](./xxx-notes-011-v5-impl-02-apis.md)). That namespace is separate from cert-manager's, which holds the connector CA's key.
 - **kcp rights** listed in [03 Operator, "Identity and permissions"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md): the connection export's content and `bind`, and the connector RBAC in provider workspaces.
-- **In the runtime cluster**: write the `ConnectorCABundle`'s status; read `CertificateRequest`s in cert-manager's cluster resource namespace, for the CA's public certificates ([04 Connector CA](./xxx-notes-011-v5-impl-04-connector-ca.md)).
+- **In the runtime cluster**: write the `ConnectorCABundle`'s status; a Role in cert-manager's cluster resource namespace with only `get`, `list` and `watch` on `certificaterequests`, for the CA's public certificates ([04 Connector CA, "The trusted set"](./xxx-notes-011-v5-impl-04-connector-ca.md)). No access to Secrets there.
 - **Egress to the internet**, for Providers' base URLs.
 - **Configuration**: the `distrust` list of CA fingerprints, from values.
 
@@ -65,7 +65,7 @@ The control plane is platform-mesh-operator ([03 Operator](./xxx-notes-011-v5-im
 ### Connector CA
 
 In the `providerconnections` chart ([04 Connector CA](./xxx-notes-011-v5-impl-04-connector-ca.md)):
-- **The CA `Certificate`** (`isCA: true`, 1 year, renewed 90 days before expiry, `rotationPolicy: Always`) in cert-manager's cluster resource namespace, issued by a self-signed issuer by default or by the `issuerRef` from values (e.g. Vault or a cloud CA).
+- **The CA `Certificate`** (`isCA: true`, 1 year, renewed 90 days before expiry, `rotationPolicy: Always`, `revisionHistoryLimit: 3`) in cert-manager's cluster resource namespace, taken from values (default `cert-manager`), issued by a self-signed issuer by default or by the `issuerRef` from values (e.g. Vault or a cloud CA).
 - **A `ClusterIssuer` of type CA** on the CA's Secret, issuing the connector certificates.
 - **Per-shard connector `Certificate`s** from that `ClusterIssuer`.
 - **The status-only `ConnectorCABundle` CRD** and its singleton; platform-mesh-operator fills in its status. Its `distrust` list (CA fingerprints to drop at once after a compromise) is part of platform-mesh-operator's configuration.
@@ -95,7 +95,7 @@ Checked against kcp-operator `8994ed7`.
 | Mount the connector certificate Secret | **Supported**: `extraVolumes` and `extraVolumeMounts` |
 | Keep the privileged fallback credential out | **Supported**: not mounted when `kubeconfigSecretRef` is set |
 | Omit cache-server credentials | **Not supported**: mounted whenever a cache server is configured. **Accepted** and documented as part of a compromised connector's blast radius |
-| Stable replica identities | **Not supported**: Deployment only. **Accepted**: connections move on restart ([05 Connector, "Replicas"](./xxx-notes-011-v5-impl-05-connector.md)) |
+| Stable replica identities | **Not needed**: every connector replica serves every connection its shard needs ([05 Connector, "Replicas"](./xxx-notes-011-v5-impl-05-connector.md)) |
 | No inbound address | `external` is required; set to the in-cluster address |
 
 ## Rollout order

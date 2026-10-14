@@ -47,7 +47,7 @@ Start here, then follow the walkthrough below, or jump to a component.
 | `Provider` status | One writer; one condition per reconcile step, with labelled messages; `phase` for both kinds: `Pending → Provisioning → Ready ⇄ Degraded`, and `Deleting`; CEL rejects local fields on remote Providers ([02](./xxx-notes-011-v5-impl-02-apis.md), [03](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)). |
 | Migration | None: no remote Providers exist yet ([03](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)). |
 | Protocol | Current and previous version supported; sessions authenticated by the inner mutual TLS alone, with a hello message; streams carry HTTP from the first byte; control calls over HTTP/1.1; registration is the only plain-HTTPS call ([01](./xxx-notes-011-v5-impl-01-protocol.md)). |
-| Connector | Connections move on replica restart; cache-server credentials accepted; child workspaces denied; one identity group for all shards ([05](./xxx-notes-011-v5-impl-05-connector.md)). |
+| Connector | Every replica serves every connection its shard needs; cache-server credentials accepted; child workspaces denied; one identity group for all shards ([05](./xxx-notes-011-v5-impl-05-connector.md)). |
 | SDK | One active replica by leader election (standbys answer `503`), owner replicas as a later opt-in; Go only; CRDs plus Secrets as reference store ([07](./xxx-notes-011-v5-impl-07-provider-sdk.md)). |
 | Quickstart | Keeps kubeconfig mode alongside connection mode ([08](./xxx-notes-011-v5-impl-08-provider-quickstart.md)). |
 | API version | `connections.platform-mesh.io/v1alpha1` ([02](./xxx-notes-011-v5-impl-02-apis.md)). |
@@ -161,7 +161,6 @@ The plan targets PM's current deployment: platform-mesh-operator rendering `pm-h
 | platform-mesh-operator: profile validation | Refusing a profile whose `providerconnections` shard list doesn't match `infra`'s, instead of applying it | **Follow-up, not part of this delivery.** Doesn't exist yet and is broader than this plan, which only specifies the rule; until then a shard runbook covers it. Admission-time (needs a webhook, since CEL can't parse the YAML inside the profile ConfigMap) or reconcile-time with the reason on the `PlatformMesh` ([09](./xxx-notes-011-v5-impl-09-deployment.md)) |
 | kcp-operator: cache-server credentials in a `VirtualWorkspace` | Connectors don't need them (v5 observation 7) | Mounted regardless; **accepted** and documented ([09](./xxx-notes-011-v5-impl-09-deployment.md)) |
 | kcp-operator: mount the connector certificate | Connectors sign and handshake with it | **Supported** (`extraVolumes`) |
-| kcp-operator: stable replica identities | Rendezvous hashing keeps connections across restarts | Deployment only; **accepted**: connections move on restart ([05](./xxx-notes-011-v5-impl-05-connector.md)) |
 | kcp: maximal permission policy on writes through the APIExport virtual workspace | platform-mesh-operator writing records | Read from code, not tested (v5 observation 8); see [10 Testing](./xxx-notes-011-v5-impl-10-testing.md) |
 | kcp-operator: `--service-account-lookup=false` | Not needed by v5 for remote Providers | Unchanged |
 

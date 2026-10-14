@@ -29,6 +29,7 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). `p
   - **a maximum connection age long enough** for connectors to replace sessions gracefully (hours, not minutes);
   - **no request-body buffering or size limits** that break long-lived streams;
   - **no client-IP affinity or sticky sessions** on those paths, so a connector that reaches a standby replica can reach the leader on its next attempt;
+  - **enough concurrent connections**, also per source IP: each PM installation keeps several sessions per connection and shard, one per connector replica, all from the same few egress addresses;
   - **a plain load balancer or ingress, not a message-based WebSocket API gateway**: gateways that route individual messages to backends, cap message sizes and limit connection lifetimes (such as cloud "WebSocket API" products) don't work.
 
   The quickstart's README walks through running the SDK's **edge self-test** against the deployed base URL, which checks each point ([07 SDK, "Edge self-test"](./xxx-notes-011-v5-impl-07-provider-sdk.md)).

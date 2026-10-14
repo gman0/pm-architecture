@@ -29,7 +29,7 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Th
  ┌───────────────────────────────────────────────────────────────────────────────┐
  │ session controller (post-start hook)                                          │
  │   discovery: connection export (ProviderEndpoints, claimed endpoint slices)   │
- │   decides sessions for this shard; owns a share of connections (replicas)     │
+ │   decides sessions for this shard; every replica serves every connection     │
  │   dials WebSocket → inner mutual TLS → hello → yamux (Provider opens streams) │
  │                     │                                                         │
  │                     ▼                                                         │
@@ -60,11 +60,12 @@ The rule follows kcp's own: a shard is listed in a slice exactly when it has a c
 
 ## Replicas
 
-Several replicas per shard share the connections:
-- **Rendezvous hashing of `connectionID`** over live replicas; membership from the connector Service's EndpointSlices (or a Lease per replica).
-- **Overlaps are harmless**: sessions aren't exclusive; two replicas briefly serving a connection both connect.
-- **Hand over before cutting off** on graceful shutdown: the new owner connects, the old one sends go-away and drains.
-- **Replica identity**: kcp-operator's `VirtualWorkspace` renders a Deployment, so pod names change on restart and a restarted replica's connections move to other replicas once (relisting on that shard). **Accepted**; graceful rollouts hand over first, so only crashes cost relists.
+Every replica of a shard's connector applies the session rule on its own and keeps a session for every connection the shard needs. Replicas don't know about each other.
+- **Why it works**: sessions aren't exclusive. A connection has one session per replica per shard, and the Provider-side spreads new streams across all sessions serving a host ([01 Protocol, "Sessions and streams"](./xxx-notes-011-v5-impl-01-protocol.md)).
+- **What replicas are for**: availability, and spreading traffic. A crashed replica cuts only the streams on its own sessions; client-go reopens them on the other replicas' sessions at once. Rollouts go one replica at a time without a gap: a leaving replica sends go-away and drains. Requests and watches spread over the replicas, so each carries about an R-th of the shard's traffic.
+- **What it costs**: every replica holds a session for every connection, so a Provider sees up to R sessions per (connection, shard), where R is the replica count (typically 2–3); [07 SDK, "Requirements on Providers"](./xxx-notes-011-v5-impl-07-provider-sdk.md) says so. Each replica also mints its own SA tokens.
+- **Scale-up** opens the new replica's sessions spread with jitter, so Providers aren't hit at once.
+- **If session counts at Providers ever matter more** than spreading traffic, replicas can divide connections by rendezvous hashing of `connectionID` over the live replicas instead. That's a contained change inside the connector: no protocol, SDK or API change, and a rollout between the two is harmless because sessions aren't exclusive.
 
 ## Opening a session
 
@@ -78,24 +79,14 @@ Several replicas per shard share the connections:
 
 cert-manager renews the connector certificate every 12 hours, for 24 hours each ([04 Connector CA, "Connector certificates"](./xxx-notes-011-v5-impl-04-connector-ca.md)). The connector keeps its current certificate and key in memory and decides when to use a renewed one:
 - **Switch rule**: use the renewed certificate once its CA is in the trusted set and marked `converged` in the `ConnectorCABundle`'s status (public data; the connector may read it), or when the current certificate has less than about an hour left, whichever comes first. A renewal under the same CA switches at once; one from a new CA waits until every connection platform-mesh-operator reaches trusts that CA, normally minutes. Open sessions keep their handshake either way.
-- **After switching to a certificate from a new CA that has converged, replace the old-certificate sessions** gracefully within the 48 hours before the old CA is dropped: open the new session first, then go-away on the old one, spread with jitter, the same mechanism as replacement before the edge's maximum connection age. So by the time the old CA is dropped, no session of PM's still depends on it, and the Provider-side's session check closes nothing ([01 Protocol, "Connector CA bundle"](./xxx-notes-011-v5-impl-01-protocol.md)).
-- **A forced switch** (the current certificate about to expire, its successor's CA not converged, e.g. because platform-mesh-operator is down) replaces nothing: open sessions keep running, and only new sessions use the new certificate, failing at Providers that don't pin its CA yet.
+- **Switching replaces no session.** Open sessions keep the certificate they were opened with. Sessions still on the old CA's certificate when platform-mesh-operator drops the old CA are closed by the Provider-side with go-away and a grace period, and the connector reopens them at once with its current certificate ([01 Protocol, "Connector CA bundle"](./xxx-notes-011-v5-impl-01-protocol.md)).
+- **A forced switch** (the current certificate about to expire, its successor's CA not converged, e.g. because platform-mesh-operator is down): only new sessions use the new certificate, failing at Providers that don't pin its CA yet.
 - **After a restart**, only the newest certificate is on disk, so the connector uses it at once. If its CA hasn't converged yet, sessions to connections that don't pin it yet fail until platform-mesh-operator's push lands, normally within minutes.
 - **Reported**: how long a renewed certificate has been waiting to be used, and the current certificate's expiry (metrics, see [04 Connector CA, "Signals"](./xxx-notes-011-v5-impl-04-connector-ca.md)).
 
-**Provider downtime doesn't affect certificate renewal.** Providers pin the connector CA, not connector certificates, so a renewal needs nothing from them. While a Provider is down, the connector retries with backoff; when it's back, the connector dials with its current certificate. If a rollover happened meanwhile, platform-mesh-operator's first successful control call brings the Provider the current trusted set, and the next dial succeeds. Open sessions aren't affected when the certificate that opened them expires: the handshake was checked when the session opened, and TLS doesn't re-check expiry on an open connection. They're replaced on the normal schedule, using the new certificate.
+**Provider downtime doesn't affect certificate renewal.** Providers pin the connector CA, not connector certificates, so a renewal needs nothing from them. While a Provider is down, the connector retries with backoff; when it's back, the connector dials with its current certificate. If a rollover happened meanwhile, platform-mesh-operator's first successful control call brings the Provider the current trusted set, and the next dial succeeds. Open sessions aren't affected when the certificate that opened them expires: the handshake was checked when the session opened, and TLS doesn't re-check expiry on an open connection.
 
-**An expired certificate stops new sessions; open ones carry traffic until they end.** If cert-manager can't renew in time (an outage longer than the 12-hour renewal budget), the connector can't open sessions with any Provider. It then **doesn't replace or close sessions that are still open**: it skips graceful replacement and reports the expired state (metric and readiness). That buys time, not continuity: each connection's traffic on this shard stops when its open session ends, whichever comes first of:
-- **the Provider's edge cutting at its maximum connection age**, normally pre-empted by replacement, so usually the real upper bound (typically hours);
-- **the edge or network dropping the connection** (idle cut, edge redeploy, network failure);
-- **the Provider-side restarting**, which ends all its sessions on every shard;
-- **a connector replica restarting, or connections moving between replicas**: no replica can take over, since they all share the expired certificate.
-
-New sessions can't start either: new connections, a shard getting a connection's first consumer, a changed record. The connector's own kcp access (SA tokens) is unaffected.
-
-Operationally:
-- **No connector rollouts while its certificate is expired**: a rollout would end every session of the shard at once. The runbook says so, and the connector's readiness reports the expired state so rollout tooling can hold.
-- **The real budget** is the renewal budget plus whatever remains of each open session's life, not "unaffected traffic"; the documented alert rules and the runbook state it that way ([04 Connector CA, "Signals"](./xxx-notes-011-v5-impl-04-connector-ca.md)).
+**cert-manager is a dependency.** Renewal normally overlaps by 12 hours: a renewed certificate is in place while the current one has half its life left. Only if renewal keeps failing past that (cert-manager down, the issuer broken, requests not approved) does a certificate expire. Then the connector opens no new sessions and replaces none; open sessions keep carrying traffic until something else ends them. Readiness reports the expired state, so rollouts hold; replicas shouldn't be restarted until renewal resumes. The signals warn well before expiry ([04 Connector CA, "Signals"](./xxx-notes-011-v5-impl-04-connector-ca.md)); what an outage looks like in detail is in the runbook.
 
 ## Serving streams
 
@@ -141,7 +132,7 @@ Settings that matter:
 
 ## Identity towards kcp
 
-- **SA tokens**: the replica that owns a connection mints tokens for the SA named in the `ProviderEndpoint` with TokenRequest through the front-proxy, caches them in memory, refreshes at half their lifetime, and never writes or sends them anywhere else.
+- **SA tokens**: each replica mints tokens for the SA named in the `ProviderEndpoint` of every connection it has sessions for, with TokenRequest through the front-proxy, caches them in memory, refreshes at half their lifetime, and never writes or sends them anywhere else.
 - **The connector's own identity** comes from the `VirtualWorkspace`'s `kubeconfigSecretRef`, which must always be set: without it, kcp-operator mounts its privileged logical-cluster-admin credential into the pod. All shards' connectors share **one group**. The identity needs:
   - read-only `apiexports/content` on the connection export;
   - in every provider workspace, `access` and `create` on `serviceaccounts/token` for that one SA, granted by platform-mesh-operator ([03 Operator, "Connector RBAC"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
@@ -155,7 +146,7 @@ Settings that matter:
 
 ## Limits
 
-Per connection: concurrent streams, request rate, header sizes, in-flight requests. One Provider must not exhaust a connector for others.
+Per connection: concurrent streams, request rate, header sizes, in-flight requests. One Provider must not exhaust a connector for others. The limits apply per replica, so a connection's effective limit is R times the configured one; configured values account for that.
 
 ## Observability
 
@@ -169,17 +160,16 @@ Per connection: concurrent streams, request rate, header sizes, in-flight reques
 
 1. Service scaffold on the virtual workspace framework (reusing patterns from `services/virtual-workspaces` and kcp's initializing-workspaces virtual workspace, including a copy of its proxy helper).
 2. Discovery and the session rule.
-3. Replica membership and rendezvous hashing.
-4. Session client: WebSocket, inner mutual TLS with pinning, hello, yamux, replacement; the certificate switch rule and replacing old-certificate sessions.
-5. Stream serving: in-process listener, context tagging, path rewriting.
-6. Authenticator, authorizer, denylist, Secret-type inspection.
-7. Proxy handler: header stripping, token injection, host mapping, streaming, settings.
-8. Token cache.
-9. Limits, metrics, audit configuration.
+3. Session client: WebSocket, inner mutual TLS with pinning, hello, yamux, replacement; the certificate switch rule.
+4. Stream serving: in-process listener, context tagging, path rewriting.
+5. Authenticator, authorizer, denylist, Secret-type inspection.
+6. Proxy handler: header stripping, token injection, host mapping, streaming, settings.
+7. Token cache.
+8. Limits, metrics, audit configuration.
 
 ## Decided
 
-- **Replica identity**: accept connection moves on restart.
+- **Replicas**: every replica serves every connection its shard needs; rendezvous hashing over replicas remains an option if session counts at Providers ever matter more.
 - **Connector certificate mount**: through the `VirtualWorkspace`'s `extraVolumes` and `extraVolumeMounts` ([09 Deployment, "Connector (providerconnections-vw)"](./xxx-notes-011-v5-impl-09-deployment.md)).
 - **Workspace creation** below the provider workspace: denied.
 - **Connector identity**: one group for all shards; `kubeconfigSecretRef` always set.

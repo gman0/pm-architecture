@@ -20,20 +20,35 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Th
 One cert-manager `Certificate` with `isCA: true`, rendered by the `providerconnections` chart ([09 Deployment, "Connector CA"](./xxx-notes-011-v5-impl-09-deployment.md)):
 - **Lifetime 1 year, renewed 90 days before expiry**, `rotationPolicy: Always`: every renewal has a new key, so a stolen CA key is useful for at most about a year.
 - **Issued by** a self-signed issuer by default, or by an `issuerRef` (e.g. Vault or a cloud CA). With an `issuerRef` the CA is an intermediate under the external root; Providers pin the intermediate, not the root, so installations sharing an external PKI still have their own CAs. Either way, the CA's own key sits in its Secret in the cluster; an external PKI only keeps the root out of it.
-- **In cert-manager's cluster resource namespace**, which only cert-manager reads. A `ClusterIssuer` of type CA on its Secret issues the connector certificates. Neither platform-mesh-operator nor connectors can read the key.
+- **In cert-manager's cluster resource namespace** (the namespace cert-manager looks in for Secrets of cluster-scoped resources; by default the one it runs in), which only cert-manager reads. A `ClusterIssuer` of type CA on its Secret issues the connector certificates, in the connectors' namespace. Neither platform-mesh-operator nor connectors can read the key.
+- **`revisionHistoryLimit: 3`**: cert-manager keeps the last three `CertificateRequest`s of the CA and deletes older ones (see "The trusted set").
+- **Any new issuance is a rollover**: a renewal, `cmctl renew`, or a change to the CA `Certificate`'s spec such as its issuer. Each goes through the automatic rollover below.
 - **The same setup in development and production.**
 
 ## The trusted set
 
-What Providers pin. Kept by platform-mesh-operator ([03 Operator, "Connector CA trusted set"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)):
-- **New CA certificates come from the CA's `CertificateRequest`s**, whose status carries the issued certificate: public data, no key access. platform-mesh-operator validates each one (a CA, allowed to sign, not expired) before adding it; an invalid one is reported (`Valid=False`) and never pushed.
-- **The set is the current CA plus the previous one**, until 48 hours after the current one was first seen. By then every connector has switched (see "Connector certificates"), and no connector certificate from the previous CA is still valid.
-- **A history of every CA PM has trusted** is kept alongside, by fingerprint. platform-mesh-operator's tamper check compares Providers' pinned bundles against it, so a Provider returning after a long outage, still pinning an old CA, isn't mistaken for tampering.
-- **Both live in a ConfigMap in platform-mesh-operator's namespace**, so they survive restarts; the `ConnectorCABundle` status mirrors them for people and connectors.
+What Providers pin. platform-mesh-operator keeps no state for it: everything is derived from the CA's `CertificateRequest`s on every reconcile ([03 Operator, "Connector CA trusted set"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
+
+**The `CertificateRequest`s.** cert-manager creates one per issuance of the CA `Certificate`, next to it in the cluster resource namespace, and keeps the last three. Each carries the issued CA certificate in its status (public data; platform-mesh-operator never reads the CA's Secret), its creation time, and its revision number. platform-mesh-operator watches them, read-only, and validates each certificate (a CA, allowed to sign, not expired); an invalid one is reported (`Valid=False`) and never pushed.
+
+**Derived from them**, with CR(n) the newest:
+
+| | Rule |
+|---|---|
+| **Current CA** | CR(n)'s certificate |
+| **Trusted set** | the current CA, plus CR(n−1)'s CA until its drop time; CAs listed in `distrust` are excluded at once |
+| **Drop time of CR(n−1)'s CA, per connection** | CR(n)'s creation time + 48 hours + a spread of up to 6 hours derived from the `connectionID`. By then every connector has switched, and spreading the drop spreads the handovers it causes (see "Rollover") |
+| **PM's unexpired CAs**, for the tamper check | the retained requests' certificates that haven't expired |
+
+**At most two of PM's CAs are unexpired at once**: each lives a year and is renewed 90 days before it expires, so the predecessor stays valid for 90 days after a renewal. Keeping three requests leaves a spare for a forced extra renewal.
+
+**The tamper check only cares about unexpired CAs.** A pinned CA that's unexpired and isn't one of PM's unexpired CAs can only have come from someone holding the connection secret. An expired pinned CA verifies nothing, so it's never tampering; the push just replaces it. So a short history is enough: a Provider returning after a long absence pins only expired CAs of PM's.
+
+**Nothing is lost on a restart or failover**: the same requests give the same result. If someone deletes the CA's `CertificateRequest`s, a Provider still pinning the predecessor within its last 90 days would be treated as tampering: its bundle is restored (which it needs anyway), its secret changed unnecessarily, and an event recorded. The runbook says not to delete them.
 
 ## ConnectorCABundle
 
-A cluster-scoped, status-only singleton in PM's runtime cluster, `connectorcabundles.providerconnections.platform-mesh.io` (short name `ccab`), named `default`. Example, mid-rollover:
+A cluster-scoped, status-only singleton in PM's runtime cluster, `connectorcabundles.providerconnections.platform-mesh.io` (short name `ccab`), named `default`. Its status is purely derived (see "The trusted set"): rebuilt on every reconcile, so losing it costs nothing. Example, mid-rollover:
 
 ```yaml
 apiVersion: providerconnections.platform-mesh.io/v1alpha1
@@ -44,13 +59,15 @@ status:
   trusted:                               # what Providers should pin
     - fingerprint: sha256:9a07…
       notAfter: "2027-10-13T00:00:00Z"
-      firstSeen: "2026-10-13T08:00:00Z"
+      issued: "2026-10-13T08:00:00Z"     # its CertificateRequest's creation time
       converged: false                   # not yet pinned by every connection platform-mesh-operator reaches
     - fingerprint: sha256:4f1c…
       notAfter: "2027-01-12T00:00:00Z"
-      firstSeen: "2025-10-13T08:00:00Z"
+      issued: "2025-10-13T08:00:00Z"
       converged: true
-      dropAfter: "2026-10-15T08:00:00Z"  # 48 hours after its successor was first seen
+      dropWindow:                        # dropped per connection within this window
+        from: "2026-10-15T08:00:00Z"     # 48 hours after its successor was issued
+        to: "2026-10-15T14:00:00Z"
   shards:                                # counts per shard, for the people running PM
     - name: root
       connections: 140
@@ -94,11 +111,10 @@ Nobody takes part:
 1. **cert-manager renews the CA** 90 days before it expires, with a new key.
 2. **platform-mesh-operator sees the new CA certificate**, validates it, adds it to the trusted set and pushes the set to every connection, with compare-and-swap. Within minutes, every connection it reaches pins both CAs.
 3. **The new CA converges.** Connectors' certificates are renewed by cert-manager on their own schedule, now from the new CA; each connector switches to its renewed certificate once the new CA has converged (see "Switch rule").
-4. **Connectors replace their remaining old-certificate sessions** gracefully, opening new sessions first ([05 Connector](./xxx-notes-011-v5-impl-05-connector.md)).
-5. **After 48 hours platform-mesh-operator drops the old CA** and pushes the set again. Any session still open with an old-CA certificate is closed by the Provider-side with go-away, and reconnects at once ([01 Protocol, "Connector CA bundle"](./xxx-notes-011-v5-impl-01-protocol.md)).
+4. **After 48 hours, platform-mesh-operator drops the old CA**, connection by connection over the next 6 hours (see "The trusted set"). At each Provider, sessions still open with an old-CA certificate are closed with go-away and a grace period, and the connector reopens them at once with its current certificate ([01 Protocol, "Connector CA bundle"](./xxx-notes-011-v5-impl-01-protocol.md)). Long-running watches on those sessions relist. Only sessions not replaced in the meantime are affected (before the edge's maximum connection age, after drops, on connector rollouts), and the spread keeps the relists from hitting kcp at once.
 
 What this means for connections:
-- **Healthy connections** see no interruption: they trust the new CA before any connector uses it, and open sessions are never checked again.
+- **Healthy connections** keep working throughout: they trust the new CA before any connector uses it. Their only disturbance is the handover at the drop, for sessions still on the old CA's certificate.
 - **A connection platform-mesh-operator can't reach** keeps its old pins. If its Provider is down, nothing changes until it returns; its first successful control call brings it the current set, whatever it missed, since control calls don't depend on the connector CA. If its control path is broken while sessions work, it loses each session at the next replacement after the connectors switch, until its control path works again.
 - **A connection that also can't authenticate** (a lost or rejected secret) stays without sessions: repairing its secret needs a session. The Provider's administrators re-pin the bundle out-of-band ([07 SDK, "Administration"](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
 - **If platform-mesh-operator is down for more than about 12 hours when the CA renews**, the new CA never converges, and connectors switch only as their old certificates expire. Open sessions keep running, but new sessions fail at Providers that don't pin the new CA, until platform-mesh-operator is back and pushes it. That's the one way a control-plane outage affects traffic.
@@ -107,7 +123,7 @@ What this means for connections:
 ## Compromise response
 
 - **A shard's connector certificate**: stop issuing it (delete or suspend its `Certificate`), and renew the CA now (below). Renewing the CA matters because sessions opened with the stolen certificate outlive its expiry; dropping its CA closes them.
-- **The CA's key**: renew the CA now (`cmctl renew`), and list the compromised CA's fingerprint in platform-mesh-operator's `distrust` configuration (chart values). platform-mesh-operator drops it from the trusted set at once instead of after 48 hours, pushes the set, and never trusts it again. The Provider-side then closes every session opened under it ([01 Protocol, "Connector CA bundle"](./xxx-notes-011-v5-impl-01-protocol.md)).
+- **The CA's key**: renew the CA now (`cmctl renew`), and list the compromised CA's fingerprint in platform-mesh-operator's `distrust` configuration (chart values). platform-mesh-operator drops it from the trusted set at once, without the 48 hours or the spread, pushes the set, and never trusts it again. The Provider-side then closes every session opened under it ([01 Protocol, "Connector CA bundle"](./xxx-notes-011-v5-impl-01-protocol.md)).
 
 ## Signals
 
@@ -127,15 +143,16 @@ For the **people running the PM installation** (owners and Providers never see t
 
 1. The status-only `ConnectorCABundle` CRD and its printer columns.
 2. Chart templates: the CA `Certificate` and its issuer (self-signed or `issuerRef`), the CA `ClusterIssuer`, per-shard connector `Certificate`s, the `distrust` configuration ([09 Deployment](./xxx-notes-011-v5-impl-09-deployment.md)).
-3. platform-mesh-operator: reading CA certificates from `CertificateRequest`s, the trusted set and its history, the `ConnectorCABundle` status ([03 Operator](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
-4. Connector: the switch rule and replacing old-certificate sessions ([05 Connector](./xxx-notes-011-v5-impl-05-connector.md)).
-5. Runbooks: what the `ConnectorCABundle` status means, connections not reached, compromise, with the documented alert rules from "Signals".
+3. platform-mesh-operator: watching the CA's `CertificateRequest`s, deriving the trusted set, drop times and unexpired CAs from them, the `ConnectorCABundle` status ([03 Operator](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
+4. Connector: the switch rule ([05 Connector](./xxx-notes-011-v5-impl-05-connector.md)).
+5. Runbooks: what the `ConnectorCABundle` status means, connections not reached, compromise, an expired connector certificate (what ends open sessions, what can't start), the CA's `CertificateRequest`s (don't delete them; with approver-policy, the policy must allow them), with the documented alert rules from "Signals".
 
 ## Decided
 
 - **The CA is managed by cert-manager and rolled over automatically**: 1 year, renewed 90 days before expiry, new key each time; self-signed by default, `issuerRef` optional.
-- **CA certificates are read from `CertificateRequest` status**; platform-mesh-operator never reads key Secrets.
-- **The previous CA is dropped 48 hours after its successor is first seen**, or at once if distrusted.
+- **Everything is derived from the CA's `CertificateRequest`s**, the last three of which cert-manager keeps; platform-mesh-operator stores nothing and never reads key Secrets.
+- **The previous CA is dropped 48 hours after its successor is issued, spread over 6 hours per connection**, or at once if distrusted. Connectors don't replace sessions because of a rollover; the drop's handover does.
+- **The tamper check only considers unexpired CAs.**
 - **Only connections platform-mesh-operator reaches count for convergence**; nothing waits for the others.
 - **An operator outage of more than about 12 hours at a CA renewal is accepted**: new sessions fail until platform-mesh-operator pushes the new CA; open sessions keep running. Letting platform-mesh-operator trigger CA renewals itself, only while it's healthy, would avoid it, but needs rights on cert-manager's `Certificate`s in cert-manager's namespace, which is cert-manager's scope, not platform-mesh-operator's.
 - **Connector certificates carry no hostnames or installation identity**; served hosts are in the session's hello.
