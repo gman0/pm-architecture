@@ -4,7 +4,7 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Th
 
 ## What it provides
 
-- **Connector certificates**: one per shard's connector, short-lived, used to sign session assertions and as the inner TLS client certificate ([01 Protocol, "Sessions"](./xxx-notes-011-v5-impl-01-protocol.md)).
+- **Connector certificates**: one per shard's connector, short-lived, used as the client certificate in each session's inner TLS, which is how sessions are authenticated ([01 Protocol, "Sessions"](./xxx-notes-011-v5-impl-01-protocol.md)).
 - **The trusted set**: the connector CA certificates Providers pin, which the operator sends at registration and pushes whenever it changes ([01 Protocol, "Connector CA bundle"](./xxx-notes-011-v5-impl-01-protocol.md), [03 Operator, "Connector CA trusted set"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)).
 - **Rollover progress**, reported in one resource, `ConnectorCABundle`.
 
@@ -86,7 +86,7 @@ Printer columns: Current, Converged, Age.
 - **One cert-manager `Certificate` per shard**, issued by the CA's `ClusterIssuer`.
 - **Lifetime 24 hours, renewed halfway** (`renewBefore: 12h`), `rotationPolicy: Always`. A stolen certificate is useful for at most a day, which is what lets the connector CA do without revocation; cert-manager can be down for up to 12 hours before any certificate expires, and even then open sessions keep running ([05 Connector](./xxx-notes-011-v5-impl-05-connector.md)). It's far shorter than any certificate elsewhere in PM on purpose.
 - **Key usages**: digital signature and client authentication.
-- **Minimal content**: key usages, and the shard name in the subject for audit. **No hostnames and no installation identity**: served hosts travel in each session's assertion ([01 Protocol, "Hosts a session serves"](./xxx-notes-011-v5-impl-01-protocol.md)), and the installation binding is the pinned CA. Nothing in a connector certificate changes when PM renames hosts.
+- **Minimal content**: key usages, and the shard name in the subject for audit. **No hostnames and no installation identity**: served hosts travel in each session's hello ([01 Protocol, "Hosts a session serves"](./xxx-notes-011-v5-impl-01-protocol.md)), and the installation binding is the pinned CA. Nothing in a connector certificate changes when PM renames hosts.
 - **Delivered to the connector** as a mounted Secret, picked up on renewal without a restart ([09 Deployment, "Connector"](./xxx-notes-011-v5-impl-09-deployment.md)).
 - **Switch rule** in the connector: a renewed certificate is used once its CA is in the trusted set and `converged`, or when the current certificate has less than about an hour left, whichever comes first. Until then the connector keeps its current certificate, which stays valid for at least 12 hours after a renewal ([05 Connector, "Connector certificate"](./xxx-notes-011-v5-impl-05-connector.md)).
 - **All replicas of a shard's connector share it.** Per-replica certificates are a later option with an external issuer.
@@ -140,7 +140,9 @@ For the **people running the PM installation** (owners and Providers never see t
 - **CA certificates are read from `CertificateRequest` status**; the operator never reads key Secrets.
 - **The previous CA is dropped 48 hours after its successor is first seen**, or at once if distrusted.
 - **Only connections the operator reaches count for convergence**; nothing waits for the others.
-- **Connector certificates carry no hostnames or installation identity**; served hosts are in the session assertion. **No name constraints** on the CA: there are no meaningful names in connector certificates to constrain.
+- **An operator outage of more than about 12 hours at a CA renewal is accepted**: new sessions fail until the operator pushes the new CA; open sessions keep running. Letting the operator trigger CA renewals itself, only while it's healthy, would avoid it, but needs rights on cert-manager's `Certificate`s in cert-manager's namespace, which is cert-manager's scope, not the operator's.
+- **Connector certificates carry no hostnames or installation identity**; served hosts are in the session's hello.
+- **No intermediates**: connector certificates are issued directly by the CA Providers pin. The CA rolls over yearly by itself, so an intermediate would add nothing; with an external PKI, PM's CA is itself the intermediate, pinned as the trust anchor. **No name constraints** on the CA: there are no meaningful names in connector certificates to constrain.
 - **No installation identifier**: the per-installation CA is the binding. A PM-wide installation identity would be a broader design.
 - **Connector certificates**: 24 hours, renewed halfway, no revocation. kcp doesn't revoke its certificates either, but relies on removing RBAC bindings, which Providers can't do for PM; a short lifetime is the equivalent.
 - **Naming**: connector CA, connector certificates, trusted set, `ConnectorCABundle`.

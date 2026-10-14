@@ -17,6 +17,7 @@ What a Provider still does itself: its portal and user accounts, its operator co
 - **Everything security-relevant is in the SDK**, written once and tested with the protocol's test vectors, so Providers can't get it subtly wrong.
 - **State belongs to its connection** (`connectionID`), never inherited by another connection. Consumer data has to be keyed with the `connectionID` too, not only with the consumer's logical cluster and the object's UID: anyone with a portal account can register a connection with a connector CA of their own and serve made-up objects that reuse a real consumer's cluster and UID (see "Requirements on Providers").
 - **`connectionID`s are stable.** A connection keeps its ID through secret changes and recovery, so state keyed by it stays valid.
+- **`connectionID`s are random and unguessable** (e.g. 128 random bits), so probing the session and control paths can't find valid ones. They aren't secret, and nothing relies on them being so.
 - **Only PM changes a connection's secret**, through the connection's `ProviderEndpoint` ([01 Protocol, "Changing the secret"](./xxx-notes-011-v5-impl-01-protocol.md)).
 - **Secrets are stored hashed**; comparisons are constant-time; nothing secret is logged.
 
@@ -36,8 +37,8 @@ The handler for the one plain-HTTPS endpoint:
 
 ### Control sessions
 
-- **WebSocket upgrade, then the inner TLS server** with the server key the connection's record lists (see "Server keys").
-- **Bearer check** inside, against the current secret hash only.
+- **WebSocket upgrade, then the inner TLS server** with the server key the connection's record lists (see "Server keys"), speaking HTTP/1.1 with keep-alive.
+- **Bearer check** on each request, against the current secret hash only. **The first failed check closes the control session**, so every guess costs a new WebSocket and handshake.
 - **Handlers**: status, connector CA bundle replacement, delete ([01 Protocol, "Control sessions"](./xxx-notes-011-v5-impl-01-protocol.md)). None changes the secret.
 - **Connector CA bundle**: parsed as a SPIFFE-format trust bundle (JWKS with `x5c`); every certificate is checked to be a CA before it's pinned. Replacement is compare-and-swap on the pinned bundle's `etag`: a missing or stale `If-Match` is refused with `412`, an identical body is a no-op ([01 Protocol, "Connector CA bundle"](./xxx-notes-011-v5-impl-01-protocol.md)). The `etag` and fingerprints are reported in `GET`. The bundle is only ever accepted on the control channel or at registration, never from a session. A push is accepted even if every pinned CA has expired: it's authenticated by the secret, not by the pinned CAs.
 
@@ -47,20 +48,21 @@ For each connection, the SDK watches its `ProviderEndpoint` (`default`, cluster-
 - **`pendingSecretHash`**: when set and different from the current hash, it becomes the current hash, atomically in the store, and the old secret stops working ([01 Protocol, "Changing the secret"](./xxx-notes-011-v5-impl-01-protocol.md)). This is the only way the hash changes after registration.
 - **`serverKeys`**: which server keys PM has pinned, so the SDK presents a new key on this connection only once it's listed (see "Server keys").
 
-The record is trusted because of how it arrives: over a session that verified against the connection's pinned bundle and `cluster` claim, from an object only PM can write.
+The record is trusted because of how it arrives: over a session whose connector certificate verified against the connection's pinned bundle and whose hello named the connection's `clusterName`, from an object only PM can write.
 
 ### Session server
 
-1. **Verify the session assertion** in the outer header, exactly as specified ([01 Protocol, "Outer layer"](./xxx-notes-011-v5-impl-01-protocol.md)), including the `jti` cache.
-2. **Accept the WebSocket**, run the **inner TLS server**, and require the client certificate to equal the assertion's leaf.
-3. **Start yamux**; register the session under its connection, with the hosts it serves (from the assertion's `hosts` claim) plus the front-proxy.
-4. **Honour go-away**: stop opening streams on a session the connector is replacing.
-5. **Close all sessions** of a connection that's deleted or frozen.
-6. **Re-check open sessions when the pinned bundle changes** (a push or a re-pin): a session whose client certificate, kept from its handshake, no longer chains to a CA in the new bundle gets go-away, a short grace period for in-flight requests (e.g. 30 seconds, configurable), then is closed. Only the issuer counts, not the certificate's expiry. This ends sessions opened with a leaked CA or connector certificate key once PM drops it; why it matters, and its limits, are in [01 Protocol, "Connector CA bundle"](./xxx-notes-011-v5-impl-01-protocol.md).
+1. **Refuse unknown or deleted connection IDs before the upgrade**, and callers beyond the handshake limits with `503` ([01 Protocol, "Endpoints at a glance"](./xxx-notes-011-v5-impl-01-protocol.md)).
+2. **Accept the WebSocket** and run the **inner TLS server**, requiring a client certificate issued directly by a CA in the connection's pinned bundle, with the `clientAuth` EKU ([01 Protocol, "Inner layer"](./xxx-notes-011-v5-impl-01-protocol.md)). A short timeout covers the whole handshake.
+3. **Read the hello**; close the session if its `clusterName` isn't the connection's.
+4. **Start yamux**; register the session under its connection, with the hosts it serves (from the hello's `hosts`) plus the front-proxy.
+5. **Honour go-away**: stop opening streams on a session the connector is replacing.
+6. **Close all sessions** of a connection that's deleted or frozen.
+7. **Re-check open sessions when the pinned bundle changes** (a push or a re-pin): a session whose client certificate, kept from its handshake, no longer chains to a CA in the new bundle gets go-away, a short grace period for in-flight requests (e.g. 30 seconds, configurable), then is closed. Only the issuer counts, not the certificate's expiry. This ends sessions opened with a leaked CA or connector certificate key once PM drops it; why it matters, and its limits, are in [01 Protocol, "Connector CA bundle"](./xxx-notes-011-v5-impl-01-protocol.md).
 
 ### Transport
 
-- **A per-connection `http.Transport`** whose dial hook opens a yamux stream on a session that serves the target host, writes the preamble, and returns the stream. The request then goes as plain HTTP/1.1 on it; the real kcp URL stays in the request.
+- **A per-connection `http.Transport`** whose dial hook opens a yamux stream on a session that serves the target host and returns it. The target address only chooses the session; the request goes as plain HTTP/1.1 on the stream, with the real kcp URL and `Host`, which the connector checks.
 - **Session choice**: any session for the front-proxy; that shard's sessions for a virtual-workspace host; spread across several sessions serving the same host.
 - **No TLS settings on the client config**: confidentiality comes from the inner TLS, and client-go refuses both a custom transport and TLS options.
 - **Per-host bookkeeping** of request outcomes, which feeds status.
@@ -87,7 +89,7 @@ The SDK enforces the protocol's framing on every session and control session ([0
 ### Edge self-test
 
 Most onboarding failures are edge configuration: a bot challenge on the upgrade, a WAF dropping binary messages, timeouts that are too short. The SDK makes these visible before a PM instance ever connects:
-- **An optional edge-check endpoint** in the connection server, enabled only when the Provider configures a test secret ([01 Protocol, "Diagnosing the edge"](./xxx-notes-011-v5-impl-01-protocol.md)). It echoes binary messages and holds connections open.
+- **An optional edge-check endpoint**, `GET /v1/edge-check` on the base URL, in the connection server. It's a WebSocket, enabled only when the Provider configures a test secret, which the self-test sends; it echoes binary messages up to the 32 KB cap and holds connections open, so the self-test can measure the edge. Only the SDK's own self-test uses it; it isn't part of the protocol PM implements.
 - **A self-test command** the Provider runs from outside its network (a laptop, CI) against its base URL. It checks, with a clear verdict for each:
   - the upgrade succeeds for a non-browser client (no bot challenge, no HTML response);
   - binary messages up to 32 KB pass in both directions, unchanged;
@@ -99,17 +101,16 @@ Most onboarding failures are edge configuration: a bot challenge on the upgrade,
 
 Commands for the Provider's administrators, for cases no protocol call can fix safely. Their inputs are exchanged out-of-band with the people running the PM installation; the commands are tooling and can come after the first release, but the store and the connection server support them from the start:
 - **Re-pin a connection's connector CA bundle**, when no session verifies (for example, a bundle that missed a whole rollover while the connection also lost its secret). Once sessions work again, PM repairs the secret through the record.
-- **Import a connection entry** after the Provider-side lost its store: `connectionID`, owner, `clusterID`, front-proxy URL and the pinned connector CA bundle. No secret hash: the operator notices the failed authentication and changes the secret through the record. New server keys are handed to PM's administrators, since PM never fetches them over plain HTTPS.
+- **Import a connection entry** after the Provider-side lost its store: `connectionID`, owner, `clusterName`, front-proxy URL and the pinned connector CA bundle. No secret hash: the operator notices the failed authentication and changes the secret through the record. New server keys are handed to PM's administrators, since PM never fetches them over plain HTTPS.
 
 Both write to the store with compare-and-swap and fire the notification hooks.
 
 ## Storage
 
-**An interface**, with entities for: connections (owner, addressing, secret hash, pinned connector CA bundle, negotiated version, frozen flag), tokens (hash, owner, expiry, spent), server keys (current, announced, retired, private keys), and the `jti` cache.
+**An interface**, with entities for: connections (owner, addressing, secret hash, pinned connector CA bundle, negotiated version, frozen flag), tokens (hash, owner, expiry, spent), and server keys (current, announced, retired, private keys).
 
 **The Kubernetes reference store** keeps these in the Provider's runtime cluster: non-secret state as **custom resources** (compare-and-swap through `resourceVersion`, inspectable with kubectl), private keys and hashes in **Secrets**. The SDK ships the CRDs. Requirements on any store:
 - atomic updates of a connection entry (compare-and-swap), since several replicas may handle calls;
-- a shared `jti` cache across replicas, or session upgrades pinned to one replica;
 - private keys never readable by anything but the connection server.
 
 **Keep the store as durable as consumer data.** If the store survives what consumer data survives, a rebuilt cluster only needs the store back; otherwise the administrators import connection entries (see "Administration").
@@ -129,7 +130,7 @@ Sessions for different shards can land on different replicas behind the Provider
 ### Follow-up: owner replicas, opt-in
 
 For vendors who need horizontal scale, a later SDK release adds an opt-in mode:
-- **Each connection has an owner replica** (rendezvous hashing over live replicas, or a Lease per connection). Any replica accepts an upgrade and forwards the raw bytes, in-cluster, to the owner, which verifies the assertion and terminates the inner TLS; forwarding replicas see only ciphertext. Control sessions are forwarded the same way.
+- **Each connection has an owner replica** (rendezvous hashing over live replicas, or a Lease per connection). Any replica accepts an upgrade and forwards the raw bytes, in-cluster, to the owner, which terminates the inner TLS and verifies the connector certificate; forwarding replicas see only ciphertext. Control sessions are forwarded the same way.
 - **Each replica runs controllers only for the connections it owns**, through the SDK's connection-aware manager.
 - **When connections move** on scaling, the old owner sends go-away and the connector reconnects to whichever replica the ingress picks, which forwards to the new owner.
 - **Constraints on vendors who opt in**: controllers sharded by connection, so **their reconcile logic must not assume one replica sees all connections** (anything aggregated across connections needs coordination of their own); pod-to-pod connectivity within their namespace; RBAC for Leases or EndpointSlices; relists when connections move.
@@ -160,7 +161,7 @@ Documented for Provider authors ([08 Quickstart, "Documentation for Provider aut
 3. Tokens and portal primitives, notification hooks.
 4. Connection API handlers.
 5. Control sessions (inner TLS server, bearer check, compare-and-swap on the bundle).
-6. Session server (assertion verification, inner TLS, yamux, registry, re-checking sessions on a bundle change).
+6. Session server (handshake limits, inner mutual TLS, hello, yamux, registry, re-checking sessions on a bundle change).
 7. Transport and connection registry; multicluster-runtime helper.
 8. Status, server keys, the record watch (`pendingSecretHash`, `serverKeys`).
 9. Framing enforcement; the edge-check endpoint and the self-test command.

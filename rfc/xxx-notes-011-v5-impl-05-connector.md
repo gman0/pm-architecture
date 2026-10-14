@@ -30,15 +30,15 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Th
  │ session controller (post-start hook)                                          │
  │   discovery: connection export (ProviderEndpoints, claimed endpoint slices)   │
  │   decides sessions for this shard; owns a share of connections (replicas)     │
- │   dials WebSocket → assertion → inner TLS → yamux (Provider opens streams)    │
- │                     │ each stream: preamble target check                      │
+ │   dials WebSocket → inner mutual TLS → hello → yamux (Provider opens streams) │
+ │                     │                                                         │
  │                     ▼                                                         │
  │ in-process listener per session, tagged with connectionID                     │
  │   full handler chain: authn → authz → audit → timeouts → limits               │
  │     authn: session authenticator (connection principal from the tag)          │
  │     authz: own connection's paths only + denylist                             │
- │   providerconnections handler: strip credentials, add SA token, map host,     │
- │     reverse-proxy → this shard's virtual workspace or the front-proxy         │
+ │   providerconnections handler: check Host, strip credentials, add SA token,   │
+ │     map host, reverse-proxy → this shard's virtual workspace or front-proxy   │
  └───────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -68,9 +68,9 @@ Several replicas per shard share the connections:
 
 ## Opening a session
 
-1. **Sign a session assertion** with the mounted connector certificate's key: `aud` the connection's session URL, `cluster` the provider workspace's `clusterID`, `hosts` the shard's virtual-workspace host(s) from the connector's configuration (during a host rename, both the old and the new one), short `exp`, fresh `jti` ([01 Protocol, "Outer layer"](./xxx-notes-011-v5-impl-01-protocol.md)).
-2. **Dial the base URL** from the `ProviderEndpoint`, under the egress rules (see "Egress to Providers"), and upgrade to a WebSocket.
-3. **Run the inner TLS client handshake** with the connector certificate, accepting only server keys from the `ProviderEndpoint`.
+1. **Dial the base URL** from the `ProviderEndpoint`, under the egress rules (see "Egress to Providers"), and upgrade to a WebSocket. The upgrade carries no credentials.
+2. **Run the inner TLS client handshake** with the connector certificate as client certificate, accepting only server keys from the `ProviderEndpoint`. That handshake is the session's authentication ([01 Protocol, "Inner layer"](./xxx-notes-011-v5-impl-01-protocol.md)); a failure ends with a TLS alert (e.g. `unknown_ca`), which the connector reports in its metrics.
+3. **Send the hello**: `clusterName` (the logical cluster of the record it acts on), `hosts` (the shard's virtual-workspace host from the connector's configuration; during a host rename, both the old and the new one) and an opaque `sub` for audit ([01 Protocol, "Hello"](./xxx-notes-011-v5-impl-01-protocol.md)).
 4. **Start yamux** and accept streams opened by the Provider-side.
 5. **Replace sessions** before the edge's maximum connection age (configurable), gracefully; reconnect with backoff on failure. An upgrade refused with `503` and `Retry-After` is retried using the value as the lower bound for the normal reconnect backoff; a session the Provider-side ends gracefully (go-away) is reopened at once. The connector assumes nothing about which Provider replica a session reaches ([01 Protocol, "Provider replicas"](./xxx-notes-011-v5-impl-01-protocol.md)). No replacement while the connector's own certificate is expired (see below).
 
@@ -83,7 +83,7 @@ cert-manager renews the connector certificate every 12 hours, for 24 hours each 
 - **After a restart**, only the newest certificate is on disk, so the connector uses it at once. If its CA hasn't converged yet, sessions to connections that don't pin it yet fail until the operator's push lands, normally within minutes.
 - **Reported**: how long a renewed certificate has been waiting to be used, and the current certificate's expiry (metrics, see [04 Connector CA, "Signals"](./xxx-notes-011-v5-impl-04-connector-ca.md)).
 
-**Provider downtime doesn't affect certificate renewal.** Providers pin the connector CA, not connector certificates, so a renewal needs nothing from them. While a Provider is down, the connector retries with backoff; when it's back, the connector dials with an assertion signed by its current certificate. If a rollover happened meanwhile, the operator's first successful control call brings the Provider the current trusted set, and the next dial succeeds. Open sessions aren't affected when the certificate that opened them expires: the handshake and assertion were checked at upgrade, and TLS doesn't re-check expiry on an open connection. They're replaced on the normal schedule, using the new certificate.
+**Provider downtime doesn't affect certificate renewal.** Providers pin the connector CA, not connector certificates, so a renewal needs nothing from them. While a Provider is down, the connector retries with backoff; when it's back, the connector dials with its current certificate. If a rollover happened meanwhile, the operator's first successful control call brings the Provider the current trusted set, and the next dial succeeds. Open sessions aren't affected when the certificate that opened them expires: the handshake was checked when the session opened, and TLS doesn't re-check expiry on an open connection. They're replaced on the normal schedule, using the new certificate.
 
 **An expired certificate stops new sessions; open ones carry traffic until they end.** If cert-manager can't renew in time (an outage longer than the 12-hour renewal budget), the connector can't open sessions with any Provider. It then **doesn't replace or close sessions that are still open**: it skips graceful replacement and reports the expired state (metric and readiness). That buys time, not continuity: each connection's traffic on this shard stops when its open session ends, whichever comes first of:
 - **the Provider's edge cutting at its maximum connection age**, normally pre-empted by replacement, so usually the real upper bound (typically hours);
@@ -99,10 +99,9 @@ Operationally:
 
 ## Serving streams
 
-- **Preamble first**: read the stream's target, check it against the allow-list (this shard's virtual-workspace host and the front-proxy host, from deployment configuration). Refuse anything else before reading HTTP.
-- **Hand the stream to an in-process HTTP server** whose connection context carries the `connectionID` and the target. Its handler is the server's **full handler chain**, not the virtual workspace handler alone.
+- **Hand the stream to an in-process HTTP server** whose connection context carries the session's `connectionID`. Streams carry HTTP/1.1 from their first byte; there's nothing to read before. The server's handler is its **full handler chain**, not the virtual workspace handler alone.
 - **Path rewriting**: the server prefixes the request path with `/services/providerconnections/<connectionID>`, keeping `Host`, so the virtual workspace framework routes it.
-- **Host check**: each request's `Host` must equal the preamble's target.
+- **Header limits** per request apply as for any HTTP server, so reading a request's headers before its `Host` is checked stays bounded.
 
 ## Authentication
 
@@ -128,11 +127,12 @@ The virtual workspace's authorizer, for the connection principal:
 ## Proxying
 
 For each authorized request:
-1. **Strip credentials and identity headers**: `Authorization`, `Impersonate-*`, `Proxy-*`, cookies, hop-by-hop headers.
-2. **Add the SA token** for the connection (see "Identity towards kcp").
-3. **Map the external host to an in-cluster address** for the dial, keeping `Host` and the TLS server name, so traffic doesn't hairpin through PM's load balancer ([09 Deployment, "Network"](./xxx-notes-011-v5-impl-09-deployment.md)).
-4. **Forward over TLS** verified with PM's own trust for kcp; resolve once, dial the checked address.
-5. **Stream the response** without buffering; watches and LISTs pass through with immediate flushing.
+1. **Check `Host`** against the allow-list: this shard's virtual-workspace host and the front-proxy host, from the connector's deployment configuration. It's the same list for every connection; anything else is refused. This is the only target check: the stream carries no separate target.
+2. **Strip credentials and identity headers**: `Authorization`, `Impersonate-*`, `Proxy-*`, cookies, hop-by-hop headers.
+3. **Add the SA token** for the connection (see "Identity towards kcp").
+4. **Map the external host to an in-cluster address** for the dial, keeping `Host` and the TLS server name, so traffic doesn't hairpin through PM's load balancer ([09 Deployment, "Network"](./xxx-notes-011-v5-impl-09-deployment.md)).
+5. **Forward over TLS** verified with PM's own trust for kcp; resolve once, dial the checked address.
+6. **Stream the response** without buffering; watches and LISTs pass through with immediate flushing.
 
 Settings that matter:
 - **Long-running requests and timeouts**: classify watches and proxied LISTs as long-running, or raise their timeout, so the generic chain's default doesn't cut them.
@@ -163,15 +163,15 @@ Per connection: concurrent streams, request rate, header sizes, in-flight reques
 - **Readiness** reflects an expired connector certificate, so rollout tooling can hold.
 - **Audience**: the people running the PM installation. Owners see their connections' state on `Provider` conditions ([03 Operator, "Readiness and health"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)); Providers see theirs through the SDK.
 - **Audit**: every request with the connection principal and the SA it acted as; at metadata level, never bodies.
-- **Logs**: no tokens, no assertions.
+- **Logs**: no tokens.
 
 ## Work breakdown
 
 1. Service scaffold on the virtual workspace framework (reusing patterns from `services/virtual-workspaces` and kcp's initializing-workspaces virtual workspace, including a copy of its proxy helper).
 2. Discovery and the session rule.
 3. Replica membership and rendezvous hashing.
-4. Session client: assertion signing, WebSocket, inner TLS with pinning, yamux, replacement; the certificate switch rule and replacing old-certificate sessions.
-5. Stream serving: preamble, in-process listener, context tagging, path rewriting.
+4. Session client: WebSocket, inner mutual TLS with pinning, hello, yamux, replacement; the certificate switch rule and replacing old-certificate sessions.
+5. Stream serving: in-process listener, context tagging, path rewriting.
 6. Authenticator, authorizer, denylist, Secret-type inspection.
 7. Proxy handler: header stripping, token injection, host mapping, streaming, settings.
 8. Token cache.
