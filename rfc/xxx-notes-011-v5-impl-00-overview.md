@@ -34,7 +34,7 @@ Start here, then follow the walkthrough below, or jump to a component.
 | Multiplexer | **yamux** over the WebSocket. |
 | Connector CA | **Managed by cert-manager and rolled over automatically**: 1 year, renewed 90 days before expiry, self-signed by default or from an `issuerRef`. platform-mesh-operator pushes each new CA to every Provider before connectors use it; a status-only **`ConnectorCABundle`** reports progress ([04](./xxx-notes-011-v5-impl-04-connector-ca.md)). |
 | Provider-side state | An SDK **storage interface** plus a **Kubernetes reference store** in the Provider's runtime cluster. |
-| Portal | **SDK primitives** (token issuing and verification, connection lifecycle, notification hooks) plus a minimal flow in **pm-provider-quickstart**. |
+| Portal | **SDK primitives** (token issuing and verification, connection lifecycle, hooks) plus a minimal flow in **pm-provider-quickstart**. |
 | E2E | **kind, multi-shard**, with the Provider behind a network boundary, extending platform-mesh-operator's `test/e2e/kind`. |
 | Naming | `xxx-notes-011-v5-impl-*.md` in `rfc/`. |
 | Control plane replicas | **One active replica** by platform-mesh-operator's leader election, with one multicluster-runtime provider per export; no partitioning by shard ([03](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)). |
@@ -48,7 +48,7 @@ Start here, then follow the walkthrough below, or jump to a component.
 | Migration | None: no remote Providers exist yet ([03](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)). |
 | Protocol | Current and previous version supported; sessions authenticated by the inner mutual TLS alone, with a hello message; streams carry HTTP from the first byte; control calls over HTTP/1.1; registration is the only plain-HTTPS call ([01](./xxx-notes-011-v5-impl-01-protocol.md)). |
 | Connector | Every replica serves every connection its shard needs; cache-server credentials accepted; child workspaces denied; one identity group for all shards ([05](./xxx-notes-011-v5-impl-05-connector.md)). |
-| SDK | One active replica by leader election (standbys answer `503`), owner replicas as a later opt-in; Go only; CRDs plus Secrets as reference store ([07](./xxx-notes-011-v5-impl-07-provider-sdk.md)). |
+| SDK | One active replica by leader election (standbys answer `503` with `Retry-After: 5`), horizontal scale as a later opt-in; hooks as optional typed functions; server keys rotated only on demand; Go only; CRDs plus Secrets as reference store ([07](./xxx-notes-011-v5-impl-07-provider-sdk.md)). |
 | Quickstart | Keeps kubeconfig mode alongside connection mode ([08](./xxx-notes-011-v5-impl-08-provider-quickstart.md)). |
 | API version | `connections.platform-mesh.io/v1alpha1` ([02](./xxx-notes-011-v5-impl-02-apis.md)). |
 

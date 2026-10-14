@@ -9,7 +9,7 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). `p
 | One kubeconfig, one PM instance | Still supported (see "Two modes"); in addition, any number of connections, one per PM instance (or per provider workspace), from the SDK |
 | Operator watches one endpoint slice | Operator runs one multicluster-runtime provider per connection and endpoint slice, cluster names prefixed by `connectionID` |
 | No connection server | The SDK's connection server, mounted under the base URL behind an ingress with WebSocket support |
-| No portal flow for onboarding | A minimal portal flow: sign in, issue a token, list, freeze and delete connections |
+| No portal flow for onboarding | A minimal portal flow: sign in, issue a token, list and delete connections |
 
 ## Principles
 
@@ -32,12 +32,12 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). `p
   - **enough concurrent connections**, also per source IP: each PM installation keeps several sessions per connection and shard, one per connector replica, all from the same few egress addresses;
   - **a plain load balancer or ingress, not a message-based WebSocket API gateway**: gateways that route individual messages to backends, cap message sizes and limit connection lifetimes (such as cloud "WebSocket API" products) don't work.
 
-  The quickstart's README walks through running the SDK's **edge self-test** against the deployed base URL, which checks each point ([07 SDK, "Edge self-test"](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
+  The quickstart's README walks through checking each point on the deployed base URL; platform-mesh-operator reports violations it sees on the `Provider` with a labelled message ([03 Operator, "Edge diagnosis"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
 - Storage: the SDK's Kubernetes reference store, in the quickstart's namespace.
 
 ### Replicas
 
-The quickstart runs the connection server and its controllers **with leader election**, as one active replica; standbys answer upgrades with `503` and `Retry-After = max(5s, ceil(LeaseDuration / 3))` ([07 SDK, "Replicas"](./xxx-notes-011-v5-impl-07-provider-sdk.md)). Its README states the constraints for vendors: controllers live in the same process as the connection server and scale vertically until the owner-replica mode is available, and the edge must not pin the session and control paths to one backend (no client-IP affinity or sticky sessions). The Gateway API example routes those paths without affinity.
+The quickstart runs the connection server and its controllers **with leader election**, as one active replica; standbys answer upgrades with `503` and `Retry-After: 5` ([07 SDK, "Replicas"](./xxx-notes-011-v5-impl-07-provider-sdk.md)). Its README states the constraints for vendors: controllers live in the same process as the connection server and scale vertically for now, and the edge must not pin the session and control paths to one backend (no client-IP affinity or sticky sessions). The Gateway API example routes those paths without affinity.
 
 ### Bootstrap per connection
 
@@ -55,8 +55,8 @@ The Wild West operator (`operator/wild-west`) reads its clusters from the mode a
 
 The existing Angular portal gains:
 - **Issue token**: shows the token once, with a `kubectl create secret` command, never a manifest, and never puts the token in a URL;
-- **Connections**: list with status (from the SDK store), freeze, unfreeze, delete;
-- **Notifications**: a simple list of events from the SDK's hooks.
+- **Connections**: list with status (from the SDK store), delete;
+- **Notifications**: a simple list of events, filled by the quickstart's SDK hooks.
 
 Authentication of portal users is out of scope; the quickstart uses a placeholder login and says so.
 

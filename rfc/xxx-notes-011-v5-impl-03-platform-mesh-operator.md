@@ -105,7 +105,7 @@ The `ProviderOnboardingRequest` reconciler. A request is one action: spend a sin
    |---|---|
    | doesn't exist | creates it with `spec.remote` from the request |
    | exists, not registered | reuses it |
-   | exists, registered, and the Provider-side knows the connection (frozen included) | fails the request: a live connection needs no new registration, and a lost or rejected secret is repaired without the owner (see "Secret changes") |
+   | exists, registered, and the Provider-side knows the connection | fails the request: a live connection needs no new registration, and a lost or rejected secret is repaired without the owner (see "Secret changes") |
    | exists, registered, and the Provider-side reports the connection unknown or deleted | reuses it and registers a **new** connection, with the token's base URL |
    | exists, registered, and the Provider-side doesn't answer | waits: only a definite "unknown" allows a new registration |
    | exists, not remote (e.g. a ManagedProvider's) | fails the request |
@@ -143,7 +143,7 @@ The `Registered` step of a remote `Provider`:
 2. **Make a first control call** (`GET` over a control session). The record isn't written until it succeeds, so a control path that's broken from the start shows up here, with its edge-diagnosis label (see "Edge diagnosis"), before any session opens. Every live connection has therefore had a working control path at least once.
 3. **Wait for the binding to work**: the provider workspace must appear in the connection export's endpoint slice before its record can be written. That's kcp's own signal that the binding is in effect.
 4. **Write the record** (see "Records").
-5. **Report the Provider-side's view**: `ConnectionUnknown` (it no longer knows the connection; the owner can onboard the `Provider` again, or the Provider can import the old entry) or `ConnectionFrozen`.
+5. **Report the Provider-side's view**: `ConnectionUnknown` (it no longer knows the connection; the owner can onboard the `Provider` again, or the Provider can import the old entry).
 
 ## Records
 
@@ -179,7 +179,7 @@ On the first control session after registration and on every failed reconnect, c
 - `EdgePayloadBlocked`: closed right after a binary message;
 - `EdgeTimeout`: closed at a regular idle time or age.
 
-Each message points the owner at the Provider's edge checklist and self-test ([08 Quickstart, "Connection server"](./xxx-notes-011-v5-impl-08-provider-quickstart.md)). Only control sessions are observed here; connectors' session failures go to their metrics, where the same classification applies.
+Each message points the owner at the Provider's edge checklist ([08 Quickstart, "Connection server"](./xxx-notes-011-v5-impl-08-provider-quickstart.md)). Only control sessions are observed here; connectors' session failures go to their metrics, where the same classification applies.
 
 ## Secret changes
 

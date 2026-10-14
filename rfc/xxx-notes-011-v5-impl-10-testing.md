@@ -49,8 +49,8 @@ Against a kcp test server, without Providers:
 | Connection breaks after `Ready` | The test edge cuts all sessions of a `Ready` remote Provider: `Connected=False` with `NoSessions`, `phase` `Degraded`; back to `Ready` once sessions return |
 | Operator crash during onboarding | platform-mesh-operator is killed after `POST`, after persisting its result, and after the first control call, in turn: each time the request still reaches `Registered`, the `Provider` reaches `Ready` with the same `connectionID`, without a second connection on the Provider-side |
 | Two requests for one `Provider` | The newer one fails, naming the active one |
-| Misconfigured edge | The test ingress in turn: returns an HTML challenge page on upgrade, drops binary messages, enforces a short idle timeout, cuts connections at a short age. Each yields its distinct label in the `Provider`'s condition message; the SDK's self-test flags the same problem from outside |
-| Well-configured edge | The self-test passes against the quickstart's traefik `HTTPRoute`; 32 KB binary messages pass both ways |
+| Misconfigured edge | The test ingress in turn: returns an HTML challenge page on upgrade, drops binary messages, enforces a short idle timeout, cuts connections at a short age. Each yields its distinct label in the `Provider`'s condition message |
+| Well-configured edge | The quickstart's traefik `HTTPRoute` passes sessions and control sessions; 32 KB binary messages pass both ways |
 | Secret change on demand | The `providers.platform-mesh.io/rotate-connection-secret` annotation on the `Provider`; re-applying the same value does nothing; a new value: the hash goes through the record, the Provider-side adopts it, the old secret is refused afterwards; sessions unaffected |
 | Lost connection Secret | Deleted from platform-mesh-operator's namespace: platform-mesh-operator repairs it through the record; `connectionID` and state kept; no owner action |
 | Provider-side rejects PM's secret | The quickstart's store is restored from an older snapshot: platform-mesh-operator repairs the secret; repeated failures stay within the rate limit |
