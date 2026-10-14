@@ -30,7 +30,8 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). `p
   - **no request-body buffering or size limits** that break long-lived streams;
   - **no client-IP affinity or sticky sessions** on those paths, so a connector that reaches a standby replica can reach the leader on its next attempt;
   - **enough concurrent connections**, also per source IP: each PM installation keeps several sessions per connection and shard, one per connector replica, all from the same few egress addresses;
-  - **a plain load balancer or ingress, not a message-based WebSocket API gateway**: gateways that route individual messages to backends, cap message sizes and limit connection lifetimes (such as cloud "WebSocket API" products) don't work.
+  - **a plain load balancer or ingress, not a message-based WebSocket API gateway**: gateways that route individual messages to backends, cap message sizes and limit connection lifetimes (such as cloud "WebSocket API" products) don't work;
+  - **a server certificate from a public CA**, or, with a private CA, owners set it as their `Provider`'s `caBundle`. Before switching to a new private CA, tell owners, so they add it next to the old one; otherwise their new sessions fail with `EdgeTLS`.
 
   The quickstart's README walks through checking each point on the deployed base URL; platform-mesh-operator reports violations it sees on the `Provider` with a labelled message ([03 Operator, "Edge diagnosis"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
 - Storage: the SDK's Kubernetes reference store, in the quickstart's namespace.

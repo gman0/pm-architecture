@@ -46,7 +46,8 @@ kcpTopology:
 ### platform-mesh-operator
 
 The control plane is platform-mesh-operator ([03 Operator](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)), with its Deployment and leader election (one active replica). For remote Providers it needs:
-- **RBAC in its namespace** for the connection Secrets ([02 APIs, "The connection Secret"](./xxx-notes-011-v5-impl-02-apis.md)). That namespace is separate from cert-manager's, which holds the connector CA's key.
+- **The `ProviderEndpointRegistration` CRD**, shipped with platform-mesh-operator's chart ([02 APIs, "ProviderEndpointRegistration"](./xxx-notes-011-v5-impl-02-apis.md)).
+- **RBAC in its namespace** for `ProviderEndpointRegistration`s and their Secrets. That namespace is separate from cert-manager's, which holds the connector CA's key. PM administrators get `update` on `providerendpointregistrations` there, for recovery, without access to the Secrets.
 - **kcp rights** listed in [03 Operator, "Identity and permissions"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md): the connection export's content and `bind`, and the connector RBAC in provider workspaces.
 - **In the runtime cluster**: write the `ConnectorCABundle`'s status; a Role in cert-manager's cluster resource namespace with only `get`, `list` and `watch` on `certificaterequests`, for the CA's public certificates ([04 Connector CA, "The trusted set"](./xxx-notes-011-v5-impl-04-connector-ca.md)). No access to Secrets there.
 - **Egress to the internet**, for Providers' base URLs.

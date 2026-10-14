@@ -69,7 +69,7 @@ Every replica of a shard's connector applies the session rule on its own and kee
 
 ## Opening a session
 
-1. **Dial the base URL** from the `ProviderEndpoint`, under the egress rules (see "Egress to Providers"), and upgrade to a WebSocket. The upgrade carries no credentials.
+1. **Dial the base URL** from the `ProviderEndpoint`, under the egress rules (see "Egress to Providers"), verify the outer TLS with the `ProviderEndpoint`'s `caBundle` when set (web PKI otherwise), and upgrade to a WebSocket. The upgrade carries no credentials.
 2. **Run the inner TLS client handshake** with the connector certificate as client certificate, accepting only server keys from the `ProviderEndpoint`. That handshake is the session's authentication ([01 Protocol, "Inner layer"](./xxx-notes-011-v5-impl-01-protocol.md)); a failure ends with a TLS alert (e.g. `unknown_ca`), which the connector reports in its metrics.
 3. **Send the hello**: `clusterName` (the logical cluster of the `ProviderEndpoint` it acts on), `hosts` (the shard's virtual-workspace host from the connector's configuration; during a host rename, both the old and the new one) and an opaque `sub` for audit ([01 Protocol, "Hello"](./xxx-notes-011-v5-impl-01-protocol.md)).
 4. **Start yamux** and accept streams opened by the Provider-side.
