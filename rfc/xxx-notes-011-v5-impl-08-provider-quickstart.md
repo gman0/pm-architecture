@@ -23,7 +23,7 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). `p
 - Mounted under the base URL path the token names (e.g. `https://wildwest.example.com/pm`).
 - Behind an ingress that allows WebSocket upgrades with suitable idle timeouts and maximum connection age. The manifests ship a tested **Gateway API `HTTPRoute` on traefik**, the setup PM itself uses and the e2e runs, plus a **generic checklist** for any other ingress, cloud load balancer, CDN or WAF:
   - **WebSocket upgrades allowed** on the base URL's `/v1/connections/*/session` and `/v1/connections/*/control` paths;
-  - **no bot protection on those paths**: the connector and the operator aren't browsers, so JavaScript challenges and CAPTCHAs (e.g. a CDN's bot mode) block them. Exempt both paths;
+  - **no bot protection on those paths**: the connectors and platform-mesh-operator aren't browsers, so JavaScript challenges and CAPTCHAs (e.g. a CDN's bot mode) block them. Exempt both paths;
   - **binary WebSocket messages up to 32 KB passed through untouched**: WAFs (web application firewalls, usually a feature of the CDN, load balancer or ingress) typically inspect only the upgrade request, which is fine; WAFs that inspect or block WebSocket payloads need a rule exempting the two paths. The payload is TLS ciphertext, so there's nothing to inspect;
   - **idle timeout above the session ping interval** (some load balancers default to 60 seconds);
   - **a maximum connection age long enough** for connectors to replace sessions gracefully (hours, not minutes);
@@ -75,7 +75,7 @@ The quickstart README becomes the Provider-facing guide:
 3. The mode abstraction; the operator on it, with the multicluster-runtime helper in connection mode and the existing single kubeconfig in kubeconfig mode.
 4. Portal pages.
 5. README and examples.
-6. Deployment variant used by the kind e2e, behind the network boundary ([10 Testing, "E2E"](./xxx-notes-011-v5-impl-10-testing.md)).
+6. Deployment variant used by the kind e2e, behind the network boundary ([10 Testing, "E2E (kind, multi-shard)"](./xxx-notes-011-v5-impl-10-testing.md)).
 
 ## Two modes
 

@@ -1,6 +1,6 @@
 # v5 implementation plan: connector
 
-Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). The **data plane**: a new service at `platform-mesh/services/providerconnections-vw`, built on the virtual workspace framework, one per kcp shard, deployed as a kcp-operator `VirtualWorkspace` with `shardRef` ([09 Deployment, "Connector"](./xxx-notes-011-v5-impl-09-deployment.md)). It opens sessions to Providers and proxies their requests to kcp with each connection's SA token.
+Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). The **data plane**: a new service at `platform-mesh/services/providerconnections-vw`, built on the virtual workspace framework, one per kcp shard, deployed as a kcp-operator `VirtualWorkspace` with `shardRef` ([09 Deployment, "Connector (providerconnections-vw)"](./xxx-notes-011-v5-impl-09-deployment.md)). It opens sessions to Providers and proxies their requests to kcp with each connection's SA token.
 
 ## Responsibilities
 
@@ -12,7 +12,7 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Th
 
 **Doesn't own:**
 - records or anything else in kcp (it writes only TokenRequests);
-- connection secrets or control calls ([03 Operator](./xxx-notes-011-v5-impl-03-providerconnections-operator.md));
+- connection secrets or control calls ([03 Connection handling](./xxx-notes-011-v5-impl-03-providerconnections-operator.md));
 - issuing its certificate ([04 Connector CA](./xxx-notes-011-v5-impl-04-connector-ca.md)).
 
 ## Principles
@@ -77,13 +77,13 @@ Several replicas per shard share the connections:
 ### Connector certificate
 
 cert-manager renews the connector certificate every 12 hours, for 24 hours each ([04 Connector CA, "Connector certificates"](./xxx-notes-011-v5-impl-04-connector-ca.md)). The connector keeps its current certificate and key in memory and decides when to use a renewed one:
-- **Switch rule**: use the renewed certificate once its CA is in the trusted set and marked `converged` in the `ConnectorCABundle`'s status (public data; the connector may read it), or when the current certificate has less than about an hour left, whichever comes first. A renewal under the same CA switches at once; one from a new CA waits until every connection the operator reaches trusts that CA, normally minutes. Open sessions keep their handshake either way.
+- **Switch rule**: use the renewed certificate once its CA is in the trusted set and marked `converged` in the `ConnectorCABundle`'s status (public data; the connector may read it), or when the current certificate has less than about an hour left, whichever comes first. A renewal under the same CA switches at once; one from a new CA waits until every connection platform-mesh-operator reaches trusts that CA, normally minutes. Open sessions keep their handshake either way.
 - **After switching to a certificate from a new CA that has converged, replace the old-certificate sessions** gracefully within the 48 hours before the old CA is dropped: open the new session first, then go-away on the old one, spread with jitter, the same mechanism as replacement before the edge's maximum connection age. So by the time the old CA is dropped, no session of PM's still depends on it, and the Provider-side's session check closes nothing ([01 Protocol, "Connector CA bundle"](./xxx-notes-011-v5-impl-01-protocol.md)).
-- **A forced switch** (the current certificate about to expire, its successor's CA not converged, e.g. because the operator is down) replaces nothing: open sessions keep running, and only new sessions use the new certificate, failing at Providers that don't pin its CA yet.
-- **After a restart**, only the newest certificate is on disk, so the connector uses it at once. If its CA hasn't converged yet, sessions to connections that don't pin it yet fail until the operator's push lands, normally within minutes.
+- **A forced switch** (the current certificate about to expire, its successor's CA not converged, e.g. because platform-mesh-operator is down) replaces nothing: open sessions keep running, and only new sessions use the new certificate, failing at Providers that don't pin its CA yet.
+- **After a restart**, only the newest certificate is on disk, so the connector uses it at once. If its CA hasn't converged yet, sessions to connections that don't pin it yet fail until platform-mesh-operator's push lands, normally within minutes.
 - **Reported**: how long a renewed certificate has been waiting to be used, and the current certificate's expiry (metrics, see [04 Connector CA, "Signals"](./xxx-notes-011-v5-impl-04-connector-ca.md)).
 
-**Provider downtime doesn't affect certificate renewal.** Providers pin the connector CA, not connector certificates, so a renewal needs nothing from them. While a Provider is down, the connector retries with backoff; when it's back, the connector dials with its current certificate. If a rollover happened meanwhile, the operator's first successful control call brings the Provider the current trusted set, and the next dial succeeds. Open sessions aren't affected when the certificate that opened them expires: the handshake was checked when the session opened, and TLS doesn't re-check expiry on an open connection. They're replaced on the normal schedule, using the new certificate.
+**Provider downtime doesn't affect certificate renewal.** Providers pin the connector CA, not connector certificates, so a renewal needs nothing from them. While a Provider is down, the connector retries with backoff; when it's back, the connector dials with its current certificate. If a rollover happened meanwhile, platform-mesh-operator's first successful control call brings the Provider the current trusted set, and the next dial succeeds. Open sessions aren't affected when the certificate that opened them expires: the handshake was checked when the session opened, and TLS doesn't re-check expiry on an open connection. They're replaced on the normal schedule, using the new certificate.
 
 **An expired certificate stops new sessions; open ones carry traffic until they end.** If cert-manager can't renew in time (an outage longer than the 12-hour renewal budget), the connector can't open sessions with any Provider. It then **doesn't replace or close sessions that are still open**: it skips graceful replacement and reports the expired state (metric and readiness). That buys time, not continuity: each connection's traffic on this shard stops when its open session ends, whichever comes first of:
 - **the Provider's edge cutting at its maximum connection age**, normally pre-empted by replacement, so usually the real upper bound (typically hours);
@@ -150,7 +150,7 @@ Settings that matter:
 
 ## Egress to Providers
 
-- Dial only base URLs from `ProviderEndpoint`s; apply the same rules as the operator ([03 Operator, "Egress"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)): `https`, public addresses, resolve once, no redirects.
+- Dial only base URLs from `ProviderEndpoint`s; apply the same rules as platform-mesh-operator ([03 Connection handling, "Egress"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)): `https`, public addresses, resolve once, no redirects.
 - Network policy allows the connector outbound internet access and in-cluster access to its virtual workspace and the front-proxy, nothing else ([09 Deployment](./xxx-notes-011-v5-impl-09-deployment.md)).
 
 ## Limits
@@ -161,7 +161,7 @@ Per connection: concurrent streams, request rate, header sizes, in-flight reques
 
 - **Metrics**: sessions per state, streams per session, requests by connection and outcome (via `apiserver_request_*`), denials by rule, token mint outcomes, buffer pressure, and the connector certificate's expiry and how long a renewed one has waited ([04 Connector CA, "Signals"](./xxx-notes-011-v5-impl-04-connector-ca.md)). Scraped through a `ServiceMonitor` like PM's other components ([09 Deployment, "Observability"](./xxx-notes-011-v5-impl-09-deployment.md)).
 - **Readiness** reflects an expired connector certificate, so rollout tooling can hold.
-- **Audience**: the people running the PM installation. Owners see their connections' state on `Provider` conditions ([03 Operator, "Readiness and health"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)); Providers see theirs through the SDK.
+- **Audience**: the people running the PM installation. Owners see their connections' state on `Provider` conditions ([03 Connection handling, "The `Connected` subroutine"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)); Providers see theirs through the SDK.
 - **Audit**: every request with the connection principal and the SA it acted as; at metadata level, never bodies.
 - **Logs**: no tokens.
 
@@ -180,7 +180,7 @@ Per connection: concurrent streams, request rate, header sizes, in-flight reques
 ## Decided
 
 - **Replica identity**: accept connection moves on restart.
-- **Connector certificate mount**: through the `VirtualWorkspace`'s `extraVolumes` and `extraVolumeMounts` ([09 Deployment, "Connector"](./xxx-notes-011-v5-impl-09-deployment.md)).
+- **Connector certificate mount**: through the `VirtualWorkspace`'s `extraVolumes` and `extraVolumeMounts` ([09 Deployment, "Connector (providerconnections-vw)"](./xxx-notes-011-v5-impl-09-deployment.md)).
 - **Workspace creation** below the provider workspace: denied.
 - **Connector identity**: one group for all shards; `kubeconfigSecretRef` always set.
 - **Cache-server credentials**: accepted, documented.
