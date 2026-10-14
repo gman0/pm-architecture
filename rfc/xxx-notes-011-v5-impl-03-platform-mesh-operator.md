@@ -1,6 +1,6 @@
 # v5 implementation plan: platform-mesh-operator
 
-Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). The **control plane**: platform-mesh-operator (`platform-mesh/operators/platform-mesh-operator`) owns every `Provider`, local or remote, from creation to deletion. For remote Providers that includes onboarding requests, the provider workspace, registration, records, health, secret changes, the connector CA trusted set and offboarding. None of it is on the session path.
+Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). The **control plane**: platform-mesh-operator (`platform-mesh/operators/platform-mesh-operator`) owns every `Provider`, local or remote, from creation to deletion. For remote Providers that includes onboarding requests, the provider workspace, registration, `ProviderEndpoint`s, health, secret changes, the connector CA trusted set and offboarding. None of it is on the session path.
 
 ## Responsibilities
 
@@ -9,7 +9,7 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Th
 - provider workspaces and everything PM creates in them: the admin SA, the connection export binding, the connector RBAC, and for local Providers the scoped kubeconfig;
 - connection Secrets, in its namespace in PM's runtime cluster;
 - every call to a Provider's connection API ([01 Protocol](./xxx-notes-011-v5-impl-01-protocol.md));
-- `ProviderEndpoint` records in provider workspaces ([02 APIs](./xxx-notes-011-v5-impl-02-apis.md));
+- `ProviderEndpoint`s in provider workspaces ([02 APIs](./xxx-notes-011-v5-impl-02-apis.md));
 - the whole `Provider` status: conditions, `phase`, `status.connection`;
 - the connector CA trusted set: keeping it and pushing it to every connection ([04 Connector CA](./xxx-notes-011-v5-impl-04-connector-ca.md)).
 
@@ -29,9 +29,9 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Th
 
 - **One owner per `Provider`**: one reconciler writes its whole status and runs one finalizer.
 - **No kcp credential for remote Providers** (overview, principle 1): no token Secret, no kubeconfig.
-- **Write before send** (overview, principle 7): every new secret is in the connection Secret before its hash is sent or written into the record.
+- **Write before send** (overview, principle 7): every new secret is in the connection Secret before its hash is sent or written into the `ProviderEndpoint`.
 - **The Provider-side is the source of truth** for what it has pinned; it's read back with `GET` and converged.
-- **Only PM changes a connection's secret**, through the record (see "Secret changes"); no call does.
+- **Only PM changes a connection's secret**, through the `ProviderEndpoint` (see "Secret changes"); no call does.
 - **Never trust owner-writable fields for links** (overview, principle 4).
 - **Bounded, polite egress**: per-Provider rate limits, jitter and backoff; Providers are external services.
 - **Aggregate status only** towards owners.
@@ -45,7 +45,7 @@ The `Provider` reconciler runs a fixed sequence of steps per kind. Each step onl
 | 1 | `Workspace`: the provider workspace and the admin SA | `Workspace`: the provider workspace and the admin SA `default/provider` (cluster-admin in the workspace, the SA connectors act as) |
 | 2 | `Kubeconfig`: an SA-token Secret, and a scoped kubeconfig copied to the owner's workspace (RFC 006) | `ConnectionBinding`: the binding to the connection export (below) |
 | 3 | | `ConnectorAccess`: the connector RBAC (below) |
-| 4 | | `Registered`: waits for a registration, makes the first control call, writes the record (see "First control call and record") |
+| 4 | | `Registered`: waits for a registration, makes the first control call, writes the `ProviderEndpoint` (see "First control call and ProviderEndpoint") |
 | 5 | | `Connected`: health on every poll, plus the connection's upkeep (see "Health") |
 
 The provider workspace is `:root:providers:<Provider name>-<the Provider's kcp.io/cluster annotation>`. The annotation is set by kcp, not the owner. Its logical cluster name (`clusterName`) is read from the `Workspace` object in `:root:providers`, which is PM-owned; nothing about the workspace is taken from the `Provider`'s spec or status.
@@ -62,7 +62,7 @@ In each remote Provider's workspace, a role and binding for the **connectors' id
 - `access` on `/` (workspace content);
 - `create` on `serviceaccounts/token` with `resourceNames: [provider]`, in namespace `default`.
 
-Nothing else. Connectors read records through the connection export, not through this RBAC ([05 Connector, "Identity towards kcp"](./xxx-notes-011-v5-impl-05-connector.md)).
+Nothing else. Connectors read `ProviderEndpoint`s through the connection export, not through this RBAC ([05 Connector, "Identity towards kcp"](./xxx-notes-011-v5-impl-05-connector.md)).
 
 ## Spec validation
 
@@ -124,35 +124,35 @@ The `ProviderOnboardingRequest` reconciler. A request is one action: spend a sin
 5. **Delete the token Secret's content**, only after the registration's result is persisted. The Secret object stays, since the owner may manage it through GitOps; only its token data goes.
 6. **Done**: phase `Registered`, with the `connectionID` in status, and a message pointing to the `Provider`. A request never changes again once `Registered` or `Failed`; onboarding again needs a new request.
 
-`Failed` is only possible before registration succeeds: the token refused, validation, or another active request. After registration, the `Provider` waits for the first control call, the record, sessions and kcp for as long as it takes.
+`Failed` is only possible before registration succeeds: the token refused, validation, or another active request. After registration, the `Provider` waits for the first control call, the `ProviderEndpoint`, sessions and kcp for as long as it takes.
 
 ## Registration
 
 1. **Generate the connection secret** and write it to the connection Secret (write before send). When a registered `Provider` is onboarded again, this replaces the old connection's Secret.
 2. **Call `POST /v1/connections`** with the token, the request's UID as idempotency key, the `clusterName`, the front-proxy URL, the secret's hash and the current trusted set ([01 Protocol, "Registration"](./xxx-notes-011-v5-impl-01-protocol.md)).
-3. **On success**, persist the `connectionID`, **the base URL from the token and the returned server keys** in the connection Secret, in one write; then record the `connectionID` in the request's status. The token's data is deleted afterwards, so the Secret is the only place the base URL survives until the record is written. The server keys are trust anchors for the control session and the record, so they're never kept in owner-writable status, and never only in memory.
+3. **On success**, persist the `connectionID`, **the base URL from the token and the returned server keys** in the connection Secret, in one write; then record the `connectionID` in the request's status. The token's data is deleted afterwards, so the Secret is the only place the base URL survives until the `ProviderEndpoint` is written. The server keys are trust anchors for the control session and the `ProviderEndpoint`, so they're never kept in owner-writable status, and never only in memory.
 4. **On a lost response, or a crash before step 3**, retry with the same idempotency key and hash; the same `connectionID` and server keys come back. The Provider-side honours such retries for 7 days by default ([01 Protocol, "Registration"](./xxx-notes-011-v5-impl-01-protocol.md)), far longer than any expected outage.
 5. **On refusal** (token spent elsewhere, expired, wrong owner, or a retry after the window), fail the request with a reason the owner can act on. A retry refused after the window leaves an orphaned connection on the Provider-side, which the SDK expires because it never saw a control call or session ([07 SDK, "Connection API"](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
 
 Every step resumes from persisted state: the connection Secret holds the secret, then the `connectionID`, base URL and server keys; the request's status holds the phase.
 
-## First control call and record
+## First control call and ProviderEndpoint
 
 The `Registered` step of a remote `Provider`:
 1. **Wait for a registration**: until the connection Secret holds a `connectionID`, base URL and server keys, `Registered=False` with `NotRegistered: waiting for an onboarding request`.
-2. **Make a first control call** (`GET` over a control session). The record isn't written until it succeeds, so a control path that's broken from the start shows up here, with its edge-diagnosis label (see "Edge diagnosis"), before any session opens. Every live connection has therefore had a working control path at least once.
-3. **Wait for the binding to work**: the provider workspace must appear in the connection export's endpoint slice before its record can be written. That's kcp's own signal that the binding is in effect.
-4. **Write the record** (see "Records").
+2. **Make a first control call** (`GET` over a control session). The `ProviderEndpoint` isn't written until it succeeds, so a control path that's broken from the start shows up here, with its edge-diagnosis label (see "Edge diagnosis"), before any session opens. Every live connection has therefore had a working control path at least once.
+3. **Wait for the binding to work**: the provider workspace must appear in the connection export's endpoint slice before its `ProviderEndpoint` can be written. That's kcp's own signal that the binding is in effect.
+4. **Write the `ProviderEndpoint`** (see "Writing ProviderEndpoints").
 5. **Report the Provider-side's view**: `ConnectionUnknown` (it no longer knows the connection; the owner can onboard the `Provider` again, or the Provider can import the old entry).
 
-## Records
+## Writing ProviderEndpoints
 
 One `ProviderEndpoint` per provider workspace, written through the connection export ([02 APIs, "ProviderEndpoint"](./xxx-notes-011-v5-impl-02-apis.md)):
-- **Written from the connection Secret**, which is authoritative ([02 APIs, "The connection Secret"](./xxx-notes-011-v5-impl-02-apis.md)): `connectionID`, base URL and server keys are copied, and `pendingSecretHash` is the hash of `pendingSecret` while the secret changes. Every change goes into the Secret first; the record follows.
-- **Drift repair**: if the record is missing (e.g. the binding was recreated) or differs, it's rewritten from the connection Secret. Connectors react to the change ([05 Connector, "Discovery"](./xxx-notes-011-v5-impl-05-connector.md)).
+- **Written from the connection Secret**, which is authoritative ([02 APIs, "The connection Secret"](./xxx-notes-011-v5-impl-02-apis.md)): `connectionID`, base URL and server keys are copied, and `pendingSecretHash` is the hash of `pendingSecret` while the secret changes. Every change goes into the Secret first; the `ProviderEndpoint` follows.
+- **Drift repair**: if the `ProviderEndpoint` is missing (e.g. the binding was recreated) or differs, it's rewritten from the connection Secret. Connectors react to the change ([05 Connector, "Discovery"](./xxx-notes-011-v5-impl-05-connector.md)).
 - **Read as input only when the connection Secret is lost**: `connectionID`, base URL and server keys are rebuilt from it, and the secret is repaired (see "Secret changes").
-- **Server key updates**: when `GET` shows a new server key, it's added to the Secret and then the record; the Provider-side presents it on a connection only once that connection's record lists it. Retired keys are removed once `GET` no longer lists them ([01 Protocol, "Server keys"](./xxx-notes-011-v5-impl-01-protocol.md)).
-- **Administrator input for recovery**: a PM administrator can supply a connection's base URL and server keys, for example after a Provider rebuilt elsewhere lost its keys. The input lives in PM's runtime cluster, never in an owner-writable field, and is applied to the connection Secret, then the record. Server keys are never fetched over plain HTTPS. The tooling is a [follow-up](./xxx-notes-011-v5-impl-todo.md); the record's design already allows it.
+- **Server key updates**: when `GET` shows a new server key, it's added to the Secret and then the `ProviderEndpoint`; the Provider-side presents it on a connection only once that connection's `ProviderEndpoint` lists it. Retired keys are removed once `GET` no longer lists them ([01 Protocol, "Server keys"](./xxx-notes-011-v5-impl-01-protocol.md)).
+- **Administrator input for recovery**: a PM administrator can supply a connection's base URL and server keys, for example after a Provider rebuilt elsewhere lost its keys. The input lives in PM's runtime cluster, never in an owner-writable field, and is applied to the connection Secret, then the `ProviderEndpoint`. Server keys are never fetched over plain HTTPS. The tooling is a [follow-up](./xxx-notes-011-v5-impl-todo.md); the `ProviderEndpoint`'s design already allows it.
 - **Deleted first** when the `Provider` is deleted (see "Deletion").
 
 ## Health
@@ -167,7 +167,7 @@ The `Connected` step runs on every reconcile of a registered remote `Provider` a
 
   The message adds counts and the last error, never shard names (overview, principle 9). If the control path fails, the status can't be read, so the control-path label wins and the message mentions the last known session state.
 - **Sets the warning condition `ProtocolOutdated`** while the connection still negotiates the previous protocol version, so the owner can ask the Provider to upgrade its SDK ([07 SDK, "Releases and protocol versions"](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
-- **Does the connection's upkeep** on the same polls: server key updates in the record, secret changes (see "Secret changes"), and trusted-set pushes and the tamper check (see "Connector CA trusted set").
+- **Does the connection's upkeep** on the same polls: server key updates in the `ProviderEndpoint`, secret changes (see "Secret changes"), and trusted-set pushes and the tamper check (see "Connector CA trusted set").
 - **Per-shard and per-host detail goes to metrics**, never to conditions (overview, principle 9).
 
 **Readiness for onboarding**: at least the front-proxy host is covered and reachable; before any consumer binds, that's the only required host.
@@ -186,20 +186,20 @@ Each message points the owner at the Provider's edge checklist ([08 Quickstart, 
 
 The only way a connection's secret changes ([01 Protocol, "Changing the secret"](./xxx-notes-011-v5-impl-01-protocol.md)):
 1. Generate a new secret; write it as `pendingSecret` in the connection Secret.
-2. Write its hash into the record's `pendingSecretHash`.
-3. Wait for the Provider-side to adopt it, which it does when it reads the record over a session: authenticate with `pendingSecret` (a `GET`) until it succeeds.
+2. Write its hash into the `ProviderEndpoint`'s `pendingSecretHash`.
+3. Wait for the Provider-side to adopt it, which it does when it reads the `ProviderEndpoint` over a session: authenticate with `pendingSecret` (a `GET`) until it succeeds.
 4. Move `pendingSecret` to `secret`, then clear `pendingSecretHash`.
 
 **Triggers:**
 - **On demand**: the annotation `providers.platform-mesh.io/rotate-connection-secret` on the `Provider`, set by the owner or by PM's operators, e.g. `kubectl annotate provider my-provider providers.platform-mesh.io/rotate-connection-secret="$(date -u +%FT%TZ)" --overwrite`. Any new value triggers one change; the value last acted on is kept in the connection Secret, so re-applying the same value (e.g. through GitOps) does nothing. Trusting it is harmless: it only makes PM change a secret PM controls, and it's never used as a link.
 - **After tampering** with the connector CA bundle (see "Connector CA trusted set").
-- **Repair**: when the connection Secret is missing, or the Provider-side rejects both `secret` and `pendingSecret` while the inner TLS against its pinned server key succeeds (e.g. its store was restored from an older backup). A missing Secret is first rebuilt from the record (`connectionID`, base URL, server keys). Repairs are rate-limited per connection (e.g. at most one per hour), so an edge or Provider bug that breaks authentication can't cause a loop of changes.
+- **Repair**: when the connection Secret is missing, or the Provider-side rejects both `secret` and `pendingSecret` while the inner TLS against its pinned server key succeeds (e.g. its store was restored from an older backup). A missing Secret is first rebuilt from the `ProviderEndpoint` (`connectionID`, base URL, server keys). Repairs are rate-limited per connection (e.g. at most one per hour), so an edge or Provider bug that breaks authentication can't cause a loop of changes.
 
 **The code carries a comment at the list of triggers** about periodic rotation: what it would need (a last-change timestamp, a configured interval, due times spread by `connectionID`), why it might be wanted (compliance), and why it isn't needed (see "Declined").
 
 **Properties:**
 - **Sessions are unaffected**: they never use the connection secret. A change needs one, though; without sessions it waits, and the Provider-side keeps its current hash.
-- **On restart mid-change**, try `pendingSecret` first, then `secret`, and resume; the record still names the pending hash.
+- **On restart mid-change**, try `pendingSecret` first, then `secret`, and resume; the `ProviderEndpoint` still names the pending hash.
 - **Nobody else can change the secret**: not someone holding it, an onboarding token or a portal account. There's no lock-out path.
 
 ## Recovery
@@ -208,7 +208,7 @@ Each case is covered elsewhere ([01 Protocol, "Recovery"](./xxx-notes-011-v5-imp
 - **A lost or rejected secret**: repaired automatically (see "Secret changes").
 - **A connection the Provider-side no longer knows**: `Registered=False` with `ConnectionUnknown`; the owner onboards the same `Provider` again, which registers a new connection (see "Onboarding requests").
 - **No session verifies**: `Connected=False` with `NoSessions`; the Provider's administrators re-pin the connector CA bundle out-of-band.
-- **Disasters on either side**: out-of-band, using the administrator input in "Records" and the SDK's administration commands ([07 SDK, "Administration"](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
+- **Disasters on either side**: out-of-band, using the administrator input in "Writing ProviderEndpoints" and the SDK's administration commands ([07 SDK, "Administration"](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
 
 ## Connector CA trusted set
 
@@ -219,10 +219,10 @@ cert-manager renews the connector CA; platform-mesh-operator makes sure every Pr
 - **Catch up as soon as a connection is back.** A Provider that was unreachable during a rollover, however long, still pins an old set; its control channel doesn't depend on the connector CA, so the **first successful control call after a connection was unreachable** pushes the current set right away. The SDK accepts the push even if every CA it pins has expired.
 - **Tampering**: a pinned certificate that's unexpired and isn't one of PM's unexpired CAs can only have come from someone holding the connection secret. Then:
   1. restore the trusted set with the current secret (with `If-Match`), so PM's sessions verify again; the Provider-side closes every session that doesn't chain to it, including any the thief opened ([01 Protocol, "Connector CA bundle"](./xxx-notes-011-v5-impl-01-protocol.md));
-  2. change the secret through the record (see "Secret changes"), which makes the stolen secret useless;
+  2. change the secret through the `ProviderEndpoint` (see "Secret changes"), which makes the stolen secret useless;
   3. record an **event** on the `Provider`, so the owner sees it happened, and count it in a metric with a critical alert rule for the people running PM ([04 Connector CA, "Signals"](./xxx-notes-011-v5-impl-04-connector-ca.md)).
 
-  If the thief pushes again before the change completes, step 1 repeats; the change completes on the Provider-side's first read of the record over a session. Expired pinned CAs verify nothing, so they're never tampering, whoever issued them; neither is a bundle merely missing some of PM's CAs. The push above converges both.
+  If the thief pushes again before the change completes, step 1 repeats; the change completes on the Provider-side's first read of the `ProviderEndpoint` over a session. Expired pinned CAs verify nothing, so they're never tampering, whoever issued them; neither is a bundle merely missing some of PM's CAs. The push above converges both.
 - **Convergence**: a CA has converged when every connection whose control calls succeed pins it. A connection whose control calls fail counts as **not reached**, whatever the cause, and is listed with its last error; owners see the cause on their `Provider`. Nothing waits for connections that aren't reached. platform-mesh-operator writes the whole `ConnectorCABundle` status: the trusted CAs with their `converged` flags, counts per shard, and the conditions `Valid` and `Converged`. Connectors read the flags to decide when to switch certificates ([05 Connector, "Connector certificate"](./xxx-notes-011-v5-impl-05-connector.md)).
 
 ## Deletion
@@ -238,7 +238,7 @@ For local Providers: the SA-token Secret, the kubeconfig in the owner's workspac
 
 ## Egress
 
-- **Base URL rules**, checked before registration, before writing a record and on every dial: `https` only, public addresses only, resolve once and dial the checked addresses, no redirects to other hosts.
+- **Base URL rules**, checked before registration, before writing a `ProviderEndpoint` and on every dial: `https` only, public addresses only, resolve once and dial the checked addresses, no redirects to other hosts.
 - **TLS** to the registration endpoint: web PKI, or the `Provider`'s `spec.remote.caBundle`.
 - **Per-Provider limits**: concurrent calls, rate, backoff; jitter on periodic work. With 1,000 connections and a 5-minute poll, steady state is about 3–4 calls per second in total.
 
@@ -282,7 +282,7 @@ Beyond what platform-mesh-operator needs for local Providers:
 3. The remote bootstrap steps: workspace, connection export binding, connector RBAC.
 4. The `ProviderOnboardingRequest` reconciler and its phases.
 5. The protocol client, in its own package: plain-HTTPS calls, control sessions (WebSocket, inner TLS with pinned keys, HTTP/1.1), retries, egress rules, input limits and fuzz tests. Built against the SDK's test server ([07 SDK, "Testing support"](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
-6. Registration, the first control call and the records writer, with drift repair, server-key updates and `pendingSecretHash`.
+6. Registration, the first control call and the `ProviderEndpoint`s writer, with drift repair, server-key updates and `pendingSecretHash`.
 7. Health: polling, the `Connected` condition, edge diagnosis.
 8. Secret changes (on demand, repair, after tampering), with the comment on periodic rotation.
 9. The connector CA trusted set, its pushes with compare-and-swap, the tamper response, and the `ConnectorCABundle` status.
@@ -301,13 +301,13 @@ Beyond what platform-mesh-operator needs for local Providers:
 - **Local fields are rejected on remote Providers** by CEL.
 - **Secret scope**: connection Secrets in platform-mesh-operator's namespace; token Secrets read by name, with no Secret informers in kcp.
 - **Requests reference an existing `Provider`**, which the owner creates; a request for a missing one waits.
-- **Onboarding order**: register, first control call, then the record; `connectionID`, base URL and server keys persisted together.
-- **The connection Secret is authoritative**; records are written from it and read back only to rebuild a lost Secret.
+- **Onboarding order**: register, first control call, then the `ProviderEndpoint`; `connectionID`, base URL and server keys persisted together.
+- **The connection Secret is authoritative**; `ProviderEndpoint`s are written from it and read back only to rebuild a lost Secret.
 - **Remote Providers' admin SA** is `default/provider`.
 - **Secret changes**: on demand (annotation), after tampering, and repair.
 - **Connector CA**: the trusted set is derived from the CA's `CertificateRequest`s, with nothing stored, and pushed here; the previous CA is dropped per connection, spread over 6 hours after the 48-hour mark; the tamper check only considers unexpired CAs; only connections that are reached count for convergence.
 - **Connector identity**: one group for all shards' connectors.
-- **The admin SA has cluster-admin** in the provider workspace, as in RFC 006; the connector's denylist and the record's maximal permission policy narrow it where PM needs to.
+- **The admin SA has cluster-admin** in the provider workspace, as in RFC 006; the connector's denylist and the `ProviderEndpoint`'s maximal permission policy narrow it where PM needs to.
 - **No migration**: no remote Providers exist yet.
 
 ## Declined

@@ -40,12 +40,12 @@ The two WebSocket endpoints accept the upgrade before the caller is authenticate
 ## Changing the secret
 
 The secret changes only through the connection's **`ProviderEndpoint`**, never through a call:
-1. platform-mesh-operator generates a new secret, stores it, and writes its hash into the record's `pendingSecretHash`.
-2. The Provider-side reads the record over one of the connection's sessions and makes that hash the current one. The old secret stops working.
+1. platform-mesh-operator generates a new secret, stores it, and writes its hash into the `ProviderEndpoint`'s `pendingSecretHash`.
+2. The Provider-side reads the `ProviderEndpoint` over one of the connection's sessions and makes that hash the current one. The old secret stops working.
 3. platform-mesh-operator confirms with a control call using the new secret, then clears `pendingSecretHash`.
 
 Why this is safe:
-- **Only PM can write the record**: the connection export's maximal permission policy refuses writes even to the provider workspace's admins ([02 APIs, "Connection export"](./xxx-notes-011-v5-impl-02-apis.md)).
+- **Only PM can write the `ProviderEndpoint`**: the connection export's maximal permission policy refuses writes even to the provider workspace's admins ([02 APIs, "Connection export"](./xxx-notes-011-v5-impl-02-apis.md)).
 - **The Provider-side reads it only over a valid session**: one whose connector certificate verified against the connection's pinned connector CA bundle, and whose hello named the connection's `clusterName` (see "Sessions").
 - **So nobody but PM can change the secret.** Holding the current secret, an onboarding token or a portal account doesn't help, which also means a thief can't lock PM out.
 
@@ -154,11 +154,11 @@ That handshake is the whole authentication; no separate token is needed:
 ### Hello
 
 The first message inside the inner TLS, before the multiplexer starts, sent by the connector:
-- **`clusterName`**: the provider workspace this session is for. The connector takes it from the logical cluster of the connection record it acts on.
+- **`clusterName`**: the provider workspace this session is for. The connector takes it from the logical cluster of the `ProviderEndpoint` it acts on.
 - **`hosts`**: the hosts this session serves (see "Hosts a session serves").
 - **`sub`**: an opaque session-group ID, for audit.
 
-It's protected by the inner TLS, so it needs no signature. The Provider-side checks that `clusterName` equals the one stored at registration and closes the session otherwise. Records can only be written by PM, so this is defense in depth: even a PM-side bug that mixed up records couldn't make a connector serve one connection's session with another provider workspace's SA. A length-prefixed message, with a small maximum size.
+It's protected by the inner TLS, so it needs no signature. The Provider-side checks that `clusterName` equals the one stored at registration and closes the session otherwise. `ProviderEndpoint`s can only be written by PM, so this is defense in depth: even a PM-side bug that mixed up `ProviderEndpoint`s couldn't make a connector serve one connection's session with another provider workspace's SA. A length-prefixed message, with a small maximum size.
 
 ### Multiplexer
 
@@ -187,7 +187,7 @@ The protocol makes **no assumption about which Provider replica a session or con
 ## Recovery
 
 What each side can lose, and how it comes back:
-- **The PM-side loses the secret, or the Provider-side rejects it** (e.g. its store was restored from an older backup): platform-mesh-operator changes the secret through the record (see "Changing the secret"). The `connectionID` and all Provider-side state stay.
+- **The PM-side loses the secret, or the Provider-side rejects it** (e.g. its store was restored from an older backup): platform-mesh-operator changes the secret through the `ProviderEndpoint` (see "Changing the secret"). The `connectionID` and all Provider-side state stay.
 - **The Provider-side no longer knows the connection** (deleted in the portal, or its store lost): it answers with the stable "unknown connection" status (see "Errors and retries"). Two ways back: the Provider's administrators import the old entry, which keeps the `connectionID` and is preferred when the Provider still has the data; or the owner onboards the same `Provider` again, which registers a **new** connection, meant for switching Providers or a connection the Provider won't restore ([03 Operator, "Onboarding requests"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
 - **No session verifies and control calls fail authentication** (a pinned bundle that missed a rollover, and a secret the Provider-side lost or rejects): nothing in the protocol can fix this. Pushing a bundle needs the secret, and repairing the secret needs a session. A missed rollover alone isn't this case: platform-mesh-operator's first successful control call pushes the current bundle. The Provider's administrators re-pin the bundle out-of-band ([07 SDK, "Administration"](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
 
@@ -196,8 +196,8 @@ Disasters on either side (a Provider's cluster rebuilt, for example) are handled
 ## Server keys
 
 - **A list**, so the Provider-side can rotate with overlap: when its administrators start a rotation, a new key is announced in `GET` before it's used, and the old one retired after the overlap.
-- **Switch per connection when the record is ready**: the Provider-side presents a new key on a connection only once that connection's `ProviderEndpoint` lists it (it reads the record over sessions anyway), and retires the old key once every connection's record lists the new one, or after a deadline. A connection whose operator is down for longer doesn't lose its sessions.
-- **No refresh over plain HTTPS.** A server key endpoint verified only by web PKI would let the Provider's edge swap keys and undo the inner TLS. After a lost or missed key, a PM administrator supplies the new keys ([03 Operator, "Records"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
+- **Switch per connection when the `ProviderEndpoint` is ready**: the Provider-side presents a new key on a connection only once that connection's `ProviderEndpoint` lists it (it reads the `ProviderEndpoint` over sessions anyway), and retires the old key once every connection's `ProviderEndpoint` lists the new one, or after a deadline. A connection whose operator is down for longer doesn't lose its sessions.
+- **No refresh over plain HTTPS.** A server key endpoint verified only by web PKI would let the Provider's edge swap keys and undo the inner TLS. After a lost or missed key, a PM administrator supplies the new keys ([03 Operator, "Writing ProviderEndpoints"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
 
 ## Status
 
@@ -239,4 +239,4 @@ platform-mesh-operator turns this into aggregate conditions ([03 Operator, "Heal
 - Control calls use HTTP/1.1; the first failed authentication closes the control session.
 - `clusterName` is the provider workspace's logical cluster name, as kcp assigns it.
 - Rate limits on registration per owner: SDK defaults, configurable by each Provider ([07 SDK](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
-- The secret changes only through the record; the connector CA bundle is replaced by compare-and-swap.
+- The secret changes only through the `ProviderEndpoint`; the connector CA bundle is replaced by compare-and-swap.

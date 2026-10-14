@@ -4,7 +4,7 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Th
 
 ## Principles
 
-- **Two exports, two audiences.** The providers export faces owners (requests, `Provider` objects, token Secrets). The connection export faces provider workspaces (records, endpoint slices). platform-mesh-operator consumes both ([03 Operator](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)); connectors only the second.
+- **Two exports, two audiences.** The providers export faces owners (requests, `Provider` objects, token Secrets). The connection export faces provider workspaces (`ProviderEndpoint`s, endpoint slices). platform-mesh-operator consumes both ([03 Operator](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)); connectors only the second.
 - **Owner-writable data is input, never a link** (overview, principle 4).
 - **PM-written data in provider workspaces is protected by kcp**, not by convention.
 
@@ -23,7 +23,7 @@ Defined in `provideronboardingrequest_types.go` (bringing the type in line with 
     tokenSecretRef: { name: my-provider-token, key: token }
   ```
 - **Status**: phase (`Pending → Registering → Registered`, or `Failed` only before registration succeeds), `connectionID`, and a message pointing to the `Provider` once `Registered`.
-- **A request is one action**: spending a single-use token to register the `Provider`'s connection. It's done once `Registered` or `Failed`; everything after registration (the first control call, the record, sessions, kcp) is reported on the `Provider` ([03 Operator, "Conditions and phase"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)). Onboarding again needs a new request.
+- **A request is one action**: spending a single-use token to register the `Provider`'s connection. It's done once `Registered` or `Failed`; everything after registration (the first control call, the `ProviderEndpoint`, sessions, kcp) is reported on the `Provider` ([03 Operator, "Conditions and phase"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)). Onboarding again needs a new request.
 - **For an already registered `Provider`**, a request is accepted only when the Provider-side reports its connection unknown; it then registers a new connection, with a new `connectionID`, on the same workspace. It's meant for switching Providers or a connection the Provider won't restore ([03 Operator, "Onboarding requests"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
 - **Who may create them**: the owner, i.e. whoever manages `Provider`s in that workspace. platform-mesh-operator acts with its own rights, so `create` on `provideronboardingrequests` is equivalent to managing `Provider`s there; PM ships one default ClusterRole that grants both together, and the creator's identity isn't checked.
 - **One active request per `Provider`**: the oldest unfinished request wins; newer ones fail at once, naming the active one.
@@ -55,11 +55,11 @@ Defined in `provideronboardingrequest_types.go` (bringing the type in line with 
 | `connectionID`, `url`, `serverKeys` | the registration's result (`url` is the base URL from the token), persisted together in one write before anything else happens |
 | `rotationRequest` | the last value of the rotation annotation acted on |
 
-- **Authoritative**: it holds everything PM knows about the connection. The record is written from it (see "ProviderEndpoint"), and every change (a new or retired server key, a secret change, administrator input for recovery) goes into the Secret first.
+- **Authoritative**: it holds everything PM knows about the connection. The `ProviderEndpoint` is written from it (see "ProviderEndpoint"), and every change (a new or retired server key, a secret change, administrator input for recovery) goes into the Secret first.
 - **Read and written only by platform-mesh-operator.** Neither owners nor Providers can reach it. In an owner's workspace, every Provider with an accepted Secrets claim there could read it, since PM's bindings accept that claim with `matchAll`; and an owner could delete it.
 - **Deleted at offboarding** ([03 Operator, "Deletion"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)); there's no owner reference across kcp and the runtime cluster.
 - **The server keys here** are the trust anchors registration returned; connectors read their copy from the `ProviderEndpoint`. They never live in owner-writable status.
-- **Lost Secrets are repaired** without anyone acting: `connectionID`, `url` and `serverKeys` are rebuilt from the record, the only time the record is read as input, and the secret is replaced through a secret change. Both copies are written only by platform-mesh-operator.
+- **Lost Secrets are repaired** without anyone acting: `connectionID`, `url` and `serverKeys` are rebuilt from the `ProviderEndpoint`, the only time the `ProviderEndpoint` is read as input, and the secret is replaced through a secret change. Both copies are written only by platform-mesh-operator.
 
 ## connections.platform-mesh.io (new, provider-workspace-facing)
 
@@ -79,7 +79,7 @@ One per provider workspace, cluster-scoped, with a fixed name (e.g. `default`), 
 - **No status**: connectors write nothing; health lives in metrics and in platform-mesh-operator's view.
 - **Validation** in the schema: `https` URLs only, bounded list sizes, key and hash format. platform-mesh-operator's egress checks apply on top ([03 Operator, "Egress"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
 - **Readable by the Provider** in its own workspace. Nothing in it is secret: `pendingSecretHash` is the hash of a 256-bit secret.
-- **The Provider-side's only authenticated source for its secret.** It reads the record over its sessions, so the record's protection (below) is what keeps anyone but PM from changing a connection's secret.
+- **The Provider-side's only authenticated source for its secret.** It reads the `ProviderEndpoint` over its sessions, so the `ProviderEndpoint`'s protection (below) is what keeps anyone but PM from changing a connection's secret.
 
 ### Connection export
 
@@ -95,14 +95,14 @@ One per provider workspace, cluster-scoped, with a fixed name (e.g. `default`), 
 ### The binding in provider workspaces
 
 - **Created by platform-mesh-operator** with the workspace, with a **fixed name** (e.g. `connections.platform-mesh.io`), accepting the one permission claim ([03 Operator, "Connection export binding"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
-- **Protected by the connector's policy**: the Provider can't update or delete it through a session ([05 Connector, "Authorization and policy"](./xxx-notes-011-v5-impl-05-connector.md)). If it disappears anyway, platform-mesh-operator recreates it and rewrites the record.
+- **Protected by the connector's policy**: the Provider can't update or delete it through a session ([05 Connector, "Authorization and policy"](./xxx-notes-011-v5-impl-05-connector.md)). If it disappears anyway, platform-mesh-operator recreates it and rewrites the `ProviderEndpoint`.
 
 ## Decided
 
 - **Request authorization**: owners create requests; a default ClusterRole grants requests and `Provider`s together; no identity checks in platform-mesh-operator.
 - **Concurrent requests**: the oldest wins.
 - **Requests reference an existing `Provider`**; the owner creates it.
-- **Connection Secrets** live in platform-mesh-operator's namespace, not in owners' workspaces, and are authoritative; records are written from them.
-- **Remote Providers' admin SA** has a fixed name; the record doesn't carry it.
+- **Connection Secrets** live in platform-mesh-operator's namespace, not in owners' workspaces, and are authoritative; `ProviderEndpoint`s are written from them.
+- **Remote Providers' admin SA** has a fixed name; the `ProviderEndpoint` doesn't carry it.
 - **Version** of the new group: `v1alpha1`. The protocol coupling is carried by the protocol version ([01 Protocol, "Versioning"](./xxx-notes-011-v5-impl-01-protocol.md)), not the API version.
 - **`ProviderEndpoint` scope**: cluster-scoped with a fixed name; the integration tests confirm platform-mesh-operator can write it through the APIExport virtual workspace ([10 Testing, "Integration tests against kcp"](./xxx-notes-011-v5-impl-10-testing.md)).

@@ -105,7 +105,7 @@ Checked against kcp-operator `8994ed7`.
 3. platform-mesh-operator ([03](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)). It tolerates the connectors' absence either way.
 4. Owners can now create `ProviderOnboardingRequest`s.
 
-Upgrades keep this order. Connectors and platform-mesh-operator tolerate each other's absence: without platform-mesh-operator, no records appear; without connectors, `Connected` stays false.
+Upgrades keep this order. Connectors and platform-mesh-operator tolerate each other's absence: without platform-mesh-operator, no `ProviderEndpoint`s appear; without connectors, `Connected` stays false.
 
 ## Local development
 
@@ -121,7 +121,7 @@ The components here already split along the deployer's placements, so moving lat
 |---|---|---|
 | Control plane | Part of platform-mesh-operator | Moves with the `Provider` part of platform-mesh-operator once that's its own operator ([follow-ups](./xxx-notes-011-v5-impl-todo.md)); as a module, a `root-shard` component with a minted front-proxy kubeconfig |
 | Connectors | kcp-operator `VirtualWorkspace` per shard, from `kcpTopology` | A `per-shard` component: one instance per shard in that shard's cluster, following the deployer's topology. Can be a plain workload (still on the virtual workspace framework) with a minted kubeconfig, which drops kcp-operator's `VirtualWorkspace` and its accepted limitations (cache-server credentials, Deployment only) |
-| kcp bootstrap | platform-mesh-operator's kcp manifests; connection export in `:root:providers:system` | Module setup: schemas, connection export, endpoint slice and policy RBAC in the module's workspace `root:modules:providerconnections`. The export's home moves, so records and bindings must be migrated or recreated |
+| kcp bootstrap | platform-mesh-operator's kcp manifests; connection export in `:root:providers:system` | Module setup: schemas, connection export, endpoint slice and policy RBAC in the module's workspace `root:modules:providerconnections`. The export's home moves, so `ProviderEndpoint`s and bindings must be migrated or recreated |
 | Shard list | `kcpTopology` in the service's values, duplicating `infra`'s shards, must match `infra`'s (profile validation, a follow-up) | The deployer's topology; nothing to maintain. The per-shard context replaces `kcpTopology` entries field for field |
 | Connector CA | The CA `Certificate` and its issuers in PM's cluster, from the chart | Module `values`. Keys and issuers stay on the management cluster; connector certificates are minted there and synced to each shard's cluster, so the CA key never leaves the management cluster |
 | Identities | kcp-operator `Kubeconfig`s with the groups and rights this plan lists | Minted users `module:providerconnections:<kubeconfig>`, cluster-admin only in the module workspace. Every right outside it (the providers export's content, `Workspace`s in `:root:providers`, TokenRequest in provider workspaces) is granted elsewhere, e.g. by platform-mesh-operator to that username instead of a group |

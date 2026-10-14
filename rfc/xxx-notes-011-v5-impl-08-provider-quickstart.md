@@ -65,7 +65,7 @@ Authentication of portal users is out of scope; the quickstart uses a placeholde
 The quickstart README becomes the Provider-facing guide:
 - what a Provider must run (connection server, ingress settings, storage);
 - how to adapt an existing single-kubeconfig operator to connections;
-- what the Provider can and can't do in its provider workspace (admin, minus the connector's denylist, and records are read-only);
+- what the Provider can and can't do in its provider workspace (admin, minus the connector's denylist, and `ProviderEndpoint`s are read-only);
 - the rules for consumer data and bootstrap, and why: keyed with the `connectionID`, adopt before creating, nothing deleted when a connection goes away, no recreated APIExport identity; and keeping the SDK store as durable as consumer data;
 - the trust model in one paragraph: no kcp credentials, sessions end-to-end encrypted to the Provider's runtime.
 

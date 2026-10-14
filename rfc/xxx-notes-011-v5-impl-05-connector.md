@@ -11,7 +11,7 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Th
 - minting and caching SA tokens.
 
 **Doesn't own:**
-- records or anything else in kcp (it writes only TokenRequests);
+- `ProviderEndpoint`s or anything else in kcp (it writes only TokenRequests);
 - connection secrets or control calls ([03 Operator](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md));
 - issuing its certificate ([04 Connector CA](./xxx-notes-011-v5-impl-04-connector-ca.md)).
 
@@ -48,7 +48,7 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Th
 - **Sees two things**:
   - `ProviderEndpoint`s, each arriving with its provider workspace's logical cluster; the endpoint that delivered it tells which shard hosts the workspace;
   - the provider workspaces' Service `apiexportendpointslices`, through the export's permission claim.
-- **An outage of one shard's virtual workspace** freezes the records and slices from that shard; informers keep the last state.
+- **An outage of one shard's virtual workspace** freezes the `ProviderEndpoint`s and slices from that shard; informers keep the last state.
 
 ## Which sessions
 
@@ -71,7 +71,7 @@ Every replica of a shard's connector applies the session rule on its own and kee
 
 1. **Dial the base URL** from the `ProviderEndpoint`, under the egress rules (see "Egress to Providers"), and upgrade to a WebSocket. The upgrade carries no credentials.
 2. **Run the inner TLS client handshake** with the connector certificate as client certificate, accepting only server keys from the `ProviderEndpoint`. That handshake is the session's authentication ([01 Protocol, "Inner layer"](./xxx-notes-011-v5-impl-01-protocol.md)); a failure ends with a TLS alert (e.g. `unknown_ca`), which the connector reports in its metrics.
-3. **Send the hello**: `clusterName` (the logical cluster of the record it acts on), `hosts` (the shard's virtual-workspace host from the connector's configuration; during a host rename, both the old and the new one) and an opaque `sub` for audit ([01 Protocol, "Hello"](./xxx-notes-011-v5-impl-01-protocol.md)).
+3. **Send the hello**: `clusterName` (the logical cluster of the `ProviderEndpoint` it acts on), `hosts` (the shard's virtual-workspace host from the connector's configuration; during a host rename, both the old and the new one) and an opaque `sub` for audit ([01 Protocol, "Hello"](./xxx-notes-011-v5-impl-01-protocol.md)).
 4. **Start yamux** and accept streams opened by the Provider-side.
 5. **Replace sessions** before the edge's maximum connection age (configurable), gracefully; reconnect with backoff on failure. An upgrade refused with `503` and `Retry-After` is retried using the value as the lower bound for the normal reconnect backoff; a session the Provider-side ends gracefully (go-away) is reopened at once. The connector assumes nothing about which Provider replica a session reaches ([01 Protocol, "Provider replicas"](./xxx-notes-011-v5-impl-01-protocol.md)). No replacement while the connector's own certificate is expired (see below).
 
@@ -112,7 +112,7 @@ The virtual workspace's authorizer, for the connection principal:
   - upgrade requests (`exec`, `attach`, `port-forward`);
   - **Secrets of type `kubernetes.io/service-account-token`**: kcp issues tokens for them (platform-mesh-operator uses them today for local Providers), so creating or updating such a Secret is a token-minting path. The authorizer can't see a body's type, so the proxy handler inspects Secret writes (create, update, patch, server-side apply) before forwarding and refuses that type;
   - `create` on `workspaces` below the provider workspace: not needed to reconcile an APIExport, and avoids unbounded workspaces under `:root:providers`.
-- **Records are not in the denylist**: kcp's maximal permission policy already makes them read-only ([02 APIs, "Connection export"](./xxx-notes-011-v5-impl-02-apis.md)).
+- **`ProviderEndpoint`s are not in the denylist**: kcp's maximal permission policy already makes them read-only ([02 APIs, "Connection export"](./xxx-notes-011-v5-impl-02-apis.md)).
 - **Denials are audited** with the connection principal.
 
 ## Proxying
