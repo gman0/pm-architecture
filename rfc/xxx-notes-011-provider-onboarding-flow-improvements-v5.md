@@ -28,7 +28,7 @@ The [implementation plan](./xxx-notes-011-v5-impl-00-overview.md) turns these no
 - **Stream**: a lightweight connection inside a session, opened by the Provider-side whenever client-go wants a new connection to a kcp host. It carries plain HTTP: requests one after another, or one long watch. Streams need no handshake or authentication of their own; the connector authorizes each request on them. A session carries many streams (see "Sessions: a stream multiplexer over a WebSocket").
 - **Control session**: a WebSocket from platform-mesh-operator to the Provider's base URL, with inner TLS against a pinned server key, carrying the control calls.
 - **Connection export**: the PM APIExport `connections.platform-mesh.io` in `:root:providers:system`, serving `ProviderEndpoint`, with a local **maximal permission policy** that allows only reads in the workspaces that bind it. platform-mesh-operator binds it in every provider workspace when it creates the workspace. It claims read-only access to `apiexportendpointslices` there.
-- **Connection record**: a non-secret `ProviderEndpoint` object (`connectionID`, base URL, the connection's SA, the pinned server keys, and `pendingSecretHash` while the connection secret changes) in the connection's **provider workspace**, written by platform-mesh-operator through the connection export. The Provider is admin in that workspace (RFC 006), but the export's maximal permission policy makes kcp itself deny it any write to the record (see "Connector policy"). Connectors read it through the export's endpoint slice, so the record lives on the shard of the workspace it describes.
+- **Connection record**: a non-secret `ProviderEndpoint` object (`connectionID`, base URL, the pinned server keys, and `pendingSecretHash` while the connection secret changes) in the connection's **provider workspace**, written by platform-mesh-operator through the connection export. The Provider is admin in that workspace (RFC 006), but the export's maximal permission policy makes kcp itself deny it any write to the record (see "Connector policy"). Connectors read it through the export's endpoint slice, so the record lives on the shard of the workspace it describes.
 - **Connection principal**: the identity a request arriving over a session of connection `{id}` is authenticated as inside the connector, e.g. `pm:connection:<id>`. The connector maps it to the connection's SA before forwarding to kcp.
 - **`ProviderOnboardingRequest`**: the owner's request to onboard a `Provider` with an onboarding token. It may also onboard an already registered `Provider` again, once the Provider-side reports its connection unknown (see "Recovery").
 
@@ -92,9 +92,9 @@ Not required: TLS passthrough, client-certificate handling at the ingress, a CA 
 ## Flow overview
 
 1. **Get a token** from the Provider's portal.
-2. **Create the request**, referencing the token Secret. The oldest unfinished request per `Provider` wins; newer ones fail at once.
-3. **Create or reuse the `Provider`.** An already registered `Provider` is refused, unless the Provider-side reports its connection unknown; then it gets a new connection. platform-mesh-operator bootstraps the provider workspace: SA, connection export binding and connector RBAC, but no kubeconfig.
-4. **Register.** platform-mesh-operator generates the connection secret, writes it to a connection Secret in its own namespace, and calls `POST /v1/connections` with the onboarding token, the addressing, the **hash** of the secret, the **connector CA bundle** and the protocol versions it supports. It gets back the `connectionID`, the Provider-side's **server keys** and the chosen protocol version, and persists the `connectionID` and server keys together in the connection Secret. No kcp credential and no secret crosses the wire. Then the controller deletes the spent token's data from the owner's token Secret, and the request is done (`Registered`); everything after is reported on the `Provider`. A crash before the result is persisted is recovered by retrying the same call, which the Provider-side honours for 7 days.
+2. **Create the `Provider` and the request.** The owner creates a remote `Provider` and a request referencing it and the token Secret, in either order. The oldest unfinished request per `Provider` wins; newer ones fail at once.
+3. **Find the `Provider`.** The request waits until it exists. An already registered `Provider` is refused, unless the Provider-side reports its connection unknown; then it gets a new connection. platform-mesh-operator bootstraps the provider workspace: SA, connection export binding and connector RBAC, but no kubeconfig.
+4. **Register.** platform-mesh-operator generates the connection secret, writes it to a connection Secret in its own namespace, and calls `POST /v1/connections` with the onboarding token, the addressing, the **hash** of the secret, the **connector CA bundle** and the protocol versions it supports. It gets back the `connectionID`, the Provider-side's **server keys** and the chosen protocol version, and persists the `connectionID`, the base URL from the token and the server keys together in the connection Secret, which stays authoritative: the record is written from it. No kcp credential and no secret crosses the wire. Then the controller deletes the spent token's data from the owner's token Secret, and the request is done (`Registered`); everything after is reported on the `Provider`. A crash before the result is persisted is recovered by retrying the same call, which the Provider-side honours for 7 days.
 5. **Make a first control call** (`GET` over a control session). The record isn't written until it succeeds, so a control path that's broken from the start shows up here, with its edge-diagnosis label in the `Provider`'s `Registered` condition, before any session opens.
 6. **Write the connection record.** The controller validates the base URL (egress rules) and writes the connection's `ProviderEndpoint` into the provider workspace, through the connection export, which the controller bound there when it created the workspace.
 7. **Open sessions where they're needed.** The connector on the shard hosting the provider workspace opens a session right away, for front-proxy traffic. Connectors on shards listed in the connection's Service endpoint slices, i.e. shards with at least one consumer binding, open theirs as those shards appear. Each runs the inner TLS with its connector certificate, against the server keys in the record, and sends its hello. Nothing is registered per shard.
@@ -656,18 +656,21 @@ kind: ProviderOnboardingRequest
 metadata:
   name: my-provider-2026-10-09
 spec:
+  providerRef: { name: my-provider }                 # created by the owner; waited for if missing; refused if registered,
+                                                     # unless the Provider-side reports its connection unknown
   tokenSecretRef: { name: my-provider-token, key: token }   # token data deleted by the controller once spent
-  provider:
-    name: my-provider                                # created if missing; refused if registered, unless the
-                                                     # Provider-side reports its connection unknown
-    spec:
-      remote:
-        caBundle: ""                                 # optional, for a private CA on the Provider's base URL
 status:
   phase: Registered                                  # Pending → Registering → Registered; Failed only before registration succeeds
                                                      # everything after registration is reported on the Provider
-  providerRef: { name: my-provider }
   connectionID: "..."
+---
+apiVersion: providers.platform-mesh.io/v1alpha1
+kind: Provider
+metadata:
+  name: my-provider
+spec:
+  remote:
+    caBundle: ""                                     # optional, for a private CA on the Provider's base URL
 ---
 apiVersion: v1
 kind: Secret                                         # PM's runtime cluster, NOT kcp
@@ -676,9 +679,12 @@ metadata:
   namespace: <platform-mesh-operator namespace>      # read and written by the controller only; deleted at offboarding
 type: Opaque
 stringData:
-  connectionID: "..."                                # links come from the ProviderEndpoint
   secret: "pmc1_..."
   pendingSecret: ""                                  # only while the secret changes
+  connectionID: "..."                                # authoritative; the ProviderEndpoint is written from these three
+  url: https://provider.example.com/pm
+  serverKeys: "..."
+  rotationRequest: ""                                # last value of the rotation annotation acted on
 ---
 apiVersion: apis.kcp.io/v1alpha2
 kind: APIExport                                      # in :root:providers:system
@@ -737,28 +743,27 @@ metadata:
 spec:
   connectionID: "..."
   url: https://provider.example.com/pm               # validated against the egress rules (https only, in the schema too)
-  serviceAccount: { namespace: ..., name: ... }      # the SA platform-mesh-operator created in this workspace
   serverKeys: [ "<PEM SPKI>", ... ]                  # the Provider-side's pinned server keys, for the inner TLS
   pendingSecretHash: ""                              # set while the connection secret changes; the Provider-side adopts it
 ```
 
 - **`ProviderEndpoint`, in its own group.** pm-operator already has a `ProviderConnection` type for its own components' kubeconfigs, and `providers.platform-mesh.io` had an unserved `ProviderConnection`; that one is removed, and the record lives only in `connections.platform-mesh.io/v1alpha1`, served only by the connection export.
-- **No `clusterName` field and no status**: the record's logical cluster is the provider workspace, and connectors write nothing. The front-proxy URL is deployment configuration. The SA is named explicitly, because RFC 006 doesn't fix its name (pm-operator derives it from a prefix and the provider suffix).
+- **No `clusterName` field and no status**: the record's logical cluster is the provider workspace, and connectors write nothing. The front-proxy URL is deployment configuration, and the SA connectors act as has a fixed name, `default/provider`, in every remote Provider's workspace.
 - **RBAC**: platform-mesh-operator writes records through the export's virtual workspace; connectors get read-only `apiexports/content`. The Provider's SA stays admin in its workspace, as in RFC 006; the export's maximal permission policy keeps it from writing records, and the connector's denylist keeps it from changing the binding.
 - **Who may create requests**: whoever manages `Provider`s in the owner's workspace; PM ships one ClusterRole that grants both together, and the controller doesn't check the creator. The oldest unfinished request per `Provider` wins; newer ones fail at once, naming the active one.
 
-**How the request treats `provider.name`**:
+**How the request treats `providerRef`**:
 
 | The `Provider`... | The request... |
 |---|---|
-| doesn't exist | creates it, waits for the workspace and SA, then registers |
-| exists, not registered | reuses it and registers |
+| doesn't exist (yet) | waits; the owner creates it |
+| exists, not registered | waits for the workspace and SA, then registers; this includes a `Provider` left behind by a failed onboarding |
 | exists and is registered, the Provider-side knows the connection | **refuses**. A lost or rejected secret is repaired by the controller; there's nothing to onboard |
 | exists and is registered, the Provider-side reports the connection unknown or deleted | **registers a new connection** (new `connectionID`) at the token's base URL, and rewrites the `ProviderEndpoint`. For switching Providers, or a connection the Provider won't restore; an import by the Provider keeps the `connectionID` and is preferred when it still has the data (see "Recovery") |
 | exists and is registered, the Provider-side doesn't answer | **waits**, with a condition: only a definite "unknown" allows a new connection |
 | exists, but isn't a remote `Provider` (e.g. a ManagedProvider's) | refuses |
 
-- `Provider.status.connection` mirrors `url` and `connectionID` for the owner's information. The owner can edit it, so the controller never uses it as a link; it reads the PM-written `ProviderEndpoint` instead. Nothing in it names shards.
+- `Provider.status.connection` mirrors `url` and `connectionID` for the owner's information. The owner can edit it, so the controller never uses it as a link; it uses the connection Secret in its own namespace instead. Nothing in it names shards.
 - The `Provider`'s status has one writer, platform-mesh-operator: a condition per reconcile step (`Workspace`, `ConnectionBinding`, `ConnectorAccess`, `Registered`, `Connected`), the aggregate `Ready`, the warning `ProtocolOutdated`, and `phase` (`Pending → Provisioning → Ready ⇄ Degraded`, and `Deleting`, the same for local Providers). Failures carry a message that starts with a stable label and says what to fix. A CEL rule rejects `providerKubeconfigSecret` and `hostOverride` on remote Providers.
 - The annotation `providers.platform-mesh.io/rotate-connection-secret` on the `Provider` triggers one secret change per new value (see "Changing the connection secret").
 - **No static kubeconfig for remote `Provider`s.** Nothing on the PM-side is issued to the Provider-side except the sessions themselves.
@@ -795,7 +800,7 @@ spec:
 | kcp unreachable from a connector | The Provider-side reports `kcpReachable=false` for that host; the `Provider` shows `Connected=False` with the `KcpUnreachable` label and the last error, without a timeout, and becomes `Ready` once the problem is fixed. |
 | Misconfigured Provider edge | The controller classifies its control-session failures (`EdgeUpgradeRefused`, `EdgeBotChallenge`, `EdgePayloadBlocked`, `EdgeTimeout`) and reports them on the `Provider` with a labelled message. |
 | Controller crash or lost response during a secret change | Try `pendingSecret`, then `secret`; resume. The record still names the pending hash. |
-| Connection Secret lost (PM-side) | The controller takes the `connectionID` from the record and repairs the secret through it. The connection and its state stay; nobody has to act. Sessions keep working throughout. |
+| Connection Secret lost (PM-side) | The controller rebuilds `connectionID`, base URL and server keys from the record and repairs the secret through it. The connection and its state stay; nobody has to act. Sessions keep working throughout. |
 | Provider-side rejects PM's secret (e.g. its store restored from an older backup) | The controller repairs the secret through the record, rate-limited per connection. |
 | Secret change while no session is up | It waits; the old secret keeps working until a session lets the Provider-side read the record. |
 | Someone with the connection secret pushes a connector CA bundle | The controller sees a CA it never issued, restores the bundle (compare-and-swap), changes the secret through the record and records an event on the `Provider`. The thief can't change the secret. |
@@ -839,6 +844,7 @@ Facts about kcp, kcp-operator and client-go the design relies on (2026-10-08 to 
 - **A separate operator for remote Providers' connections**, next to platform-mesh-operator. Two controllers would act on every remote `Provider`: two status writers, a hint condition passed between them, a finalizer handshake and naming functions shared as a contract. Keeping the connection code in platform-mesh-operator gives each `Provider` one owner; the price is internet-facing code in PM's most privileged component, while the `Provider` part is still part of it.
 - **Partitioning the control plane by kcp shard**, with a Lease per shard and a worker per held shard. The load (a few calls per second for 1,000 connections, mostly waiting) doesn't need horizontal scale; leader election already gives one writer per object, and multicluster-runtime keeps a cache per shard endpoint, so a stuck shard only stalls its own objects.
 - **Folding `ProviderOnboardingRequest` into `Provider`** (a token reference in `spec.remote`). It would remove one resource and the "oldest request wins" rule, but not the states, which would move into `Provider` conditions. Onboarding is a one-off event spending a single-use token; in a spec, the operator would have to rebuild that event (remembering the last token used) and notice new tokens in Secrets it doesn't watch.
+- **The request creating the `Provider`**, before or after registration. Before, the request needs a copy of `spec.remote` and a rule for when it disagrees with an existing `Provider`. After, registration would also have to work without a `clusterName` (the workspace doesn't exist yet), and a spent token could leave a registered connection with no `Provider`. A `Provider` left behind by a failed onboarding is harmless: it waits, and the next request uses it.
 - **Inlining the token in the request** instead of referencing a Secret. One object to copy, but an unspent token in a custom resource is exposed to more readers and more copies (`last-applied-configuration`, `kubectl get -o yaml`, audit bodies) than a Secret, and it can't come through GitOps or a secret store, which keep the request in Git and supply the token later.
 - **A per-connection opt-out of inner TLS.** Two modes to test and reason about, for a saving that falls mostly on SDK code PM writes once.
 - **Signed control calls** (a per-connection keypair signing a short-lived JWT per call, instead of the bearer secret). They add nothing here. Inside inner TLS the edge never sees the secret, and the Provider-side stores only a hash of a 256-bit secret, which is as useless to a thief as a public key. Whoever steals the PM-side's credential can use it either way, secret or private key. What limits such a thief is that the credential can't change itself (see "Changing the connection secret") and that bundle tampering is detected and undone.
@@ -889,13 +895,13 @@ Detailed decisions are in the [implementation plan](./xxx-notes-011-v5-impl-00-o
 - **`Provider` status**: one writer; one condition per reconcile step, with labelled messages; `phase` `Pending → Provisioning → Ready ⇄ Degraded`, and `Deleting`, for both kinds ([03 Operator](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
 - **Connection secret changes**: only through the PM-written record (`pendingSecretHash`), adopted by the Provider-side over a session; no call changes a secret; on demand (an annotation), after tampering, and repair (automatic, rate-limited); no periodic rotation ([01 Protocol](./xxx-notes-011-v5-impl-01-protocol.md), [03 Operator](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
 - **Connector CA bundle at Providers**: compare-and-swap with `etag` and `If-Match`; a CA PM never trusted triggers restore, a secret change and an event on the `Provider` ([01 Protocol](./xxx-notes-011-v5-impl-01-protocol.md), [03 Operator](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
-- **Recovery**: lost secrets are repaired through the record; owners onboard a `Provider` again only after the Provider-side reports its connection unknown; disasters are handled out-of-band, with stable `connectionID`s, an SDK import, re-pinning and PM administrator input keeping that possible ([01 Protocol](./xxx-notes-011-v5-impl-01-protocol.md), [07 SDK](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
+- **Recovery**: the connection Secret is authoritative and the record is written from it; a lost Secret is rebuilt from the record and its secret repaired; owners onboard a `Provider` again only after the Provider-side reports its connection unknown; disasters are handled out-of-band, with stable `connectionID`s, an SDK import, re-pinning and PM administrator input keeping that possible ([01 Protocol](./xxx-notes-011-v5-impl-01-protocol.md), [07 SDK](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
 - **Connection export and record**: `connections.platform-mesh.io/v1alpha1` `ProviderEndpoint`, cluster-scoped with a fixed name, exported from `:root:providers:system`; platform-mesh-operator creates the binding with the workspace and recreates it if deleted ([02 APIs](./xxx-notes-011-v5-impl-02-apis.md), [03 Operator](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
 - **Connector policy**: SA-token Secret writes are inspected and refused; child workspaces are denied; both kcp path shapes are parsed explicitly ([05 Connector](./xxx-notes-011-v5-impl-05-connector.md)).
 - **Where Service endpoint slices live**: a documented requirement for Providers, in the provider workspace, for exports in that workspace ([07 SDK](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
 - **Connector deployment**: kcp-operator `VirtualWorkspace` per shard with `kubeconfigSecretRef` always set; cache-server credentials accepted and documented; every replica serves every connection its shard needs; `ServeProxy` copied ([05 Connector](./xxx-notes-011-v5-impl-05-connector.md), [09 Deployment](./xxx-notes-011-v5-impl-09-deployment.md)).
 - **Provider-side replicas**: one active replica by leader election, standbys answer `503` with `Retry-After` ([07 SDK](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
-- **Requests**: owners create them, with one ClusterRole granting requests and `Provider`s together; the oldest wins; a request ends at registration (`Pending → Registering → Registered`, or `Failed` before registration succeeds); the token stays in its own Secret ([02 APIs](./xxx-notes-011-v5-impl-02-apis.md)).
+- **Requests**: owners create them, referencing a `Provider` the owner creates, with one ClusterRole granting requests and `Provider`s together; the oldest wins; a request ends at registration (`Pending → Registering → Registered`, or `Failed` before registration succeeds); the token stays in its own Secret ([02 APIs](./xxx-notes-011-v5-impl-02-apis.md)).
 - **Egress rules**: `https` only, public addresses only, resolve once and dial the checked addresses, no redirects, for the controller and the connectors alike ([03 Operator](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
 
 **Still to confirm** (by the plan's tests, [10 Testing](./xxx-notes-011-v5-impl-10-testing.md)):

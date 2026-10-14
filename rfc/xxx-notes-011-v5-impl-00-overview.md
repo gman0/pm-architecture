@@ -87,8 +87,8 @@ Start here, then follow the walkthrough below, or jump to a component.
 Each step names the document and section that owns it; read them in this order to follow the flow.
 
 1. **The owner gets a token** from the Provider's portal. The token format and its single-use rules: [01 Protocol, "Onboarding token"](./xxx-notes-011-v5-impl-01-protocol.md). Issuing and verifying: [07 SDK, "Onboarding tokens and portal primitives"](./xxx-notes-011-v5-impl-07-provider-sdk.md).
-2. **The owner creates a `ProviderOnboardingRequest`** referencing the token Secret: [02 APIs, "ProviderOnboardingRequest"](./xxx-notes-011-v5-impl-02-apis.md).
-3. **platform-mesh-operator creates or reuses the `Provider`**: [03 Operator, "Onboarding requests"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md).
+2. **The owner creates a remote `Provider` and a `ProviderOnboardingRequest`** referencing it and the token Secret, in either order: [02 APIs, "ProviderOnboardingRequest"](./xxx-notes-011-v5-impl-02-apis.md).
+3. **platform-mesh-operator finds the `Provider`**, waiting until it exists: [03 Operator, "Onboarding requests"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md).
 4. **platform-mesh-operator bootstraps the provider workspace** (workspace, SA, connection export binding, connector RBAC), without a kubeconfig for remote Providers: [03 Operator, "Reconciling Providers"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md).
 5. **The request registers the connection** with the Provider-side: generates the connection secret, sends its hash and the connector CA certificates, receives the `connectionID` and server keys, and is done (`Registered`): [03 Operator, "Registration"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md); the Provider's side: [07 SDK, "Connection API"](./xxx-notes-011-v5-impl-07-provider-sdk.md); the CA certificates it sends: [04 Connector CA, "ConnectorCABundle"](./xxx-notes-011-v5-impl-04-connector-ca.md).
 6. **platform-mesh-operator makes a first control call and writes the `ProviderEndpoint`** into the provider workspace through the connection export: [03 Operator, "First control call and record" and "Records"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md); type and policy: [02 APIs, "ProviderEndpoint" and "Connection export"](./xxx-notes-011-v5-impl-02-apis.md).
@@ -127,7 +127,7 @@ Clear ownership avoids two controllers fighting over the same fields. "pm-operat
 | `ProviderOnboardingRequest.spec` | owner | pm-operator |
 | token Secret | owner; pm-operator deletes its token data once spent | pm-operator |
 | `ProviderOnboardingRequest.status` | pm-operator | owner |
-| `Provider.spec` | owner (or pm-operator, when the request creates it); the rotation annotation, owner or PM's operators | pm-operator |
+| `Provider.spec` | owner; the rotation annotation, owner or PM's operators | pm-operator |
 | `Provider.status`, all of it | pm-operator | owner |
 | connection Secret (pm-operator's namespace, runtime cluster) | pm-operator | pm-operator only |
 | provider workspace, SA, binding, connector RBAC | pm-operator | connectors |

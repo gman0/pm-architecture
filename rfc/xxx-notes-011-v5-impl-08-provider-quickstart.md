@@ -54,7 +54,7 @@ The Wild West operator (`operator/wild-west`) reads its clusters from the mode a
 ### Portal
 
 The existing Angular portal gains:
-- **Issue token**: shows the token once, with a `kubectl create secret` command, never a manifest, and never puts the token in a URL;
+- **Issue token**: shows the token once, with a `kubectl create secret` command, never a manifest, and never puts the token in a URL; next to it, the `Provider` and `ProviderOnboardingRequest` manifests to apply;
 - **Connections**: list with status (from the SDK store), delete;
 - **Notifications**: a simple list of events, filled by the quickstart's SDK hooks.
 

@@ -132,10 +132,10 @@ Settings that matter:
 
 ## Identity towards kcp
 
-- **SA tokens**: each replica mints tokens for the SA named in the `ProviderEndpoint` of every connection it has sessions for, with TokenRequest through the front-proxy, caches them in memory, refreshes at half their lifetime, and never writes or sends them anywhere else.
+- **SA tokens**: each replica mints tokens for the fixed admin SA `default/provider` in the provider workspace of every connection it has sessions for, with TokenRequest through the front-proxy, caches them in memory, refreshes at half their lifetime, and never writes or sends them anywhere else.
 - **The connector's own identity** comes from the `VirtualWorkspace`'s `kubeconfigSecretRef`, which must always be set: without it, kcp-operator mounts its privileged logical-cluster-admin credential into the pod. All shards' connectors share **one group**. The identity needs:
   - read-only `apiexports/content` on the connection export;
-  - in every provider workspace, `access` and `create` on `serviceaccounts/token` for that one SA, granted by platform-mesh-operator ([03 Operator, "Connector RBAC"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
+  - in every provider workspace, `access` and `create` on `serviceaccounts/token` for that one SA (`resourceNames: [provider]`), granted by platform-mesh-operator ([03 Operator, "Connector RBAC"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
 - **In the runtime cluster**: read access to the `ConnectorCABundle` (public data, for the switch rule) and its own connector certificate Secret. Nothing else.
 - **No `Shard` objects, no `/services/admin`.** The connector doesn't use the cache server, but kcp-operator mounts cache-server credentials into every `VirtualWorkspace` when a cache server is configured, as in PM. **Accepted and documented** as part of a compromised connector's blast radius ([09 Deployment, "Dependencies on kcp-operator"](./xxx-notes-011-v5-impl-09-deployment.md)).
 
