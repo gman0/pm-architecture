@@ -31,7 +31,7 @@ What a Provider still does itself: its portal and user accounts, its operator co
 ### Connection API
 
 The handler for the one plain-HTTPS endpoint:
-- **Registration**: verify and spend the token, apply idempotency rules (retries with the same idempotency key and hash return the same response for 7 days by default), create the connection entry (owner, `clusterID`, front-proxy URL, secret hash, the pinned connector CA bundle, negotiated version), return `connectionID` and server keys.
+- **Registration**: verify and spend the token, apply idempotency rules (retries with the same idempotency key and hash return the same response for 7 days by default), create the connection entry (owner, `clusterName`, front-proxy URL, secret hash, the pinned connector CA bundle, negotiated version), return `connectionID` and server keys.
 - **Orphan expiry**: a connection that has seen neither a control call nor a session by the end of the retry window is removed; it's a registration whose result PM never stored. A connection that was used once is never expired for being idle, however long its Provider or PM is away.
 
 ### Control sessions

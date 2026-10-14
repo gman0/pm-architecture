@@ -49,7 +49,7 @@ Two kinds, in two places:
 
 ## Finding the provider workspace
 
-The operator needs the provider workspace's `clusterID` for registration, and where to write the record. It never takes these from the `Provider`'s spec or status:
+The operator needs the provider workspace's `clusterName` for registration, and where to write the record. It never takes these from the `Provider`'s spec or status:
 1. **Derive the workspace name** the same way the Provider controller does: `<Provider name>-<the Provider's kcp.io/cluster annotation>` under `:root:providers`. The annotation is set by kcp, not the owner. Share this function between the two operators, so they can't drift.
 2. **Read the `Workspace` object** in `:root:providers` (PM-owned; owners have no rights there) for its logical cluster name and phase.
 3. **Derive the SA's namespace and name** with the Provider controller's shared function.
@@ -93,7 +93,7 @@ Every step is resumable from persisted state: the connection Secret holds the se
 ## Registration
 
 1. **Generate the connection secret** and write it to the connection Secret in the operator's namespace (write before send). When onboarding a registered `Provider` again, this replaces the old connection's Secret.
-2. **Call `POST /v1/connections`** with the token, the request's UID as idempotency key, the `clusterID`, the front-proxy URL, the secret's hash and the current connector CA certificates ([01 Protocol, "Registration"](./xxx-notes-011-v5-impl-01-protocol.md)).
+2. **Call `POST /v1/connections`** with the token, the request's UID as idempotency key, the `clusterName`, the front-proxy URL, the secret's hash and the current connector CA certificates ([01 Protocol, "Registration"](./xxx-notes-011-v5-impl-01-protocol.md)).
 3. **On success**, persist the `connectionID` **and the returned server keys** in the connection Secret, in one write; then record the `connectionID` in the request's status and `Provider.status.connection` for the owner's information. The server keys are trust anchors for the control session and the record, so they're never kept in owner-writable status, and never only in memory.
 4. **On a lost response, or a crash before step 3**, retry with the same idempotency key and hash; the same `connectionID` and server keys come back. The Provider-side honours such retries for a generous window (7 days by default, [01 Protocol, "Registration"](./xxx-notes-011-v5-impl-01-protocol.md)), far longer than any expected operator outage.
 5. **On refusal** (token spent elsewhere, expired, wrong owner, or a retry after the window), fail the request with a reason the owner can act on. This is the last point at which a request can fail. A retry refused after the window leaves an orphaned connection on the Provider-side, which the SDK expires because it never saw a control call or session ([07 SDK, "Connection API"](./xxx-notes-011-v5-impl-07-provider-sdk.md)).

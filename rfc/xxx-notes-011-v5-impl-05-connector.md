@@ -113,7 +113,7 @@ A session authenticator in the server's authenticator union:
 ## Authorization and policy
 
 The virtual workspace's authorizer, for the connection principal:
-- **Scope**: only its own connection's paths, i.e. its provider workspace through the front-proxy (`/clusters/<its clusterID>/…`), and the APIExport virtual-workspace endpoints of exports in that workspace. Both kcp path shapes are parsed explicitly.
+- **Scope**: only its own connection's paths, i.e. its provider workspace through the front-proxy (`/clusters/<its clusterName>/…`), and the APIExport virtual-workspace endpoints of exports in that workspace. Both kcp path shapes are parsed explicitly.
 - **Denylist** (v5, "Connector policy"):
   - `update`, `patch`, `delete` on the connection export's APIBinding;
   - writes to `apiexportendpointslices/status`;

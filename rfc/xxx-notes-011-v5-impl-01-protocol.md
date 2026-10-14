@@ -44,14 +44,14 @@ The secret changes only through the connection's **`ProviderEndpoint`**, never t
 
 Why this is safe:
 - **Only PM can write the record**: the connection export's maximal permission policy refuses writes even to the provider workspace's admins ([02 APIs, "Connection export"](./xxx-notes-011-v5-impl-02-apis.md)).
-- **The Provider-side reads it only over a valid session**: one that verified against the connection's pinned connector CA bundle and carries the connection's `cluster` claim (see "Sessions").
+- **The Provider-side reads it only over a valid session**: one whose connector certificate verified against the connection's pinned connector CA bundle, and whose hello named the connection's `clusterName` (see "Sessions").
 - **So nobody but PM can change the secret.** Holding the current secret, an onboarding token or a portal account doesn't help, which also means a thief can't lock PM out.
 
 It needs a working session. Without one, the change waits; the Provider-side keeps the current hash meanwhile.
 
 ## Registration
 
-Request: idempotency key (the `ProviderOnboardingRequest` UID), `clusterID` (logical cluster of the provider workspace), front-proxy URL, the secret's hash, the connector CA bundle (see "Connector CA bundle"), and the protocol versions the PM-side supports.
+Request: idempotency key (the `ProviderOnboardingRequest` UID), `clusterName` (the logical cluster name of the provider workspace, as kcp assigns it), front-proxy URL, the secret's hash, the connector CA bundle (see "Connector CA bundle"), and the protocol versions the PM-side supports.
 
 Response: `connectionID`, the Provider-side's **server keys** (public keys, a list to allow rotation), and the chosen protocol version.
 
@@ -59,7 +59,7 @@ Rules:
 - **Only new connections.** Registration never changes an existing connection.
 - **Idempotency**: keyed on `(tokenID, idempotencyKey)`. A retry with the same `secretHash` returns the same response (`connectionID` and server keys); a different hash is refused. After the token's expiry, a retry is still honoured for a **generous window, 7 days by default**, so an operator that crashed between the call and persisting its result can always recover it.
 - **Orphans expire**: a connection that has seen neither a control call nor a session by the end of that window is removed by the Provider-side. That's a registration whose result PM never stored. A connection that was used once is never expired for being idle.
-- **Addressing is immutable**: `clusterID` and front-proxy URL are fixed for the connection's life.
+- **Addressing is immutable**: `clusterName` and front-proxy URL are fixed for the connection's life.
 - **Trust in the response** comes from web PKI on the base URL; it's what makes the returned server keys safe to pin.
 
 ## Control sessions

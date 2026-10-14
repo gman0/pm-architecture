@@ -39,7 +39,7 @@ The Provider controller and the operator both write `Provider.status`. They use 
 
 ### The connection Secret
 
-**In the operator's namespace in PM's runtime cluster, not in kcp.** One Secret per connection, named after the provider workspace's logical cluster (e.g. `connection-<clusterID>`), so it exists before registration returns a `connectionID`:
+**In the operator's namespace in PM's runtime cluster, not in kcp.** One Secret per connection, named after the provider workspace's logical cluster (e.g. `connection-<clusterName>`), so it exists before registration returns a `connectionID`:
 
 | Key | Content |
 |---|---|
@@ -67,7 +67,7 @@ One per provider workspace, cluster-scoped, with a fixed name (e.g. `default`), 
 | `serverKeys` | The Provider-side's pinned server public keys, for the inner TLS |
 | `pendingSecretHash` | The hash of the connection secret the operator is switching to; empty otherwise. The Provider-side adopts it ([01 Protocol, "Changing the secret"](./xxx-notes-011-v5-impl-01-protocol.md)) |
 
-- **No `clusterID`**: the object's logical cluster is the provider workspace.
+- **No `clusterName`**: the object's logical cluster is the provider workspace.
 - **No status**: connectors write nothing; health lives in metrics and in the operator's view.
 - **Validation** in the schema: `https` URLs only, bounded list sizes, key and hash format. The operator's egress checks apply on top ([03 Operator, "Egress"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)).
 - **Readable by the Provider** in its own workspace. Nothing in it is secret: `pendingSecretHash` is the hash of a 256-bit secret.
