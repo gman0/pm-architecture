@@ -27,7 +27,7 @@ The two WebSocket endpoints accept the upgrade before the caller is authenticate
 
 - **Format**: `pm1.<base64url(base URL)>.<tokenID>.<tokenSecret>`. The base URL inside ensures the token is only ever sent to its issuer.
 - **Single-use and short-lived**; the Provider-side stores only a hash of `tokenSecret`.
-- **Bound to the issuing owner account** on the Provider-side, which owns the connection it registers (portal listing, billing, freezing).
+- **Bound to the issuing owner account** on the Provider-side, which owns the connection it registers (portal listing, billing).
 - **Spent on first successful `POST`**, but a retry with the same idempotency key and secret hash within a window (7 days by default) returns the same result (see "Idempotency").
 
 ## Connection secret
@@ -93,7 +93,7 @@ The connector CA certificates a connection pins travel as a **trust bundle in SP
 - **Only on the control channel**, never through a session: a session is authenticated by the CA it would be changing.
 - **Open sessions are checked against a new bundle.** Sessions are only verified when they open, so on its own, removing a CA wouldn't affect sessions already opened under it. When the Provider-side accepts a new bundle (a push, or a re-pin by its administrators), it checks each open session of that connection: if the session's client certificate, kept from its handshake, no longer chains to a CA in the new bundle, the Provider-side sends go-away, lets in-flight requests finish within a short grace period (e.g. 30 seconds), then closes the session. Only the issuer counts, not the certificate's expiry, so sessions still outlive an expired connector certificate. A bundle that only adds CAs closes nothing. PM's connectors reconnect at once with a certificate from a trusted CA; anyone else can't.
 
-  Why: someone who gets a connector CA's key or a connector certificate's key on its own (from a compromised external PKI, or a single Secret leaked in a backup or log) can open sessions and act as PM's connector, feeding the Provider made-up objects and receiving what it writes back, without any kcp access. PM's response is to renew the CA and drop the leaked one; this rule is what ends the sessions already opened with it. It doesn't help against an attacker who still has access to PM's runtime cluster, who would also have kcp access and could do it again. In a normal rollover connectors have already moved their sessions to the new CA before the old one is dropped ([05 Connector, "Connector certificate"](./xxx-notes-011-v5-impl-05-connector.md)), so nothing is closed.
+  Why: someone who gets a connector CA's key or a connector certificate's key on its own (from a compromised external PKI, or a single Secret leaked in a backup or log) can open sessions and act as PM's connector, feeding the Provider made-up objects and receiving what it writes back, without any kcp access. PM's response is to renew the CA and drop the leaked one; this rule is what ends the sessions already opened with it. It doesn't help against an attacker who still has access to PM's runtime cluster, who would also have kcp access and could do it again. In a normal rollover, this is also how sessions still on the old CA's certificate move to the new one: platform-mesh-operator spreads the old CA's drop over several hours, so the handovers, and the relists of long-running watches on those sessions, are spread too ([03 Operator, "Connector CA trusted set"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
 
 ## WebSocket framing
 
@@ -111,9 +111,29 @@ Most onboarding problems come from the Provider's edge, not the protocol. The PM
 - **connection closed right after a binary message**, the typical sign of a WAF inspecting WebSocket payloads;
 - **connection closed at a regular age or after a regular idle time**, the sign of an edge timeout below what the protocol needs.
 
-The SDK also offers Providers an edge self-test they run against their own base URL. It's an SDK feature, not part of this contract: PM never calls it ([07 SDK, "Edge self-test"](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
+Providers check their edge against the quickstart's checklist ([08 Quickstart, "Connection server"](./xxx-notes-011-v5-impl-08-provider-quickstart.md)); a self-test tool for Providers is a [follow-up](./xxx-notes-011-v5-impl-todo.md).
 
 ## Sessions
+
+### Sessions and streams
+
+A **session** is a long-lived tunnel between PM and a Provider; **streams** are the lightweight connections running inside it.
+
+| | Session | Stream |
+|---|---|---|
+| **What it is** | One WebSocket, with inner TLS and the yamux multiplexer inside | One logical connection inside a session, created by yamux |
+| **Who opens it** | PM: a connector replica dials the Provider | The Provider-side: the SDK opens one whenever client-go wants a new connection to a kcp host |
+| **For what** | One connection (one provider workspace), on one shard | One HTTP connection from client-go: requests one after another, or one long watch |
+| **Authentication** | Once, when it opens: the inner TLS handshake, then the hello | None of its own: it inherits the session's. The connector authorizes each request on it |
+| **Cost to open** | A WebSocket upgrade through the Provider's edge, plus a TLS handshake | A yamux frame |
+| **Lifetime** | Hours; replaced before the edge's maximum connection age | Seconds for requests (or reused with keep-alive), hours for a watch |
+| **How many** | One per (connection, shard with traffic, connector replica): typically single digits per PM installation | One per concurrent request or watch: typically tens per Provider |
+| **Visible at the Provider's edge** | Yes, as one WebSocket connection | No, only as opaque bytes inside the session |
+| **If it ends** | All its streams end; client-go reopens them on another session | Only that request or watch; client-go retries or re-watches |
+
+It's like an HTTP/2 connection and its streams, with one difference in direction: PM sets up the session, because the Provider can't reach PM, but the Provider opens the streams, because it's the client talking to kcp.
+
+**How they fit together in practice.** The Provider's controller wants to watch `cowboys` on shard B. client-go asks the SDK for a connection to shard B's virtual-workspace host. The SDK picks one of the sessions serving that host and opens a stream on it. client-go sends `GET …/cowboys?watch=true` over that stream; the connector authorizes it, adds the SA token and forwards it to kcp; the watch events stream back on the same stream for hours. Other watches and requests on shard B get their own streams, on the same session or another one serving that host.
 
 ### Upgrade
 
@@ -122,7 +142,7 @@ A plain WebSocket upgrade on `/v1/connections/{id}/session`, without credentials
 ### Inner layer
 
 After the upgrade, a TLS 1.3 handshake inside the WebSocket, with mutual authentication:
-- **Client**: the connector presents its connector certificate. The Provider-side verifies it against **only** the CA certificates in the connection's pinned connector CA bundle: the certificate must be issued directly by one of them (no intermediates), be valid, and allow signing and client authentication (key usage `digitalSignature`, EKU `clientAuth`). Go's verifier requires EKU `serverAuth` unless told otherwise, so the SDK passes `clientAuth` explicitly.
+- **Client**: the connector presents its connector certificate. The Provider-side verifies it against **only** the CA certificates in the connection's pinned connector CA bundle: the certificate must be issued directly by one of them (no intermediates), be valid, with the pinned CA itself unexpired too, and allow signing and client authentication (key usage `digitalSignature`, EKU `clientAuth`). Go's verifier requires EKU `serverAuth` unless told otherwise, so the SDK passes `clientAuth` explicitly.
 - **Server**: the Provider-side presents a self-signed certificate for one of its server keys; the connector accepts only keys pinned for this connection (read from the `ProviderEndpoint`, see [02 APIs](./xxx-notes-011-v5-impl-02-apis.md)).
 - **ALPN** names the session protocol and version (e.g. `pm-session/1`), so a future change is negotiated, not guessed.
 
@@ -175,7 +195,7 @@ Disasters on either side (a Provider's cluster rebuilt, for example) are handled
 
 ## Server keys
 
-- **A list**, so the Provider-side can rotate with overlap: a new key is announced in `GET` before it's used, the old one retired after the overlap.
+- **A list**, so the Provider-side can rotate with overlap: when its administrators start a rotation, a new key is announced in `GET` before it's used, and the old one retired after the overlap.
 - **Switch per connection when the record is ready**: the Provider-side presents a new key on a connection only once that connection's `ProviderEndpoint` lists it (it reads the record over sessions anyway), and retires the old key once every connection's record lists the new one, or after a deadline. A connection whose operator is down for longer doesn't lose its sessions.
 - **No refresh over plain HTTPS.** A server key endpoint verified only by web PKI would let the Provider's edge swap keys and undo the inner TLS. After a lost or missed key, a PM administrator supplies the new keys ([03 Operator, "Records"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
 
@@ -190,13 +210,13 @@ platform-mesh-operator turns this into aggregate conditions ([03 Operator, "Heal
 
 ## Errors and retries
 
-- **Upgrades refused with `503` and `Retry-After`** (e.g. by a standby Provider replica): the connector treats the value as the **lower bound for its normal reconnect backoff** (jitter, growth on repeated failures), with no special handling. A standby built on the SDK sends `Retry-After = max(5s, ceil(LeaseDuration / 3))`, derived from its leader-election settings ([07 SDK, "Replicas"](./xxx-notes-011-v5-impl-07-provider-sdk.md)). A `503` from the Provider's edge without `Retry-After` falls back to the normal backoff.
+- **Upgrades refused with `503` and `Retry-After`** (e.g. by a standby Provider replica): the connector treats the value as the **lower bound for its normal reconnect backoff** (jitter, growth on repeated failures), with no special handling. A standby built on the SDK sends `Retry-After: 5` ([07 SDK, "Replicas"](./xxx-notes-011-v5-impl-07-provider-sdk.md)). A `503` from the Provider's edge without `Retry-After` falls back to the normal backoff.
 - **A session closed gracefully by the Provider-side** (go-away, then close): connectors reconnect at once, with jitter.
 
 - **Authentication failures** reveal no detail: a failed session handshake ends with a standard TLS alert (e.g. `unknown_ca` when the connector's CA isn't pinned, which the connector reports in its metrics), and a failed control call gets a uniform response, then the control session closes. The Provider-side records the reason for its own audit and notifications.
 - **Rate limits** return `429` with `Retry-After`; the PM-side honours it with jitter.
 - **Transient failures** (`5xx`, connection errors) are retried with backoff; registration retries reuse the same idempotency key and hash.
-- **An unknown or deleted connection, and a frozen one**, refuse everything with two stable, distinguishable statuses, so the PM-side can report them instead of retrying forever. "Unknown" is also what lets an owner onboard the same `Provider` again (see "Recovery").
+- **An unknown or deleted connection** refuses everything with a stable, distinguishable status, so the PM-side can report it instead of retrying forever. "Unknown" is also what lets an owner onboard the same `Provider` again (see "Recovery").
 
 ## Versioning
 
@@ -208,7 +228,7 @@ platform-mesh-operator turns this into aggregate conditions ([03 Operator, "Heal
 ## Deliverables
 
 - **This contract as a versioned specification** in the SDK module, with the message schemas.
-- **Test vectors**: inner TLS (a client certificate from an unpinned CA, expired, without the `clientAuth` EKU, or with an intermediate in its chain; an unpinned server key), hellos (wrong `clusterName`, missing or malformed `hosts`, oversized), control sessions (wrong secret, closed on the first failure). Shared by the SDK and the connector's tests ([10 Testing](./xxx-notes-011-v5-impl-10-testing.md)).
+- **Test vectors**: inner TLS (a client certificate from an unpinned CA, expired, without the `clientAuth` EKU, or with an intermediate in its chain; a pinned CA that has expired; an unpinned server key), hellos (wrong `clusterName`, missing or malformed `hosts`, oversized), control sessions (wrong secret, closed on the first failure). Shared by the SDK and the connector's tests ([10 Testing](./xxx-notes-011-v5-impl-10-testing.md)).
 
 ## Decided
 
