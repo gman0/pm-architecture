@@ -1,6 +1,6 @@
 # v5 implementation plan: protocol
 
-Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). The wire contract between the PM-side ([platform-mesh-operator](./xxx-notes-011-v5-impl-03-providerconnections-operator.md), which makes every registration and control call, and the [connectors](./xxx-notes-011-v5-impl-05-connector.md)) and the Provider-side (the [SDK](./xxx-notes-011-v5-impl-07-provider-sdk.md)). Both sides implement exactly this document; neither relies on anything the other does beyond it.
+Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). The wire contract between the PM-side ([platform-mesh-operator](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md), which makes every registration and control call, and the [connectors](./xxx-notes-011-v5-impl-05-connector.md)) and the Provider-side (the [SDK](./xxx-notes-011-v5-impl-07-provider-sdk.md)). Both sides implement exactly this document; neither relies on anything the other does beyond it.
 
 ## Principles
 
@@ -88,7 +88,7 @@ The connector CA certificates a connection pins travel as a **trust bundle in SP
 
 - **Sent at registration** and **replaced by `PUT …/connector-ca-bundle`** whenever the trusted set changes, which is a few times a year.
 - **Compare-and-swap**: `GET` returns the pinned bundle's `etag` (a hash of its canonical content, computed by the Provider-side) and the CAs' fingerprints. A `PUT` must carry `If-Match: <etag>`; a mismatch is refused with `412` and the current `etag`, and a body identical to the pinned bundle is a no-op. Reordered or duplicated calls, for example from two operator workers during a handover, therefore can't overwrite a newer bundle unnoticed.
-- **PM can always restore its bundle**, even after someone holding the connection secret replaced it (see [03 Connection handling, "Connector CA trusted set"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)).
+- **PM can always restore its bundle**, even after someone holding the connection secret replaced it (see [03 Operator, "Connector CA trusted set"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
 - **Accepted even if every pinned CA has expired.** A push is authenticated by the connection secret and protected by compare-and-swap; the pinned CAs play no part. A Provider that was down through any number of rollovers is caught up by its first successful control call.
 - **Only on the control channel**, never through a session: a session is authenticated by the CA it would be changing.
 - **Open sessions are checked against a new bundle.** Sessions are only verified when they open, so on its own, removing a CA wouldn't affect sessions already opened under it. When the Provider-side accepts a new bundle (a push, or a re-pin by its administrators), it checks each open session of that connection: if the session's client certificate, kept from its handshake, no longer chains to a CA in the new bundle, the Provider-side sends go-away, lets in-flight requests finish within a short grace period (e.g. 30 seconds), then closes the session. Only the issuer counts, not the certificate's expiry, so sessions still outlive an expired connector certificate. A bundle that only adds CAs closes nothing. PM's connectors reconnect at once with a certificate from a trusted CA; anyone else can't.
@@ -106,7 +106,7 @@ Applies to control sessions and sessions alike, so that they pass common edges (
 
 ## Diagnosing the edge
 
-Most onboarding problems come from the Provider's edge, not the protocol. The PM-side classifies failures on the first control session after registration, and on every reconnect, and reports them with distinct reasons ([03 Connection handling, "The `Connected` subroutine"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)):
+Most onboarding problems come from the Provider's edge, not the protocol. The PM-side classifies failures on the first control session after registration, and on every reconnect, and reports them with distinct reasons ([03 Operator, "Health"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)):
 - **upgrade refused** (a non-`101` response), including **an HTML page in response**, the typical sign of a bot challenge or WAF block page;
 - **connection closed right after a binary message**, the typical sign of a WAF inspecting WebSocket payloads;
 - **connection closed at a regular age or after a regular idle time**, the sign of an edge timeout below what the protocol needs.
@@ -168,7 +168,7 @@ The protocol makes **no assumption about which Provider replica a session or con
 
 What each side can lose, and how it comes back:
 - **The PM-side loses the secret, or the Provider-side rejects it** (e.g. its store was restored from an older backup): platform-mesh-operator changes the secret through the record (see "Changing the secret"). The `connectionID` and all Provider-side state stay.
-- **The Provider-side no longer knows the connection** (deleted in the portal, or its store lost): it answers with the stable "unknown connection" status (see "Errors and retries"). Two ways back: the Provider's administrators import the old entry, which keeps the `connectionID` and is preferred when the Provider still has the data; or the owner onboards the same `Provider` again, which registers a **new** connection, meant for switching Providers or a connection the Provider won't restore ([03 Connection handling, "Onboarding requests"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)).
+- **The Provider-side no longer knows the connection** (deleted in the portal, or its store lost): it answers with the stable "unknown connection" status (see "Errors and retries"). Two ways back: the Provider's administrators import the old entry, which keeps the `connectionID` and is preferred when the Provider still has the data; or the owner onboards the same `Provider` again, which registers a **new** connection, meant for switching Providers or a connection the Provider won't restore ([03 Operator, "Onboarding requests"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
 - **No session verifies and control calls fail authentication** (a pinned bundle that missed a rollover, and a secret the Provider-side lost or rejects): nothing in the protocol can fix this. Pushing a bundle needs the secret, and repairing the secret needs a session. A missed rollover alone isn't this case: platform-mesh-operator's first successful control call pushes the current bundle. The Provider's administrators re-pin the bundle out-of-band ([07 SDK, "Administration"](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
 
 Disasters on either side (a Provider's cluster rebuilt, for example) are handled the same way: out-of-band steps between the people running both sides, on top of the properties above. The protocol keeps them possible: `connectionID`s are stable, the Provider-side can import a connection entry, and the PM-side can take a connection's base URL and server keys from an administrator. The procedures themselves aren't part of this plan.
@@ -177,7 +177,7 @@ Disasters on either side (a Provider's cluster rebuilt, for example) are handled
 
 - **A list**, so the Provider-side can rotate with overlap: a new key is announced in `GET` before it's used, the old one retired after the overlap.
 - **Switch per connection when the record is ready**: the Provider-side presents a new key on a connection only once that connection's `ProviderEndpoint` lists it (it reads the record over sessions anyway), and retires the old key once every connection's record lists the new one, or after a deadline. A connection whose operator is down for longer doesn't lose its sessions.
-- **No refresh over plain HTTPS.** A server key endpoint verified only by web PKI would let the Provider's edge swap keys and undo the inner TLS. After a lost or missed key, a PM administrator supplies the new keys ([03 Connection handling, "Records"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)).
+- **No refresh over plain HTTPS.** A server key endpoint verified only by web PKI would let the Provider's edge swap keys and undo the inner TLS. After a lost or missed key, a PM administrator supplies the new keys ([03 Operator, "Records"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
 
 ## Status
 
@@ -186,7 +186,7 @@ Disasters on either side (a Provider's cluster rebuilt, for example) are handled
 - whether its last requests reached kcp;
 - the last error, without sensitive detail.
 
-platform-mesh-operator turns this into aggregate conditions ([03 Connection handling, "The `Connected` subroutine"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)). No shard names or PM topology appear.
+platform-mesh-operator turns this into aggregate conditions ([03 Operator, "Health"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)). No shard names or PM topology appear.
 
 ## Errors and retries
 

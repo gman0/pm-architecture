@@ -5,7 +5,7 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Th
 ## What it provides
 
 - **Connector certificates**: one per shard's connector, short-lived, used as the client certificate in each session's inner TLS, which is how sessions are authenticated ([01 Protocol, "Sessions"](./xxx-notes-011-v5-impl-01-protocol.md)).
-- **The trusted set**: the connector CA certificates Providers pin, which platform-mesh-operator sends at registration and pushes whenever it changes ([01 Protocol, "Connector CA bundle"](./xxx-notes-011-v5-impl-01-protocol.md), [03 Connection handling, "Connector CA trusted set"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)).
+- **The trusted set**: the connector CA certificates Providers pin, which platform-mesh-operator sends at registration and pushes whenever it changes ([01 Protocol, "Connector CA bundle"](./xxx-notes-011-v5-impl-01-protocol.md), [03 Operator, "Connector CA trusted set"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
 - **Rollover progress**, reported in one resource, `ConnectorCABundle`.
 
 ## Principles
@@ -25,7 +25,7 @@ One cert-manager `Certificate` with `isCA: true`, rendered by the `providerconne
 
 ## The trusted set
 
-What Providers pin. Kept by platform-mesh-operator ([03 Connection handling, "Connector CA trusted set"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)):
+What Providers pin. Kept by platform-mesh-operator ([03 Operator, "Connector CA trusted set"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)):
 - **New CA certificates come from the CA's `CertificateRequest`s**, whose status carries the issued certificate: public data, no key access. platform-mesh-operator validates each one (a CA, allowed to sign, not expired) before adding it; an invalid one is reported (`Valid=False`) and never pushed.
 - **The set is the current CA plus the previous one**, until 48 hours after the current one was first seen. By then every connector has switched (see "Connector certificates"), and no connector certificate from the previous CA is still valid.
 - **A history of every CA PM has trusted** is kept alongside, by fingerprint. platform-mesh-operator's tamper check compares Providers' pinned bundles against it, so a Provider returning after a long outage, still pinning an old CA, isn't mistaken for tampering.
@@ -74,7 +74,7 @@ Printer columns: Current, Converged, Age.
 
 ### Who writes what
 
-The whole status has one writer: platform-mesh-operator's active replica. It mirrors the trusted set, counts connections per shard, and computes each CA's `converged` flag and the conditions ([03 Connection handling, "Connector CA trusted set"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)).
+The whole status has one writer: platform-mesh-operator's active replica. It mirrors the trusted set, counts connections per shard, and computes each CA's `converged` flag and the conditions ([03 Operator, "Connector CA trusted set"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
 
 **Convergence** counts only the connections whose control calls succeed. A connection platform-mesh-operator can't reach, whether its Provider is down or its control path is broken, is listed as not reached with its last error and catches up on its first successful control call; nothing waits for it.
 
@@ -121,13 +121,13 @@ For the **people running the PM installation** (owners and Providers never see t
 | Connector holding its previous certificate | `providerconnections_connector_certificate_pending_switch_seconds{shard}` (connector) | — | > 6 hours: warning (the new CA hasn't converged) |
 | Connector certificate not renewed | `providerconnections_connector_certificate_expiry_seconds{shard}` (connector) | Event on the connector's `Certificate` (cert-manager) | < 6 hours left (half the renewal budget used): warning |
 | Connector certificate expired | same | Connector readiness reports it (rollout tooling can hold) | ≤ 0: critical. From then on every session that ends is an outage for its connection on that shard ([05 Connector, "Opening a session"](./xxx-notes-011-v5-impl-05-connector.md)) |
-| A pinned bundle held a CA PM never trusted | `providerconnections_connector_ca_bundle_tampered_total` (operator) | An event on the `Provider` ([03 Connection handling, "Connector CA trusted set"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)) | Increase: critical (a connection secret was used by someone other than PM) |
+| A pinned bundle held a CA PM never trusted | `providerconnections_connector_ca_bundle_tampered_total` (operator) | An event on the `Provider` ([03 Operator, "Connector CA trusted set"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)) | Increase: critical (a connection secret was used by someone other than PM) |
 
 ## Work breakdown
 
 1. The status-only `ConnectorCABundle` CRD and its printer columns.
 2. Chart templates: the CA `Certificate` and its issuer (self-signed or `issuerRef`), the CA `ClusterIssuer`, per-shard connector `Certificate`s, the `distrust` configuration ([09 Deployment](./xxx-notes-011-v5-impl-09-deployment.md)).
-3. platform-mesh-operator: reading CA certificates from `CertificateRequest`s, the trusted set and its history, the `ConnectorCABundle` status ([03 Connection handling](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)).
+3. platform-mesh-operator: reading CA certificates from `CertificateRequest`s, the trusted set and its history, the `ConnectorCABundle` status ([03 Operator](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
 4. Connector: the switch rule and replacing old-certificate sessions ([05 Connector](./xxx-notes-011-v5-impl-05-connector.md)).
 5. Runbooks: what the `ConnectorCABundle` status means, connections not reached, compromise, with the documented alert rules from "Signals".
 

@@ -12,7 +12,7 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Th
 
 **Doesn't own:**
 - records or anything else in kcp (it writes only TokenRequests);
-- connection secrets or control calls ([03 Connection handling](./xxx-notes-011-v5-impl-03-providerconnections-operator.md));
+- connection secrets or control calls ([03 Operator](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md));
 - issuing its certificate ([04 Connector CA](./xxx-notes-011-v5-impl-04-connector-ca.md)).
 
 ## Principles
@@ -144,13 +144,13 @@ Settings that matter:
 - **SA tokens**: the replica that owns a connection mints tokens for the SA named in the `ProviderEndpoint` with TokenRequest through the front-proxy, caches them in memory, refreshes at half their lifetime, and never writes or sends them anywhere else.
 - **The connector's own identity** comes from the `VirtualWorkspace`'s `kubeconfigSecretRef`, which must always be set: without it, kcp-operator mounts its privileged logical-cluster-admin credential into the pod. All shards' connectors share **one group**. The identity needs:
   - read-only `apiexports/content` on the connection export;
-  - in every provider workspace, `access` and `create` on `serviceaccounts/token` for that one SA, granted by the Provider controller ([06 Provider controller, "Connector RBAC"](./xxx-notes-011-v5-impl-06-provider-controller.md)).
+  - in every provider workspace, `access` and `create` on `serviceaccounts/token` for that one SA, granted by platform-mesh-operator ([03 Operator, "Connector RBAC"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
 - **In the runtime cluster**: read access to the `ConnectorCABundle` (public data, for the switch rule) and its own connector certificate Secret. Nothing else.
 - **No `Shard` objects, no `/services/admin`.** The connector doesn't use the cache server, but kcp-operator mounts cache-server credentials into every `VirtualWorkspace` when a cache server is configured, as in PM. **Accepted and documented** as part of a compromised connector's blast radius ([09 Deployment, "Dependencies on kcp-operator"](./xxx-notes-011-v5-impl-09-deployment.md)).
 
 ## Egress to Providers
 
-- Dial only base URLs from `ProviderEndpoint`s; apply the same rules as platform-mesh-operator ([03 Connection handling, "Egress"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)): `https`, public addresses, resolve once, no redirects.
+- Dial only base URLs from `ProviderEndpoint`s; apply the same rules as platform-mesh-operator ([03 Operator, "Egress"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)): `https`, public addresses, resolve once, no redirects.
 - Network policy allows the connector outbound internet access and in-cluster access to its virtual workspace and the front-proxy, nothing else ([09 Deployment](./xxx-notes-011-v5-impl-09-deployment.md)).
 
 ## Limits
@@ -161,7 +161,7 @@ Per connection: concurrent streams, request rate, header sizes, in-flight reques
 
 - **Metrics**: sessions per state, streams per session, requests by connection and outcome (via `apiserver_request_*`), denials by rule, token mint outcomes, buffer pressure, and the connector certificate's expiry and how long a renewed one has waited ([04 Connector CA, "Signals"](./xxx-notes-011-v5-impl-04-connector-ca.md)). Scraped through a `ServiceMonitor` like PM's other components ([09 Deployment, "Observability"](./xxx-notes-011-v5-impl-09-deployment.md)).
 - **Readiness** reflects an expired connector certificate, so rollout tooling can hold.
-- **Audience**: the people running the PM installation. Owners see their connections' state on `Provider` conditions ([03 Connection handling, "The `Connected` subroutine"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)); Providers see theirs through the SDK.
+- **Audience**: the people running the PM installation. Owners see their connections' state on `Provider` conditions ([03 Operator, "Health"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)); Providers see theirs through the SDK.
 - **Audit**: every request with the connection principal and the SA it acted as; at metadata level, never bodies.
 - **Logs**: no tokens.
 

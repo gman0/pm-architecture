@@ -6,7 +6,7 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Ho
 
 - **Declarative and GitOps-friendly**, like the rest of PM's deployment.
 - **Per-shard pieces come from an explicit topology in the chart's values**, a deliberate duplicate of the shards in the `infra` service's values, shaped like the per-instance context platform-mesh-deployer will provide later. Drift between the two is detected, not prevented (see "Charts").
-- **Least privilege per component**: platform-mesh-operator's connection handling, connectors and cert-manager each get only what they need on top of what they already have.
+- **Least privilege per component**: platform-mesh-operator, connectors and cert-manager each get only what they need.
 
 ## kcp bootstrap
 
@@ -45,11 +45,11 @@ kcpTopology:
 
 ### platform-mesh-operator
 
-The connection handling runs inside platform-mesh-operator ([03 Connection handling](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)), with its existing Deployment and leader election (one active replica). Its deployment gains:
+The control plane is platform-mesh-operator ([03 Operator](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)), with its Deployment and leader election (one active replica). For remote Providers it needs:
 - **RBAC in its namespace** for the connection Secrets ([02 APIs, "The connection Secret"](./xxx-notes-011-v5-impl-02-apis.md)) and the trusted-set ConfigMap ([04 Connector CA, "The trusted set"](./xxx-notes-011-v5-impl-04-connector-ca.md)). That namespace is separate from cert-manager's, which holds the connector CA's key.
-- **kcp rights** listed in [03 Connection handling, "Identity and permissions"](./xxx-notes-011-v5-impl-03-providerconnections-operator.md): the connection export's content and `bind`, and the connector RBAC in provider workspaces.
+- **kcp rights** listed in [03 Operator, "Identity and permissions"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md): the connection export's content and `bind`, and the connector RBAC in provider workspaces.
 - **In the runtime cluster**: write the `ConnectorCABundle`'s status; read `CertificateRequest`s in cert-manager's cluster resource namespace, for the CA's public certificates ([04 Connector CA](./xxx-notes-011-v5-impl-04-connector-ca.md)).
-- **Egress to the internet**, for Providers' base URLs, next to what it has today.
+- **Egress to the internet**, for Providers' base URLs.
 - **Configuration**: the `distrust` list of CA fingerprints, from values.
 
 ### Connector (providerconnections-vw)
@@ -59,7 +59,7 @@ The connection handling runs inside platform-mesh-operator ([03 Connection handl
 - **No front-proxy path mapping**: nobody reaches connectors inbound; they only dial out. The resource's `external` field is required, so it's set to the connector's in-cluster address; nothing routes to it.
 - **Per-shard configuration**, from its `kcpTopology` entry: shard name, its virtual-workspace host, the front-proxy host, and the in-cluster address for each (see "Network").
 - **Connector certificate**: one cert-manager `Certificate` per shard, rendered in the same loop, from the connector CA's `ClusterIssuer` (see "Connector CA" below), mounted into that shard's connector through the `VirtualWorkspace`'s `extraVolumes` and `extraVolumeMounts` ([04 Connector CA, "Connector certificates"](./xxx-notes-011-v5-impl-04-connector-ca.md)).
-- **The connectors' kcp identity**: one group shared by all shards, used in the connector RBAC the Provider controller creates in each provider workspace ([06 Provider controller, "Connector RBAC"](./xxx-notes-011-v5-impl-06-provider-controller.md)).
+- **The connectors' kcp identity**: one group shared by all shards, used in the connector RBAC platform-mesh-operator creates in each provider workspace ([03 Operator, "Connector RBAC"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
 - **Resources**: requests and limits sized from the shard's expected watch count; anti-affinity from the shard's own pods so a burst can't starve the shard.
 
 ### Connector CA
@@ -75,7 +75,7 @@ The same templates serve development and production; nothing about the CA has to
 ## Observability
 
 - **Today in PM**: the `observability` chart runs an OpenTelemetry collector that scrapes `ServiceMonitor`s (kcp, account-operator, security-operator, OpenFGA) into a bundled Prometheus or an external Prometheus-compatible endpoint. There's **no alerting**: Alertmanager and kube-state-metrics are disabled, no chart ships alert rules, and the bundled Prometheus (the community chart, not prometheus-operator) wouldn't read `PrometheusRule`s.
-- **The `providerconnections` chart ships**: metrics endpoints on the connectors, and `ServiceMonitor`s for them, so the existing collector picks them up. The connection handling's metrics come from platform-mesh-operator's own metrics endpoint.
+- **The `providerconnections` chart ships**: metrics endpoints on the connectors, and `ServiceMonitor`s for them, so the existing collector picks them up. The control plane's metrics come from platform-mesh-operator's own metrics endpoint.
 - **Alert rules are documented**, in the runbook, with expressions and severities ([04 Connector CA, "Signals"](./xxx-notes-011-v5-impl-04-connector-ca.md)). The chart can also render them as a `PrometheusRule` behind a values flag, off by default, for installations running prometheus-operator.
 - **Delivering alerts** (Alertmanager, routing, on-call) is a platform-wide gap outside this plan (see the overview's external dependencies).
 
@@ -84,7 +84,7 @@ The same templates serve development and production; nothing about the CA has to
 - **Connectors**: egress to their shard's virtual workspace and the front-proxy in-cluster, and to the internet for Providers. **Map external kcp hosts to in-cluster Services** for the dial while keeping the TLS server name, so traffic doesn't hairpin through PM's load balancer ([05 Connector, "Proxying"](./xxx-notes-011-v5-impl-05-connector.md)).
 - **platform-mesh-operator**: additionally, egress to the internet for Providers.
 - **No new inbound paths** into PM.
-- **Multi-cluster installations**: PM's charts render all shards into one cluster today. If shards ever span clusters, each cluster's profile carries its own `kcpTopology`, and the chart renders that cluster's connectors there; the connection handling stays with platform-mesh-operator in PM's cluster.
+- **Multi-cluster installations**: PM's charts render all shards into one cluster today. If shards ever span clusters, each cluster's profile carries its own `kcpTopology`, and the chart renders that cluster's connectors there; the control plane stays with platform-mesh-operator in PM's cluster.
 
 ## Dependencies on kcp-operator
 
@@ -102,10 +102,10 @@ Checked against kcp-operator `8994ed7`.
 
 1. kcp bootstrap (schemas, exports, RBAC).
 2. The `providerconnections` chart: the connector CA and connectors on every shard.
-3. platform-mesh-operator with the Provider controller and connection handling ([06](./xxx-notes-011-v5-impl-06-provider-controller.md), [03](./xxx-notes-011-v5-impl-03-providerconnections-operator.md)). It tolerates the connectors' absence either way.
+3. platform-mesh-operator ([03](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)). It tolerates the connectors' absence either way.
 4. Owners can now create `ProviderOnboardingRequest`s.
 
-Upgrades keep this order. Connectors and platform-mesh-operator tolerate each other's absence: without its connection handling, no records appear; without connectors, `Connected` stays false.
+Upgrades keep this order. Connectors and platform-mesh-operator tolerate each other's absence: without platform-mesh-operator, no records appear; without connectors, `Connected` stays false.
 
 ## Local development
 
@@ -119,19 +119,19 @@ The components here already split along the deployer's placements, so moving lat
 
 | Piece | Now (this plan) | On the deployer |
 |---|---|---|
-| Connection handling | Part of platform-mesh-operator | Moves with the `Provider` part of platform-mesh-operator once that's its own operator ([follow-ups](./xxx-notes-011-v5-impl-todo.md)); as a module, a `root-shard` component with a minted front-proxy kubeconfig |
+| Control plane | Part of platform-mesh-operator | Moves with the `Provider` part of platform-mesh-operator once that's its own operator ([follow-ups](./xxx-notes-011-v5-impl-todo.md)); as a module, a `root-shard` component with a minted front-proxy kubeconfig |
 | Connectors | kcp-operator `VirtualWorkspace` per shard, from `kcpTopology` | A `per-shard` component: one instance per shard in that shard's cluster, following the deployer's topology. Can be a plain workload (still on the virtual workspace framework) with a minted kubeconfig, which drops kcp-operator's `VirtualWorkspace` and its accepted limitations (cache-server credentials, Deployment only) |
 | kcp bootstrap | platform-mesh-operator's kcp manifests; connection export in `:root:providers:system` | Module setup: schemas, connection export, endpoint slice and policy RBAC in the module's workspace `root:modules:providerconnections`. The export's home moves, so records and bindings must be migrated or recreated |
 | Shard list | `kcpTopology` in the service's values, duplicating `infra`'s shards, must match `infra`'s (profile validation, a follow-up) | The deployer's topology; nothing to maintain. The per-shard context replaces `kcpTopology` entries field for field |
 | Connector CA | The CA `Certificate` and its issuers in PM's cluster, from the chart | Module `values`. Keys and issuers stay on the management cluster; connector certificates are minted there and synced to each shard's cluster, so the CA key never leaves the management cluster |
-| Identities | kcp-operator `Kubeconfig`s with the groups and rights this plan lists | Minted users `module:providerconnections:<kubeconfig>`, cluster-admin only in the module workspace. Every right outside it (the providers export's content, `Workspace`s in `:root:providers`, TokenRequest in provider workspaces) is granted elsewhere, e.g. by the Provider controller to that username instead of a group |
+| Identities | kcp-operator `Kubeconfig`s with the groups and rights this plan lists | Minted users `module:providerconnections:<kubeconfig>`, cluster-admin only in the module workspace. Every right outside it (the providers export's content, `Workspace`s in `:root:providers`, TokenRequest in provider workspaces) is granted elsewhere, e.g. by platform-mesh-operator to that username instead of a group |
 
 **Gaps to close in the deployer first:**
 1. **Per-shard instances need their hosts**: the shard's URL and virtual-workspace URL, the front-proxy URL, and in-cluster addresses. The deployer computes them from its exposure templates but doesn't pass them to module instances yet.
 2. **Client certificates per instance** from a configurable issuer (the connector CA's `ClusterIssuer`), with chosen key usages, as it already mints serving certificates.
 3. **Rights outside the module workspace** for minted identities, or a documented place where other components grant them.
 
-Nothing in the protocol, the APIs other than the export's home, the connection handling's or the connector's logic, or the SDK depends on how PM is deployed.
+Nothing in the protocol, the APIs other than the export's home, platform-mesh-operator's or the connector's logic, or the SDK depends on how PM is deployed.
 
 ## Decided
 
