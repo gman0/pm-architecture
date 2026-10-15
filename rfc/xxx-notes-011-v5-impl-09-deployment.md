@@ -50,7 +50,7 @@ kcpTopology:
 - **The `ProviderEndpointRegistration` CRD**, shipped with `platform-mesh-operator`'s chart ([02 APIs, "ProviderEndpointRegistration"](./xxx-notes-011-v5-impl-02-apis.md)).
 - **RBAC in its namespace** for `ProviderEndpointRegistration`s and their `Secret`s. That namespace is separate from cert-manager's, which holds the Connector CA's key. PM Administrators get `update` on `providerendpointregistrations` there, for recovery, without access to the `Secret`s.
 - **kcp rights** listed in [03 Operator, "Identity and permissions"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md): the Connection Export's content and `bind`, and the Connector RBAC in Provider Workspaces.
-- **In the runtime cluster**: write the `ConnectorCABundle`'s status; a Role in cert-manager's cluster resource namespace with only `get`, `list` and `watch` on `certificaterequests`, for the CA's public certificates ([04 Connector CA, "The Trusted Set"](./xxx-notes-011-v5-impl-04-connector-ca.md)). No access to `Secret`s there.
+- **In the runtime cluster**: write the `ConnectorCASet`'s status; a Role in cert-manager's cluster resource namespace with only `get`, `list` and `watch` on `certificaterequests`, for the CA's public certificates ([04 Connector CA, "The Connector CA Set"](./xxx-notes-011-v5-impl-04-connector-ca.md)). No access to `Secret`s there.
 - **Egress to the internet**, for Providers' Base URLs.
 - **Configuration**: the `distrust` list of CA fingerprints, from values.
 
@@ -68,7 +68,7 @@ In the `providerconnections` chart ([04 Connector CA](./xxx-notes-011-v5-impl-04
 - **The CA `Certificate`** (`isCA: true`, 1 year, renewed 90 days before expiry, `rotationPolicy: Always`, `revisionHistoryLimit: 3`) in cert-manager's cluster resource namespace, taken from values (default `cert-manager`), issued by a self-signed issuer by default or by the `issuerRef` from values (e.g. Vault or a cloud CA).
 - **A `ClusterIssuer` of type CA** on the CA's `Secret`, issuing the Connector Certificates.
 - **Per-shard Connector `Certificate`s** from that `ClusterIssuer`.
-- **The status-only `ConnectorCABundle` CRD** and its singleton; `platform-mesh-operator` fills in its status. Its `distrust` list (CA fingerprints to drop at once after a compromise) is part of `platform-mesh-operator`'s configuration.
+- **The status-only `ConnectorCASet` CRD** and its singleton; `platform-mesh-operator` fills in its status. Its `distrust` list (CA fingerprints to drop at once after a compromise) is part of `platform-mesh-operator`'s configuration.
 
 The same templates serve development and production; nothing about the CA has to be prepared outside the chart.
 

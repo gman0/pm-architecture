@@ -14,7 +14,7 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Ho
 **Every rule in a component's document is unit-tested with that component's work** ([02](./xxx-notes-011-v5-impl-02-apis.md), [03](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md), [04](./xxx-notes-011-v5-impl-04-connector-ca.md), [05](./xxx-notes-011-v5-impl-05-connector.md), [07](./xxx-notes-011-v5-impl-07-provider-sdk.md)), including what must be refused. Shared across components:
 - **the protocol's test vectors** ([01 Protocol, "Deliverables"](./xxx-notes-011-v5-impl-01-protocol.md)), run by the SDK, the Connector and `platform-mesh-operator`;
 - **the SDK's fake PM-side and test Provider-side server** ([07 SDK, "Testing support"](./xxx-notes-011-v5-impl-07-provider-sdk.md)), so `platform-mesh-operator` and the Connector test against the real protocol, and Providers test against a real PM-side;
-- **envtest** for every CRD and its controllers: the SDK's resources, `ProviderEndpointRegistration`, `ConnectorCABundle`;
+- **envtest** for every CRD and its controllers: the SDK's resources, `ProviderEndpointRegistration`, `ConnectorCASet`;
 - **configurable timings** (see "Decided"), so time-based rules are tested without waiting.
 
 ## E2E (kind, multi-shard)
@@ -65,7 +65,7 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Ho
 
 | Scenario | Checks |
 |---|---|
-| Automatic Rollover | With shortened lifetimes, cert-manager renews the CA (or `cmctl renew` forces it), and Connector Certificates renew along the way: `platform-mesh-operator` pushes the Trusted Set, the new CA converges, Connectors switch, and the old CA is dropped Connection by Connection within the spread; Sessions still on the old CA's certificate hand over with go-away and reopen at once; no Connection is left without a Session |
+| Automatic Rollover | With shortened lifetimes, cert-manager renews the CA (or `cmctl renew` forces it), and Connector Certificates renew along the way: `platform-mesh-operator` pushes the Connector CA Set, the new CA converges, Connectors switch, and the old CA is dropped Connection by Connection within the spread; Sessions still on the old CA's certificate hand over with go-away and reopen at once; no Connection is left without a Session |
 | Control path broken during a Rollover | The test Edge blocks a Provider's `/control` path while its Sessions stay up: convergence doesn't wait for it, it's listed as not reached, its Sessions are lost after the Connectors switch, and once `/control` is unblocked the catch-up push restores them within seconds |
 | Connector restarted mid-Rollover | A Connector restarted before the new CA converges uses its newest certificate at once; Sessions to Connections not yet pinning the new CA fail until the push lands, then recover |
 | Provider down during a Rollover | The Rollover completes for reachable Connections; when the Provider returns, its first successful Control Call triggers the bundle push and Sessions open within seconds. Also after two Rollovers and with every pinned CA expired: the push is accepted and no tampering is reported |

@@ -62,7 +62,7 @@ status:
 - **`listedServerKeys`**: the `ServerKey`s PM's `ProviderEndpoint` last listed. Set at Registration to the keys returned, then updated whenever the SDK reads the `ProviderEndpoint`. The Inner TLS handshake picks the key from it before any Session exists (see "Server Keys").
 - **`secretHash`**: the current Connection Secret's SHA-256. In status because only the SDK writes it; it isn't in a `Secret` because a hash of a 256-bit random Connection Secret reveals nothing, and the same kind of hash is already public in the `ProviderEndpoint`. If it's lost (e.g. a restore without status), PM's next Control Call fails and PM repairs the Connection Secret ([03 Operator, "Secret Changes"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
 - **Deleting the object is the delete**, whoever does it: a portal, an administrator with `kubectl`, the SDK on PM's `DELETE` call, or orphan expiry. The finalizer closes the Connection's Sessions and Control Sessions, takes it out of the registry, emits `Removed` and lets the object go. Deleting is final.
-- **Events**: `Registered`, `SecretChanged`, `ConnectorCABundleChanged` (with the number of Sessions closed), `Removed` (with the reason) and `AdministrativeChange`. A Provider that tells its customers about changes watches `Connection`s and their Events, like any other resource. The SDK also logs every event, never with secrets.
+- **Events**: `Registered`, `SecretChanged`, `PinnedBundleChanged` (with the number of Sessions closed), `Removed` (with the reason) and `AdministrativeChange`. A Provider that tells its customers about changes watches `Connection`s and their Events, like any other resource. The SDK also logs every event, never with secrets.
 
 ### OnboardingToken
 

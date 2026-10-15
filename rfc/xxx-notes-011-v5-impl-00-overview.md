@@ -11,8 +11,8 @@ Start here, then follow the walkthrough below, or jump to a component.
 | [00 Overview](./xxx-notes-011-v5-impl-00-overview.md) | Decisions, component map, end-to-end walkthrough, cross-cutting principles, ownership, build order |
 | [01 Protocol](./xxx-notes-011-v5-impl-01-protocol.md) | The wire contract between PM and the Provider-side: endpoints, credentials, Inner TLS, multiplexer, status, versioning |
 | [02 APIs](./xxx-notes-011-v5-impl-02-apis.md) | kcp-side types and exports: `ProviderOnboardingRequest`, `Provider`, `ProviderEndpointRegistration` and its `Secret`, `ProviderEndpoint`, the Connection Export and its maximal permission policy |
-| [03 platform-mesh-operator](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md) | Reconciling local and remote `Provider`s and `ProviderOnboardingRequest`s; Registration, `ProviderEndpoint`s, health, Secret Changes, the Trusted Set, deletion |
-| [04 Connector CA](./xxx-notes-011-v5-impl-04-connector-ca.md) | The Connector CA managed by cert-manager, Connector Certificates, the Trusted Set that Providers pin, and the automatic Rollover |
+| [03 platform-mesh-operator](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md) | Reconciling local and remote `Provider`s and `ProviderOnboardingRequest`s; Registration, `ProviderEndpoint`s, health, Secret Changes, the Connector CA Set, deletion |
+| [04 Connector CA](./xxx-notes-011-v5-impl-04-connector-ca.md) | The Connector CA managed by cert-manager, Connector Certificates, the Connector CA Set that Providers pin, and the automatic Rollover |
 | [05 Connector](./xxx-notes-011-v5-impl-05-connector.md) | The per-shard Connector, a standalone proxy; Sessions, proxying, policy |
 | [07 Provider SDK](./xxx-notes-011-v5-impl-07-provider-sdk.md) | The Provider-side library: Connection API, its resources (`Connection`, `OnboardingToken`, `ServerKey`), Session server, transport, lifecycle |
 | [08 Provider quickstart](./xxx-notes-011-v5-impl-08-provider-quickstart.md) | The reference Provider in pm-provider-quickstart |
@@ -32,7 +32,7 @@ Start here, then follow the walkthrough below, or jump to a component.
 | Connection object type | **`connections.platform-mesh.io/ProviderEndpoint`**, served only by the Connection Export. `ProviderConnection` is removed from `providers.platform-mesh.io`. |
 | Connection Export home | **`:root:providers:system`**. |
 | Multiplexer | **yamux** over the WebSocket. |
-| Connector CA | **Managed by cert-manager and rolled over automatically**: 1 year, renewed 90 days before expiry, self-signed by default or from an `issuerRef`. `platform-mesh-operator` pushes each new CA to every Provider before Connectors use it; a status-only **`ConnectorCABundle`** reports progress ([04](./xxx-notes-011-v5-impl-04-connector-ca.md)). |
+| Connector CA | **Managed by cert-manager and rolled over automatically**: 1 year, renewed 90 days before expiry, self-signed by default or from an `issuerRef`. `platform-mesh-operator` pushes each new CA to every Provider before Connectors use it; a status-only **`ConnectorCASet`** reports progress ([04](./xxx-notes-011-v5-impl-04-connector-ca.md)). |
 | Provider-side state | **Custom resources in the Provider's cluster** (`Connection`, `OnboardingToken`, `ServerKey` in `provider-sdk.platform-mesh.io`), the only source of truth; the only `Secret`s hold private keys, unless they're in a KMS or HSM. |
 | Portal | **The Kubernetes API on the SDK's resources**, plus a token helper; the quickstart has its own small portal. |
 | E2E | **kind, multi-shard**, with the Provider behind a network boundary, extending `platform-mesh-operator`'s `test/e2e/kind`. |
@@ -91,7 +91,7 @@ Each step names the document and section that owns it; read them in this order t
 2. **The Owner creates a remote `Provider` and a `ProviderOnboardingRequest`** referencing it and the token `Secret`, in either order: [02 APIs, "ProviderOnboardingRequest"](./xxx-notes-011-v5-impl-02-apis.md).
 3. **`platform-mesh-operator` finds the `Provider`**, waiting until it exists: [03 Operator, "Onboarding requests"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md).
 4. **`platform-mesh-operator` bootstraps the Provider Workspace** (workspace, SA, Connection Export binding, Connector RBAC), without a kubeconfig for Remote Providers: [03 Operator, "Reconciling Providers"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md).
-5. **The request registers the Connection** with the Provider-side: generates the Connection Secret, sends its hash and the Connector CA certificates, receives the `connectionID` and Server Keys, and is done (`Registered`): [03 Operator, "Registration"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md); the Provider's side: [07 SDK, "Connection API"](./xxx-notes-011-v5-impl-07-provider-sdk.md); the CA certificates it sends: [04 Connector CA, "ConnectorCABundle"](./xxx-notes-011-v5-impl-04-connector-ca.md).
+5. **The request registers the Connection** with the Provider-side: generates the Connection Secret, sends its hash and the Connector CA certificates, receives the `connectionID` and Server Keys, and is done (`Registered`): [03 Operator, "Registration"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md); the Provider's side: [07 SDK, "Connection API"](./xxx-notes-011-v5-impl-07-provider-sdk.md); the CA certificates it sends: [04 Connector CA, "ConnectorCASet"](./xxx-notes-011-v5-impl-04-connector-ca.md).
 6. **`platform-mesh-operator` makes a first Control Call and writes the `ProviderEndpoint`** into the Provider Workspace through the Connection Export: [03 Operator, "First Control Call and ProviderEndpoint" and "Writing ProviderEndpoints"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md); type and policy: [02 APIs, "ProviderEndpoint" and "Connection export"](./xxx-notes-011-v5-impl-02-apis.md).
 7. **Connectors discover the `ProviderEndpoint` and open Sessions** where needed: [05 Connector, "Discovery" and "Which sessions"](./xxx-notes-011-v5-impl-05-connector.md); the Session handshake: [01 Protocol, "Sessions"](./xxx-notes-011-v5-impl-01-protocol.md); the Provider's side: [07 SDK, "Session server"](./xxx-notes-011-v5-impl-07-provider-sdk.md).
 8. **The Provider's controllers reconcile through the Sessions**: transport and client configs in [07 SDK, "Transport" and "Connections for multicluster-runtime"](./xxx-notes-011-v5-impl-07-provider-sdk.md); the proxy on PM's side in [05 Connector, "Request pipeline"](./xxx-notes-011-v5-impl-05-connector.md); the reference wiring in [08 Quickstart](./xxx-notes-011-v5-impl-08-provider-quickstart.md).
@@ -116,7 +116,7 @@ Every component follows these; the component documents refer back here instead o
 8. **Everything is idempotent and resumable.** Reconcilers converge from any intermediate state; the Provider-side is the source of truth for what it has pinned, and `platform-mesh-operator` reads it back.
 9. **Owners learn nothing about PM's topology.** Owners see aggregate conditions only; shards, hosts and per-shard detail stay in metrics and PM-internal objects.
 10. **One mode, versioned protocol.** Inner TLS is always on; the protocol carries an explicit version so SDK and PM can evolve independently ([01 Protocol, "Versioning"](./xxx-notes-011-v5-impl-01-protocol.md)).
-11. **Signals go to the audience that can act on them.** Owners get conditions and events on their own objects; the PM Administrators get metrics, the `ConnectorCABundle` status and documented alert rules; Providers get SDK notifications. PM has no alerting pipeline today, so the plan ships signals and documented rules, not alerts.
+11. **Signals go to the audience that can act on them.** Owners get conditions and events on their own objects; the PM Administrators get metrics, the `ConnectorCASet` status and documented alert rules; Providers get SDK notifications. PM has no alerting pipeline today, so the plan ships signals and documented rules, not alerts.
 12. **Secrets never appear in logs, events, metrics, conditions or audit bodies.** Prefixed formats (`pm1.`, `pmc1_`) make leaks detectable by scanners.
 
 ## Who writes what
@@ -135,7 +135,7 @@ Clear ownership avoids two controllers fighting over the same fields. "`platform
 | Provider Workspace, SA, binding, Connector RBAC | `platform-mesh-operator` | Connectors |
 | `ProviderEndpoint`, including `pendingSecretHash` | `platform-mesh-operator` | Connectors, the SDK (over Sessions) |
 | Connector CA, Connector Certificates | cert-manager | `platform-mesh-operator` (public certificates, from `CertificateRequest`s), Connectors (their own Connector Certificate) |
-| Trusted Set, `ConnectorCABundle` status | `platform-mesh-operator` | Connectors (switch rule), PM Administrators |
+| Connector CA Set, `ConnectorCASet` status | `platform-mesh-operator` | Connectors (switch rule), PM Administrators |
 | SA tokens | Connectors (TokenRequest) | Connectors only |
 | a Connection's Provider-side state | the SDK | the SDK, portal |
 
