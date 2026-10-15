@@ -165,7 +165,7 @@ It's protected by the inner TLS, so it needs no signature. The Provider-side che
 
 - **yamux** runs inside the inner TLS.
 - **Only the Provider-side opens streams.** The connector refuses streams it didn't expect and never opens any.
-- **Each stream carries plain HTTP/1.1 from its first byte.** The connector checks each request's `Host` against its allow-list before forwarding it ([05 Connector, "Proxying"](./xxx-notes-011-v5-impl-05-connector.md)). The Provider-side uses the target address only to choose which session to open the stream on.
+- **Each stream carries plain HTTP/1.1 from its first byte.** The connector checks each request's `Host` against its allow-list before forwarding it ([05 Connector, "Request pipeline"](./xxx-notes-011-v5-impl-05-connector.md)). The Provider-side uses the target address only to choose which session to open the stream on.
 - **Flow control per stream** is required: a slow reader on one stream must not stall others or force unbounded buffering.
 - **Go-away from either side**: the connector signals graceful replacement with yamux's go-away, and the Provider-side may send it too (e.g. when a connection moves between its replicas). On go-away from the connector, the Provider-side stops opening streams on that session and lets in-flight ones finish.
 - **Liveness**: WebSocket pings at the outer level (so ingresses see traffic), yamux keepalives inside.

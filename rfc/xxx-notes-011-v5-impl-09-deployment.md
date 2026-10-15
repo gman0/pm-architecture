@@ -54,15 +54,13 @@ The control plane is platform-mesh-operator ([03 Operator](./xxx-notes-011-v5-im
 - **Egress to the internet**, for Providers' base URLs.
 - **Configuration**: the `distrust` list of CA fingerprints, from values.
 
-### Connector (providerconnections-vw)
+### Connector
 
-- **One kcp-operator `VirtualWorkspace` per shard**, with `shardRef` (or the root shard reference), rendered by the `providerconnections` chart, one per `kcpTopology` entry. kcp-operator renders the Deployment, Service, serving certificate and kubeconfig identity (the pattern `kcp-access-vw` uses).
-- **`kubeconfigSecretRef` always set**: without it, kcp-operator mounts its privileged logical-cluster-admin credential into the pod.
-- **No front-proxy path mapping**: nobody reaches connectors inbound; they only dial out. The resource's `external` field is required, so it's set to the connector's in-cluster address; nothing routes to it.
+- **One Deployment per shard**, rendered by the `providerconnections` chart, one per `kcpTopology` entry, running the connector image ([05 Connector](./xxx-notes-011-v5-impl-05-connector.md)). No Service and no serving certificate: nothing reaches connectors inbound; they only dial out. The ops endpoints (`/metrics`, health) are cluster-internal.
+- **Its kcp identity from a kcp-operator `Kubeconfig`** per shard, rendered in the same loop: a client certificate for the connectors' group, targeting the front-proxy (`frontProxyRef`), written to a Secret in the namespace of the kcp-operator objects, where the connector runs. kcp-operator regenerates it before it expires; the connector reloads it when the Secret changes. The group is the one platform-mesh-operator uses in the connector RBAC in each provider workspace ([03 Operator, "Connector RBAC"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
 - **Per-shard configuration**, from its `kcpTopology` entry: shard name, its virtual-workspace host, the front-proxy host, and the in-cluster address for each (see "Network").
-- **Connector certificate**: one cert-manager `Certificate` per shard, rendered in the same loop, from the connector CA's `ClusterIssuer` (see "Connector CA" below), mounted into that shard's connector through the `VirtualWorkspace`'s `extraVolumes` and `extraVolumeMounts` ([04 Connector CA, "Connector certificates"](./xxx-notes-011-v5-impl-04-connector-ca.md)).
-- **The connectors' kcp identity**: one group shared by all shards, used in the connector RBAC platform-mesh-operator creates in each provider workspace ([03 Operator, "Connector RBAC"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
-- **Resources**: requests and limits sized from the shard's expected watch count; anti-affinity from the shard's own pods so a burst can't starve the shard.
+- **Connector certificate**: one cert-manager `Certificate` per shard, rendered in the same loop, from the connector CA's `ClusterIssuer` (see "Connector CA" below), mounted into that shard's connector as an ordinary volume ([04 Connector CA, "Connector certificates"](./xxx-notes-011-v5-impl-04-connector-ca.md)).
+- **Replicas, resources, anti-affinity** set directly on the Deployment: requests and limits sized from the shard's expected watch count; anti-affinity from the shard's own pods so a burst can't starve the shard; a PodDisruptionBudget so rollouts keep at least one replica.
 
 ### Connector CA
 
@@ -77,31 +75,24 @@ The same templates serve development and production; nothing about the CA has to
 ## Observability
 
 - **Today in PM**: the `observability` chart runs an OpenTelemetry collector that scrapes `ServiceMonitor`s (kcp, account-operator, security-operator, OpenFGA) into a bundled Prometheus or an external Prometheus-compatible endpoint. There's **no alerting**: Alertmanager and kube-state-metrics are disabled, no chart ships alert rules, and the bundled Prometheus (the community chart, not prometheus-operator) wouldn't read `PrometheusRule`s.
-- **The `providerconnections` chart ships**: metrics endpoints on the connectors, and `ServiceMonitor`s for them, so the existing collector picks them up. The control plane's metrics come from platform-mesh-operator's own metrics endpoint.
+- **The `providerconnections` chart ships**: metrics endpoints on the connectors' ops listener, and `ServiceMonitor`s for them, so the existing collector picks them up. The control plane's metrics come from platform-mesh-operator's own metrics endpoint.
 - **Alert rules are documented**, in the runbook, with expressions and severities ([04 Connector CA, "Signals"](./xxx-notes-011-v5-impl-04-connector-ca.md)). The chart can also render them as a `PrometheusRule` behind a values flag, off by default, for installations running prometheus-operator.
 - **Delivering alerts** (Alertmanager, routing, on-call) is a platform-wide gap outside this plan (see the overview's external dependencies).
 
 ## Network
 
-- **Connectors**: egress to their shard's virtual workspace and the front-proxy in-cluster, and to the internet for Providers. **Map external kcp hosts to in-cluster Services** for the dial while keeping the TLS server name, so traffic doesn't hairpin through PM's load balancer ([05 Connector, "Proxying"](./xxx-notes-011-v5-impl-05-connector.md)).
+- **Connectors**: egress to their shard's virtual workspace and the front-proxy in-cluster, and to the internet for Providers. **Map external kcp hosts to in-cluster Services** for the dial while keeping the TLS server name, so traffic doesn't hairpin through PM's load balancer ([05 Connector, "Request pipeline"](./xxx-notes-011-v5-impl-05-connector.md)).
 - **platform-mesh-operator**: additionally, egress to the internet for Providers.
 - **No new inbound paths** into PM.
 
 ## Dependencies on kcp-operator
 
-Checked against kcp-operator `8994ed7`.
-
-| Need | Status |
-|---|---|
-| Mount the connector certificate Secret | **Supported**: `extraVolumes` and `extraVolumeMounts` |
-| Keep the privileged fallback credential out | **Supported**: not mounted when `kubeconfigSecretRef` is set |
-| Omit cache-server credentials | **Not supported**: mounted whenever a cache server is configured. **Accepted** and documented as part of a compromised connector's blast radius |
-| No inbound address | `external` is required; set to the in-cluster address |
+Checked against kcp-operator `8994ed7`: the connectors' identity comes from a `Kubeconfig` (`operator.kcp.io/v1alpha1`), with a username, groups, a validity and a target of the root shard, a shard or the front-proxy. Nothing else from kcp-operator is needed.
 
 ## Rollout order
 
 1. kcp bootstrap (schemas, exports, RBAC).
-2. The `providerconnections` chart: the connector CA and connectors on every shard.
+2. The `providerconnections` chart: the connector CA, and connectors with their `Kubeconfig`s on every shard.
 3. platform-mesh-operator ([03](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)). It tolerates the connectors' absence either way.
 4. Owners can now create `ProviderOnboardingRequest`s.
 

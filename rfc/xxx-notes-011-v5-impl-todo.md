@@ -22,7 +22,7 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Wo
 - **Per-replica connector certificates** with an external issuer, so no private key is mounted into connectors.
 - **Iterate on the quickstart's portal** once the RFC is implemented: real login, owner notifications from `Connection` Events, more connection detail.
 - **Moving to platform-mesh-deployer** (`operators/platform-mesh-deployer`, unreleased as of 2026-10-12, today used only for kcp in the Tilt dev environment). It changes packaging, not design:
-  - *connectors* become a `per-shard` component in each shard's cluster, a plain workload on the virtual workspace framework with a minted kubeconfig, dropping kcp-operator's `VirtualWorkspace` and its accepted limitations (cache-server credentials);
+  - *connectors* become a `per-shard` component in each shard's cluster, with a minted kubeconfig instead of a kcp-operator `Kubeconfig`;
   - *the control plane* moves with the `Provider` part of platform-mesh-operator once that's its own operator, as a `root-shard` component;
   - *kcp bootstrap* moves to the module workspace `root:modules:providerconnections`; the connection export's home changes, so `ProviderEndpoint`s and bindings are migrated or recreated;
   - *`kcpTopology`* is replaced field for field by the deployer's per-shard context, and profile validation becomes unnecessary;
@@ -38,6 +38,6 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Wo
 - **Profile validation** in platform-mesh-operator: refuse a `providerconnections` shard list that doesn't match `infra`'s.
 - **Alerting**: PM has no alerting pipeline; the plan ships metrics, `ServiceMonitor`s and documented alert rules.
 - **Narrowing the providers export's Secrets claim** with a label selector in PM's bindings, a PM-wide hardening.
-- **Audit policy and retention** for connector traffic.
+- **Retention of the connector's request log**, PM's audit trail for Provider traffic.
 - **Proposing `ServeProxy` upstream** into the virtual workspace framework, instead of the connector's copy.
 - **Possible kcp issue**: impersonation on the APIExport virtual workspace (v5 notes, observation 5). Confirm with an e2e test before reporting it.

@@ -34,7 +34,7 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Ho
 
 | Scenario | Checks |
 |---|---|
-| Consumers on a second shard | A binding on shard B makes shard B's connector open a session; the Provider reconciles consumers on both shards; removing the last binding on shard B closes that session |
+| Consumers on a second shard | A binding on shard B makes shard B's connector open a session; the Provider reconciles consumers on both shards; a watch through the connector stays open for over an hour and ends only when kcp ends it; removing the last binding on shard B closes that session |
 | Connector replica killed | Every replica of the shard holds a session per connection: killing one cuts only the streams on its own sessions, which client-go reopens on the others' sessions at once |
 | Shard connector or virtual workspace down | Only that shard's endpoint traffic stops; with its virtual workspace down, connectors keep the last known `ProviderEndpoint`s and slices |
 | Host rename | A shard's virtual-workspace host changes: the connector lists old and new hosts in its hellos, endpoint slices switch, then the old host is dropped; no session gap in either order of changes, no certificate reissuance |
@@ -84,7 +84,7 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Ho
 
 ## Security tests
 
-- **Provider attempts through a session**: edit or delete its `ProviderEndpoint` (refused by kcp, through the connection export's maximal permission policy), delete the binding, write endpoint-slice status, create a TokenRequest, create an SA-token Secret, make the connector act as any SA other than `default/provider`, create a CSR, `exec`, impersonation headers, requests to another connection's workspace, streams to hosts outside the allow-list. All refused and audited.
+- **Provider attempts through a session**: edit or delete its `ProviderEndpoint` (refused by kcp, through the connection export's maximal permission policy), delete the binding, write endpoint-slice status, create a TokenRequest, create an SA-token Secret, make the connector act as any SA other than `default/provider`, create a CSR, `exec`, impersonation headers, requests to another connection's workspace, streams to hosts outside the allow-list, paths in neither kcp shape. All refused and logged.
 - **Owner attempts**: edit the `ProviderEndpoint` (no rights), point `Provider` status or spec at another workspace (ignored by platform-mesh-operator), read a connection secret (none in the owner's workspace).
 - **Stolen connection secret**: used against the Provider-side to push a bundle with a foreign CA. platform-mesh-operator detects it, restores the bundle, changes the secret through the `ProviderEndpoint` and records an event on the `Provider`; the stolen secret is refused afterwards. No call lets the thief change the secret.
 - **Stolen onboarding token or portal account**: registers only a new, separate connection that receives no sessions from PM; it can't change an existing connection's secret or bundle.

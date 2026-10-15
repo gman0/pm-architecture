@@ -1,13 +1,13 @@
 # v5 implementation plan: connector
 
-Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). The **data plane**: a new service at `platform-mesh/services/providerconnections-vw`, built on the virtual workspace framework, one per kcp shard, deployed as a kcp-operator `VirtualWorkspace` with `shardRef` ([09 Deployment, "Connector (providerconnections-vw)"](./xxx-notes-011-v5-impl-09-deployment.md)). It opens sessions to Providers and proxies their requests to kcp with each connection's SA token.
+Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). The **data plane**: a new service at `platform-mesh/services/providerconnections-connector`, a standalone proxy server modelled on kcp's front-proxy, one per kcp shard, deployed as a plain Deployment ([09 Deployment, "Connector"](./xxx-notes-011-v5-impl-09-deployment.md)). It opens sessions to Providers and proxies their requests to kcp with each connection's SA token.
 
 ## Responsibilities
 
 **Owns:**
 - deciding which sessions its shard needs, and opening, keeping and replacing them;
 - the PM end of the session protocol ([01 Protocol, "Sessions"](./xxx-notes-011-v5-impl-01-protocol.md));
-- authenticating, authorizing, auditing and proxying every request that arrives over a session;
+- authorizing, logging and proxying every request that arrives over a session;
 - minting and caching SA tokens.
 
 **Doesn't own:**
@@ -19,32 +19,40 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Th
 
 - **Stateless** (overview, principle 5): everything comes from its deployment (shard name, its virtual-workspace host, the front-proxy host, its connector certificate) and the connection export.
 - **The Provider's only path into kcp**: whatever it allows, the Provider can do; the policy is the security guarantee and is tested as such ([10 Testing](./xxx-notes-011-v5-impl-10-testing.md)).
-- **kcp's serving stack, not a hand-written proxy**: authentication, authorization, audit, timeouts, limits and metrics come from the generic handler chain.
+- **A standalone proxy, like kcp's front-proxy** (`kcp/pkg/proxy`): its own `http.Server`, a few filters taken from upstream `k8s.io/apiserver` (`WithRequestInfo`, `WithPanicRecovery`, `WithHTTPLogging`), and `httputil.ReverseProxy`. No generic apiserver.
+- **kcp owns request timeouts.** The connector applies none of its own to proxied requests and has no shared in-flight cap; its limits are per connection (see "Limits").
 - **Forward bytes, don't decode objects.** The connector never parses response bodies.
 
 ## Structure
 
 ```
- providerconnections-vw @ shard (one process per replica)
- ┌───────────────────────────────────────────────────────────────────────────────┐
- │ session controller (post-start hook)                                          │
- │   discovery: connection export (ProviderEndpoints, claimed endpoint slices)   │
- │   decides sessions for this shard; every replica serves every connection     │
- │   dials WebSocket → inner mutual TLS → hello → yamux (Provider opens streams) │
- │                     │                                                         │
- │                     ▼                                                         │
- │ in-process listener per session, tagged with connectionID                     │
- │   full handler chain: authn → authz → audit → timeouts → limits               │
- │     authn: session authenticator (connection principal from the tag)          │
- │     authz: own connection's paths only + denylist                             │
- │   providerconnections handler: check Host, strip credentials, add SA token,   │
- │     map host, reverse-proxy → this shard's virtual workspace or front-proxy   │
- └───────────────────────────────────────────────────────────────────────────────┘
+ connector @ shard (Deployment, one process per replica, stateless)
+ ┌──────────────────────────────────────────────────────────────────────────────────┐
+ │ Session manager (controller)                                                     │
+ │   watches the connection export: ProviderEndpoints + claimed endpoint slices     │
+ │   session rule → which connections need a session from this shard                │
+ │   dials WebSocket → inner mutual TLS → hello → yamux (Provider opens streams)    │
+ │   replaces sessions, honours go-away, backoff, certificate switch rule           │
+ │                                     │ yamux streams                              │
+ │                                     ▼                                            │
+ │ Stream server: one http.Server, a listener per session yielding its streams      │
+ │   ConnContext: connectionID, clusterName; header-read timeout, max header size   │
+ │                                     ▼                                            │
+ │ Request pipeline                                                                 │
+ │   recover → limits → Host check → parse path → authorize → strip headers         │
+ │   → SA token → log + metrics → reverse proxy                                     │
+ │                                     ▼                                            │
+ │                  this shard's virtual workspace / front-proxy                    │
+ │                                                                                  │
+ │ Ops listener (cluster-internal): /metrics, /healthz, /readyz; nothing else       │
+ └──────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+Nothing reaches the connector from the network except the ops listener: it dials out to Providers and serves streams on in-process listeners.
 
 ## Discovery
 
-- **Consumes the connection export's endpoint slice** through the front-proxy, and list/watches through every shard's virtual-workspace URL in it, with read-only `apiexports/content`.
+- **Consumes the connection export's endpoint slice** through the front-proxy, and list/watches through every shard's virtual-workspace URL in it, with read-only `apiexports/content`, using multicluster-runtime's endpoint-slice provider.
 - **Sees two things**:
   - `ProviderEndpoint`s, each arriving with its provider workspace's logical cluster; the endpoint that delivered it tells which shard hosts the workspace;
   - the provider workspaces' Service `apiexportendpointslices`, through the export's permission claim.
@@ -63,7 +71,7 @@ The rule follows kcp's own: a shard is listed in a slice exactly when it has a c
 Every replica of a shard's connector applies the session rule on its own and keeps a session for every connection the shard needs. Replicas don't know about each other.
 - **Why it works**: sessions aren't exclusive. A connection has one session per replica per shard, and the Provider-side spreads new streams across all sessions serving a host ([01 Protocol, "Sessions and streams"](./xxx-notes-011-v5-impl-01-protocol.md)).
 - **What replicas are for**: availability, and spreading traffic. A crashed replica cuts only the streams on its own sessions; client-go reopens them on the other replicas' sessions at once. Rollouts go one replica at a time without a gap: a leaving replica sends go-away and drains. Requests and watches spread over the replicas, so each carries about an R-th of the shard's traffic.
-- **What it costs**: every replica holds a session for every connection, so a Provider sees up to R sessions per (connection, shard), where R is the replica count (typically 2–3); [07 SDK, "Requirements on Providers"](./xxx-notes-011-v5-impl-07-provider-sdk.md) says so. Each replica also mints its own SA tokens.
+- **What it costs**: every replica holds a session for every connection, so a Provider sees up to R sessions per (connection, shard), where R is the replica count (typically 2–3); the quickstart's edge checklist says so ([08 Quickstart, "Connection server"](./xxx-notes-011-v5-impl-08-provider-quickstart.md)). Each replica also mints its own SA tokens.
 - **Scale-up** opens the new replica's sessions spread with jitter, so Providers aren't hit at once.
 - **If session counts at Providers ever matter more** than spreading traffic, replicas can divide connections by rendezvous hashing of `connectionID` over the live replicas instead. That's a contained change inside the connector: no protocol, SDK or API change, and a rollout between the two is harmless because sessions aren't exclusive.
 
@@ -90,89 +98,101 @@ cert-manager renews the connector certificate every 12 hours, for 24 hours each 
 
 ## Serving streams
 
-- **Hand the stream to an in-process HTTP server** whose connection context carries the session's `connectionID`. Streams carry HTTP/1.1 from their first byte; there's nothing to read before. The server's handler is its **full handler chain**, not the virtual workspace handler alone.
-- **Path rewriting**: the server prefixes the request path with `/services/providerconnections/<connectionID>`, keeping `Host`, so the virtual workspace framework routes it.
-- **Header limits** per request apply as for any HTTP server, so reading a request's headers before its `Host` is checked stays bounded.
+- **One `http.Server`** serves all streams. Each session is a listener that yields its yamux streams; `ConnContext` puts the session's `connectionID` and `clusterName` into every request's context. Streams carry HTTP/1.1 from their first byte; there's nothing to read before.
+- **That context is the caller's identity.** Only these in-process listeners set it, so nothing arriving from the network can carry it, and there's nothing else to authenticate.
+- **A header-read timeout and a maximum header size** on the server, so reading a request's headers before its `Host` is checked stays bounded and a Provider can't hold streams by sending headers slowly.
 
-## Authentication
+## Request pipeline
 
-A session authenticator in the server's authenticator union:
-- maps the `connectionID` from the connection context to the **connection principal** (e.g. `pm:connection:<id>`);
-- only in-process listeners set that context; requests from the network never carry it.
+Plain `http.Handler` wrappers, in order, the way kcp's front-proxy builds its handler:
+1. **Recover** from panics (`WithPanicRecovery`).
+2. **Limits** (see "Limits").
+3. **Check `Host`** against the allow-list: this shard's virtual-workspace host and the front-proxy host, from the connector's deployment configuration. It's the same list for every connection; anything else is refused. This is the only target check: the stream carries no separate target.
+4. **Parse the path** (see "Path parsing").
+5. **Authorize** (see "Authorization and policy").
+6. **Strip credentials and identity headers**: `Authorization`, `Impersonate-*`, `Proxy-*`, cookies, hop-by-hop headers, and kcp-internal headers such as `X-Kcp-Virtual-Resource-Hops`.
+7. **Add the SA token** for the connection (see "Identity towards kcp").
+8. **Log and count** the request (see "Observability").
+9. **Reverse-proxy** with `httputil.ReverseProxy`:
+   - **map the external host to an in-cluster address** for the dial, keeping `Host` and the TLS server name, so traffic doesn't hairpin through PM's load balancer ([09 Deployment, "Network"](./xxx-notes-011-v5-impl-09-deployment.md));
+   - **forward over TLS** verified with PM's own trust for kcp; resolve once, dial the checked address;
+   - **stream the response** with immediate flushing, so watches and LISTs pass through without buffering;
+   - **buffers**: a small copy buffer per stream, and a cap on the upstream HTTP/2 receive buffer per stream, so a slow Provider's backlog stays upstream.
+
+## Path parsing
+
+Two kcp path shapes, parsed explicitly:
+- **`/clusters/<cluster>/…`**, the provider workspace through the front-proxy;
+- **`/services/apiexport/<cluster>/<export>/clusters/<cluster or *>/…`**, the APIExport virtual workspace.
+
+The `/clusters/<cluster>` part is stripped by a copy of kcp's `ClusterPathFromAndStrip` (`kcp/pkg/server/filters/filters.go`, about 20 lines, with a comment naming its origin), and cluster names are checked with `kcp-dev/logicalcluster`. The rest of the path goes to upstream `k8s.io/apiserver`'s `RequestInfoFactory` (`pkg/endpoints/request`, imported, not kcp's fork), which gives verb (`get`, `list`, `watch`, `deletecollection`, …), group, resource, subresource, namespace and name. Anything that doesn't parse is refused.
 
 ## Authorization and policy
 
-The virtual workspace's authorizer, for the connection principal:
-- **Scope**: only its own connection's paths, i.e. its provider workspace through the front-proxy (`/clusters/<its clusterName>/…`), and the APIExport virtual-workspace endpoints of exports in that workspace. Both kcp path shapes are parsed explicitly.
+For the request's connection:
+- **Scope**: only its own connection's paths, i.e. its provider workspace through the front-proxy (`/clusters/<its clusterName>/…`), and the APIExport virtual-workspace endpoints of exports in that workspace.
 - **Denylist** (v5, "Connector policy"):
   - `update`, `patch`, `delete` on the connection export's APIBinding;
   - writes to `apiexportendpointslices/status`;
   - `create` on `serviceaccounts/token`;
   - `create` on `certificatesigningrequests` and their approval;
   - upgrade requests (`exec`, `attach`, `port-forward`);
-  - **Secrets of type `kubernetes.io/service-account-token`**: kcp issues tokens for them (platform-mesh-operator uses them today for local Providers), so creating or updating such a Secret is a token-minting path. The authorizer can't see a body's type, so the proxy handler inspects Secret writes (create, update, patch, server-side apply) before forwarding and refuses that type;
+  - **Secrets of type `kubernetes.io/service-account-token`**: kcp issues tokens for them (platform-mesh-operator uses them today for local Providers), so creating or updating such a Secret is a token-minting path. The type is in the body, so Secret writes (create, update, patch, server-side apply) are inspected before forwarding and that type is refused;
   - `create` on `workspaces` below the provider workspace: not needed to reconcile an APIExport, and avoids unbounded workspaces under `:root:providers`.
 - **`ProviderEndpoint`s are not in the denylist**: kcp's maximal permission policy already makes them read-only ([02 APIs, "Connection export"](./xxx-notes-011-v5-impl-02-apis.md)).
-- **Denials are audited** with the connection principal.
-
-## Proxying
-
-For each authorized request:
-1. **Check `Host`** against the allow-list: this shard's virtual-workspace host and the front-proxy host, from the connector's deployment configuration. It's the same list for every connection; anything else is refused. This is the only target check: the stream carries no separate target.
-2. **Strip credentials and identity headers**: `Authorization`, `Impersonate-*`, `Proxy-*`, cookies, hop-by-hop headers.
-3. **Add the SA token** for the connection (see "Identity towards kcp").
-4. **Map the external host to an in-cluster address** for the dial, keeping `Host` and the TLS server name, so traffic doesn't hairpin through PM's load balancer ([09 Deployment, "Network"](./xxx-notes-011-v5-impl-09-deployment.md)).
-5. **Forward over TLS** verified with PM's own trust for kcp; resolve once, dial the checked address.
-6. **Stream the response** without buffering; watches and LISTs pass through with immediate flushing.
-
-Settings that matter:
-- **Long-running requests and timeouts**: classify watches and proxied LISTs as long-running, or raise their timeout, so the generic chain's default doesn't cut them.
-- **Buffers**: a small copy buffer per stream, and a cap on the upstream HTTP/2 receive buffer per stream, so a slow Provider's backlog stays upstream ([10 Testing, "Load"](./xxx-notes-011-v5-impl-10-testing.md)).
-- **Hop budget**: confirm the extra hop's effect on `X-Kcp-Virtual-Resource-Hops`.
+- **Plain Go functions** on the parsed request and its connection, independent of how they're wired into the server, so they're tested on their own.
+- **Denials are logged** with the connection and the rule.
 
 ## Identity towards kcp
 
 - **SA tokens**: each replica mints tokens for the fixed admin SA `default/provider` in the provider workspace of every connection it has sessions for, with TokenRequest through the front-proxy, caches them in memory, refreshes at half their lifetime, and never writes or sends them anywhere else.
-- **The connector's own identity** comes from the `VirtualWorkspace`'s `kubeconfigSecretRef`, which must always be set: without it, kcp-operator mounts its privileged logical-cluster-admin credential into the pod. All shards' connectors share **one group**. The identity needs:
+- **The connector's own identity** comes from a kcp-operator `Kubeconfig` per shard ([09 Deployment, "Connector"](./xxx-notes-011-v5-impl-09-deployment.md)): a client certificate for **one group** shared by all shards' connectors. The identity needs:
   - read-only `apiexports/content` on the connection export;
   - in every provider workspace, `access` and `create` on `serviceaccounts/token` for that one SA (`resourceNames: [provider]`), granted by platform-mesh-operator ([03 Operator, "Connector RBAC"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
 - **In the runtime cluster**: read access to the `ConnectorCABundle` (public data, for the switch rule) and its own connector certificate Secret. Nothing else.
-- **No `Shard` objects, no `/services/admin`.** The connector doesn't use the cache server, but kcp-operator mounts cache-server credentials into every `VirtualWorkspace` when a cache server is configured, as in PM. **Accepted and documented** as part of a compromised connector's blast radius ([09 Deployment, "Dependencies on kcp-operator"](./xxx-notes-011-v5-impl-09-deployment.md)).
+- **No `Shard` objects, no `/services/admin`, no cache server.**
 
 ## Egress to Providers
 
 - Dial only base URLs from `ProviderEndpoint`s; apply the same rules as platform-mesh-operator ([03 Operator, "Egress"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)): `https`, public addresses, resolve once, no redirects.
-- Network policy allows the connector outbound internet access and in-cluster access to its virtual workspace and the front-proxy, nothing else ([09 Deployment](./xxx-notes-011-v5-impl-09-deployment.md)).
+- Network policy allows the connector outbound internet access and access to its virtual workspace and the front-proxy, nothing else ([09 Deployment](./xxx-notes-011-v5-impl-09-deployment.md)).
 
 ## Limits
 
-Per connection: concurrent streams, request rate, header sizes, in-flight requests. One Provider must not exhaust a connector for others. The limits apply per replica, so a connection's effective limit is R times the configured one; configured values account for that.
+- **Per connection**: concurrent streams, request rate, header sizes, in-flight requests. One Provider must not exhaust a connector for others. The limits apply per replica, so a connection's effective limit is R times the configured one; configured values account for that.
+- **Per replica**: a ceiling on total streams, to protect the replica's memory.
+- **No request timeouts**: kcp applies its own to every request, with the SA's identity; a second, shorter one in the connector would only cut watches and large LISTs.
 
 ## Observability
 
-- **Metrics**: sessions per state, streams per session, requests by connection and outcome (via `apiserver_request_*`), denials by rule, token mint outcomes, buffer pressure, and the connector certificate's expiry and how long a renewed one has waited ([04 Connector CA, "Signals"](./xxx-notes-011-v5-impl-04-connector-ca.md)). Scraped through a `ServiceMonitor` like PM's other components ([09 Deployment, "Observability"](./xxx-notes-011-v5-impl-09-deployment.md)).
+- **Metrics**, the connector's own Prometheus collectors: sessions per state, streams, requests by outcome, latency, denials by rule, token mint outcomes, buffer pressure, and the connector certificate's expiry and how long a renewed one has waited ([04 Connector CA, "Signals"](./xxx-notes-011-v5-impl-04-connector-ca.md)). **No `connectionID` labels**: with thousands of connections they'd explode cardinality; per-connection detail is in the logs. Documented alert rules use only these metrics. Scraped through a `ServiceMonitor` like PM's other components ([09 Deployment, "Observability"](./xxx-notes-011-v5-impl-09-deployment.md)).
+- **Request log**: one structured line per request with the connection, the SA it acted as, verb, path, outcome and latency; metadata only, never bodies. This is the connector's audit trail.
 - **Readiness** reflects an expired connector certificate, so rollout tooling can hold.
 - **Audience**: the people running the PM installation. Owners see their connections' state on `Provider` conditions ([03 Operator, "Health"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)); Providers see theirs through the SDK.
-- **Audit**: every request with the connection principal and the SA it acted as; at metadata level, never bodies.
 - **Logs**: no tokens.
 
 ## Work breakdown
 
-1. Service scaffold on the virtual workspace framework (reusing patterns from `services/virtual-workspaces` and kcp's initializing-workspaces virtual workspace, including a copy of its proxy helper).
+1. Service scaffold: `http.Server`, ops listener, configuration, following kcp's front-proxy (`kcp/pkg/proxy`).
 2. Discovery and the session rule.
-3. Session client: WebSocket, inner mutual TLS with pinning, hello, yamux, replacement; the certificate switch rule.
-4. Stream serving: in-process listener, context tagging, path rewriting.
-5. Authenticator, authorizer, denylist, Secret-type inspection.
-6. Proxy handler: header stripping, token injection, host mapping, streaming, settings.
+3. Session manager: WebSocket, inner mutual TLS with pinning, hello, yamux, replacement; the certificate switch rule.
+4. Stream server: a listener per session, `ConnContext`, header limits.
+5. Path parsing; authorization, denylist, Secret-type inspection.
+6. Proxy: header stripping, token injection, host mapping, streaming, buffers.
 7. Token cache.
-8. Limits, metrics, audit configuration.
+8. Limits, metrics, request log.
 9. Unit tests for the rules above, including the protocol's test vectors and the refusals.
 
 ## Decided
 
+- **A standalone proxy server**, modelled on kcp's front-proxy; no generic apiserver, no request timeouts of its own, limits per connection.
+- **Path parsing**: a copy of kcp's `ClusterPathFromAndStrip`, then upstream `RequestInfoFactory`.
 - **Replicas**: every replica serves every connection its shard needs; rendezvous hashing over replicas remains an option if session counts at Providers ever matter more.
-- **Connector certificate mount**: through the `VirtualWorkspace`'s `extraVolumes` and `extraVolumeMounts` ([09 Deployment, "Connector (providerconnections-vw)"](./xxx-notes-011-v5-impl-09-deployment.md)).
+- **Deployment**: a plain Deployment per shard, its identity from a kcp-operator `Kubeconfig`, the connector certificate as an ordinary volume ([09 Deployment, "Connector"](./xxx-notes-011-v5-impl-09-deployment.md)).
 - **Workspace creation** below the provider workspace: denied.
-- **Connector identity**: one group for all shards; `kubeconfigSecretRef` always set.
-- **Cache-server credentials**: accepted, documented.
+- **Connector identity**: one group for all shards.
 - **Where Service endpoint slices live**: a stated requirement for Providers: in the provider workspace, for exports in that workspace ([07 SDK](./xxx-notes-011-v5-impl-07-provider-sdk.md), [08 Quickstart](./xxx-notes-011-v5-impl-08-provider-quickstart.md)).
+
+## Declined
+
+- **A virtual workspace on kcp's virtual workspace framework**, deployed as a kcp-operator `VirtualWorkspace`. For a proxy, the generic handler chain's timeouts and shared in-flight limits would have to be switched off (its default resolver doesn't recognise `/clusters/…` or `/services/apiexport/…` as resource requests, so watches would be cut after 60 seconds and hold in-flight slots); it would need a session authenticator and path rewriting just to fit the framework, and tie the connector to kcp's Kubernetes version. The `VirtualWorkspace` resource would render a Service, serving certificate and `external` address nobody uses, and mount cache-server credentials. kcp's own front-proxy is the better model.
