@@ -166,6 +166,7 @@ Per connection: concurrent streams, request rate, header sizes, in-flight reques
 6. Proxy handler: header stripping, token injection, host mapping, streaming, settings.
 7. Token cache.
 8. Limits, metrics, audit configuration.
+9. Unit tests for the rules above, including the protocol's test vectors and the refusals.
 
 ## Decided
 

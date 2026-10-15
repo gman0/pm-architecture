@@ -40,6 +40,8 @@ What Providers pin. platform-mesh-operator keeps no state for it: everything is 
 | **Drop time of CR(n−1)'s CA, per connection** | CR(n)'s creation time + 48 hours + a spread of up to 6 hours derived from the `connectionID`. By then every connector has switched, and spreading the drop spreads the handovers it causes (see "Rollover") |
 | **PM's unexpired CAs**, for the tamper check | the retained requests' certificates that haven't expired |
 
+**Only valid CAs enter the trusted set.** Each certificate must parse, be a CA, be able to sign and be unexpired; one that isn't is never pushed, and is reported as `Valid=False` on the `ConnectorCABundle` (see "Signals").
+
 **At most two of PM's CAs are unexpired at once**: each lives a year and is renewed 90 days before it expires, so the predecessor stays valid for 90 days after a renewal. Keeping three requests leaves a spare for a forced extra renewal.
 
 **The tamper check only cares about unexpired CAs.** A pinned CA that's unexpired and isn't one of PM's unexpired CAs can only have come from someone holding the connection secret. An expired pinned CA verifies nothing, so it's never tampering; the push just replaces it. So a short history is enough: a Provider returning after a long absence pins only expired CAs of PM's.
@@ -145,7 +147,8 @@ For the **people running the PM installation** (owners and Providers never see t
 2. Chart templates: the CA `Certificate` and its issuer (self-signed or `issuerRef`), the CA `ClusterIssuer`, per-shard connector `Certificate`s, the `distrust` configuration ([09 Deployment](./xxx-notes-011-v5-impl-09-deployment.md)).
 3. platform-mesh-operator: watching the CA's `CertificateRequest`s, deriving the trusted set, drop times and unexpired CAs from them, the `ConnectorCABundle` status ([03 Operator](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
 4. Connector: the switch rule ([05 Connector](./xxx-notes-011-v5-impl-05-connector.md)).
-5. Runbooks: what the `ConnectorCABundle` status means, connections not reached, compromise, an expired connector certificate (what ends open sessions, what can't start), the CA's `CertificateRequest`s (don't delete them; with approver-policy, the policy must allow them), with the documented alert rules from "Signals".
+5. Unit tests for the rules above, and chart-output tests for the templates.
+6. Runbooks: what the `ConnectorCABundle` status means, connections not reached, compromise, an expired connector certificate (what ends open sessions, what can't start), the CA's `CertificateRequest`s (don't delete them; with approver-policy, the policy must allow them), with the documented alert rules from "Signals".
 
 ## Decided
 

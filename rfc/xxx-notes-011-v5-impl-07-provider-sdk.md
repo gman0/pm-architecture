@@ -260,7 +260,8 @@ Documented for Provider authors ([08 Quickstart, "Documentation for Provider aut
 8. The SDK's controllers: `Connection` (finalizer, `Ready`, `lastSeen`, orphan expiry, Events), `OnboardingToken` (garbage collection), `ServerKey` (generation, signers, checks); the `ProviderEndpoint` watch (`pendingSecretHash`, `serverKeys`); status.
 9. Framing enforcement.
 10. Fake PM side and test server.
-11. Documentation for Provider authors, including the requirements on consumer data and the administration runbooks.
+11. Unit tests for the rules above, with envtest and the protocol's test vectors.
+12. Documentation for Provider authors, including the requirements on consumer data and the administration runbooks.
 
 ## Releases and protocol versions
 

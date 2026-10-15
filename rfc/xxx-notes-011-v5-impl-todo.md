@@ -21,6 +21,7 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Wo
 - **Suspending a connection without deleting it**, if Providers need it: a field on the `Connection` that takes it out of the registry (its controllers disengage, sessions and upkeep continue), reported in the status `GET` so platform-mesh-operator can show it to the owner.
 - **Per-replica connector certificates** with an external issuer, so no private key is mounted into connectors.
 - **Iterate on the quickstart's portal** once the RFC is implemented: real login, owner notifications from `Connection` Events, more connection detail.
+- **Load tests of the connector**, the second, lighter hop in front of the APIExport virtual workspace (v5, "Load"). For one shard's connector at a realistic watch count: memory and goroutines per idle watch, compared with the APIExport virtual workspace's; peak memory per stream with a slow reader, with and without the HTTP/2 and multiplexer caps; CPU per GB proxied; cost per session.
 - **In-band rotation of a private outer CA**, if Providers with many owners on private CAs need it: the Provider-side announces a new CA in the status `GET` (protected by the inner TLS), and platform-mesh-operator adds it to the `ProviderEndpoint`'s `caBundle`, so owners don't have to update theirs. Until then, rotation is out-of-band.
 
 ## Outside this plan

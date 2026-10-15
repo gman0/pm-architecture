@@ -916,11 +916,11 @@ Detailed decisions are in the [implementation plan](./xxx-notes-011-v5-impl-00-o
 - **Outer TLS to base URLs**: web PKI, or the `Provider`'s `caBundle`, copied into the `ProviderEndpoint` for connectors; rotating a private CA is out-of-band, by the owner ([02 APIs](./xxx-notes-011-v5-impl-02-apis.md)).
 - **Egress rules**: `https` only, public addresses only, resolve once and dial the checked addresses, no redirects, for the controller and the connectors alike ([03 Operator](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
 
-**Still to confirm** (by the plan's tests, [10 Testing](./xxx-notes-011-v5-impl-10-testing.md)):
-- **Maximal permission policy** on writes through the APIExport virtual workspace with only the prefixed-user grant, and refusal for a provider-workspace admin (observation 8).
-- **The permission claim** on `apiexportendpointslices` is readable through the connection export.
-- **SA-token Secrets**: that kcp issues tokens for them, and that the inspection blocks every write form.
-- **Sizing the second hop**: memory and goroutines per watch on the connector against the APIExport virtual workspace's, and cost per session (load tests).
+**Still to confirm** (by the plan's E2E and security tests, [10 Testing](./xxx-notes-011-v5-impl-10-testing.md), unless noted):
+- **Maximal permission policy** on writes through the APIExport virtual workspace with only the prefixed-user grant (every onboarding), and refusal for the Provider (the security tests) (observation 8).
+- **The permission claim** on `apiexportendpointslices` is readable through the connection export (consumers on a second shard).
+- **SA-token Secrets**: the connector's inspection blocks every write form (the security tests).
+- **Sizing the second hop**: memory and goroutines per watch on the connector against the APIExport virtual workspace's, and cost per session; load tests are a [follow-up](./xxx-notes-011-v5-impl-todo.md).
 - **Transport check**: `http.Transport` with a `DialTLSContext` returning a non-TLS stream speaks HTTP/1.1 to `https://` URLs, and client-go accepts it with multicluster-runtime's per-endpoint configs.
 - **Proxied requests in the generic handler chain**: the long-running check and timeouts for proxied LISTs and watches, and the `X-Kcp-Virtual-Resource-Hops` budget.
 - **multicluster-runtime composition**: adding and removing per-connection providers at runtime with prefixed cluster names.

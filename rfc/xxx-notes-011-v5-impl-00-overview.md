@@ -17,7 +17,7 @@ Start here, then follow the walkthrough below, or jump to a component.
 | [07 Provider SDK](./xxx-notes-011-v5-impl-07-provider-sdk.md) | The Provider-side library: connection API, its resources (`Connection`, `OnboardingToken`, `ServerKey`), session server, transport, lifecycle |
 | [08 Provider quickstart](./xxx-notes-011-v5-impl-08-provider-quickstart.md) | The reference Provider in pm-provider-quickstart |
 | [09 Deployment](./xxx-notes-011-v5-impl-09-deployment.md) | Charts, kcp bootstrap manifests, kcp-operator and cert-manager resources, network, rollout |
-| [10 Testing](./xxx-notes-011-v5-impl-10-testing.md) | Unit, integration, multi-shard kind e2e, security and load tests |
+| [10 Testing](./xxx-notes-011-v5-impl-10-testing.md) | Unit tests per component, multi-shard kind e2e, security tests; load tests as a follow-up |
 | [Follow-ups](./xxx-notes-011-v5-impl-todo.md) | Work that can be done separately: cleanups, larger follow-ups, items outside this plan |
 
 ## Decisions taken
@@ -149,7 +149,7 @@ Single delivery, but the pieces depend on each other. Suggested order, with what
 3. **Connector CA** ([04](./xxx-notes-011-v5-impl-04-connector-ca.md)) and **kcp bootstrap** of the connection export ([09](./xxx-notes-011-v5-impl-09-deployment.md)).
 4. **platform-mesh-operator** ([03](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)) and **connector** ([05](./xxx-notes-011-v5-impl-05-connector.md)), in parallel; they meet only at the `ProviderEndpoint` and the protocol.
 6. **Quickstart** ([08](./xxx-notes-011-v5-impl-08-provider-quickstart.md)).
-7. **Deployment** ([09](./xxx-notes-011-v5-impl-09-deployment.md)) and **e2e, security and load tests** ([10](./xxx-notes-011-v5-impl-10-testing.md)).
+7. **Deployment** ([09](./xxx-notes-011-v5-impl-09-deployment.md)) and **e2e and security tests** ([10](./xxx-notes-011-v5-impl-10-testing.md)).
 
 ## Deployment target
 

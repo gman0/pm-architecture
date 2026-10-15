@@ -7,76 +7,84 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Ho
 - **The protocol has one set of test vectors**, used by both the SDK and the PM-side ([01 Protocol, "Deliverables"](./xxx-notes-011-v5-impl-01-protocol.md)).
 - **Security guarantees are tested as negative cases**: what must be refused is enumerated and checked, for every verb and both kcp path shapes.
 - **E2E runs with a real network boundary**: PM can't reach the Provider except through its base URL, and the Provider can't reach PM at all.
-- **Every row of v5's failure table has a test.**
+- **Every row of v5's failure table has a test**, at the level that fits: a unit test for a component's own reaction, an E2E scenario when components or the network are involved, a security test for an attack.
 
 ## Unit tests
 
-| Component | Focus |
-|---|---|
-| SDK ([07](./xxx-notes-011-v5-impl-07-provider-sdk.md)) | Inner mutual TLS against the vectors (client certificates only issued directly by a pinned CA, with `clientAuth`; pinned server keys); the hello's `clusterName` check; handshake limits and timeouts, unknown connection IDs refused before the upgrade; control sessions closed on the first failed authentication; random connection IDs; token issuing and spending; idempotent registration; adopting `pendingSecretHash` only from the `ProviderEndpoint`, read over a valid session, and never through a call; bearer check against the current hash only; connector CA bundle parsing against the vectors (malformed PEM, other block types, PEM headers, text between blocks, duplicates, non-CA certificates, size limits) and compare-and-swap (`412` on a missing or stale `If-Match`, the same set of certificates in any order a no-op), accepted even when every pinned CA has expired; on a bundle change, sessions whose certificate no longer chains get go-away and are closed after the grace period, while expired-but-chaining ones and bundles that only add CAs close nothing; registration retries honoured for the whole window, and orphaned connections expired after it, never used ones only; server key choice from `listedServerKeys` (newest announced key listed), none presented past `retireAt`; key generation only while `publicKey` is empty, and each `ServerKey` `Ready` reason (`SignerUnavailable`, `KeyMissing`, `KeyMismatch` after a signer returns a different public key on restart); deleting a `Connection` by the portal, `kubectl`, PM's `DELETE` and orphan expiry all behave the same (sessions closed, registry left, `Removed`); a `kubectl` re-pin re-checks sessions like a push; a token can't be spent twice, and tokens are garbage-collected at expiry and after the retry window; `Connection` `Ready` reports failures only after the debounce, and doesn't flip on a failover; `lastSeen` written at most hourly; Events for each change; metrics for authentication failures, refused bundles, closed sessions, refused handshakes and `providersdk_server_key_connections` during a rotation, without `connectionID` labels; all against real CRDs with envtest |
-| platform-mesh-operator, onboarding and connections ([03](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)) | The oldest-request rule; the request's phases (`Pending → Registering → Registered`, `Failed` only before registration succeeds) and the `Provider` decision table, including a new registration only on a definite "unknown connection", a request created before its `Provider` waiting for it, and a `Provider` left by a failed onboarding used by the next request; write-before-send and resume after a crash at each step, including between `POST` and persisting its result, and between the first control call and the `ProviderEndpoint`; the `ProviderEndpoint` written from the `ProviderEndpointRegistration`, its Secret and the `Provider`'s `caBundle`, and a deleted `ProviderEndpointRegistration` rebuilt from the `ProviderEndpoint`; the `EdgeTLS` label; `connectionID`, base URL and server keys persisted in one write, never only in memory; the `ProviderEndpoint` written only after a first successful control call; token data deleted only after the result is persisted, never before; `ProviderEndpointRegistration`s and their Secrets only in its own namespace, no Secret informers in kcp; edge-failure classification for each reason (non-`101`, HTML challenge page, close after a binary message, regular idle or age cuts); a re-applied spent token is ignored; the secret-change state machine and its triggers, with the repair rate limit; the trusted set derived from the CA's `CertificateRequest`s (a new CA added after validation; the previous one dropped per connection within the spread after 48 hours, or at once when distrusted), and a restart deriving the same result; push decisions by fingerprint, `412` handling, the catch-up push on the first successful control call, and the tamper response (an unexpired CA that isn't one of PM's unexpired CAs → restore, change secret, report; an expired pinned CA, whoever issued it, isn't tampering; with the `CertificateRequest`s deleted, a Provider pinning the predecessor takes the harmless tamper path); convergence counting only reached connections; never giving up on an unreachable connection; condition aggregation; egress rules |
-| Connector ([05](./xxx-notes-011-v5-impl-05-connector.md)) | Certificate switch rule (same CA: at once; new CA: once converged, or with less than an hour left), replacing no session; session rule (`ProviderEndpoint`s, slices, same-workspace exports only), applied by each replica on its own; per-connection limits per replica; sending the hello; `Host` checks against the allow-list on every request; authorizer scope and denylist for both path shapes; Secret-type inspection for SA-token Secrets; header stripping |
-| platform-mesh-operator, `Provider`s ([03](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)) | The remote steps in order (`Workspace`, `ConnectionBinding`, `ConnectorAccess`, `Registered`, `Connected`), each only after the previous one is done; no token Secret or kubeconfig; conditions and labelled messages for each failure; `phase` from the conditions for both kinds, `Degraded` only after `Ready` and kept across restarts; `ProtocolOutdated` not affecting `Ready`; the rotation annotation acted on once per value; the remote finalizer's order |
-| Connector CA ([04](./xxx-notes-011-v5-impl-04-connector-ca.md)) | Chart output: the CA `Certificate` (self-signed and `issuerRef`), the CA `ClusterIssuer`, per-shard connector `Certificate`s with their key usages and no hostnames; the `ConnectorCABundle` status and conditions from one writer; an invalid CA certificate is reported and never pushed |
-
-## Integration tests against kcp
-
-Against a kcp test server, without Providers:
-- **Maximal permission policy**, modelled on kcp's `TestMaximalPermissionPolicyAuthorizer`: an admin of a provider workspace is refused every write on `providerendpoints` and their status, and can read them; platform-mesh-operator's identity can write through the connection export's virtual workspace with only its prefixed-user grant, and can't without it. This closes v5 observation 8's untested point.
-- **`ProviderEndpoint` scope**: platform-mesh-operator can write the cluster-scoped, fixed-name `ProviderEndpoint` through the connection export's virtual workspace.
-- **Permission claim**: connectors can read `apiexportendpointslices` through the connection export.
-- **Connector token minting** with the RBAC from [03](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md): only for the fixed SA `default/provider`, refused for any other SA in the workspace.
-- **SA-token Secrets**: confirm kcp issues tokens for them (so the connector's inspection is needed) and that the inspection blocks every write form.
-- **`ProviderEndpointRegistration` validation**: the schema rejects non-`https` URLs, malformed keys and oversized lists.
-- **`Provider` validation**: the CEL rule rejects `providerKubeconfigSecret` or `hostOverride` together with `spec.remote`, on create and on update.
+**Every rule in a component's document is unit-tested with that component's work** ([02](./xxx-notes-011-v5-impl-02-apis.md), [03](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md), [04](./xxx-notes-011-v5-impl-04-connector-ca.md), [05](./xxx-notes-011-v5-impl-05-connector.md), [07](./xxx-notes-011-v5-impl-07-provider-sdk.md)), including what must be refused. Shared across components:
+- **the protocol's test vectors** ([01 Protocol, "Deliverables"](./xxx-notes-011-v5-impl-01-protocol.md)), run by the SDK, the connector and platform-mesh-operator;
+- **the SDK's fake PM side and test Provider-side server** ([07 SDK, "Testing support"](./xxx-notes-011-v5-impl-07-provider-sdk.md)), so platform-mesh-operator and the connector test against the real protocol, and Providers test against a real PM side;
+- **envtest** for every CRD and its controllers: the SDK's resources, `ProviderEndpointRegistration`, `ConnectorCABundle`;
+- **configurable timings** (see "Decided"), so time-based rules are tested without waiting.
 
 ## E2E (kind, multi-shard)
 
-**Environment**, extending platform-mesh-operator's kind e2e setup (`operators/platform-mesh-operator/test/e2e/kind`; see also [09 Deployment, "Local development"](./xxx-notes-011-v5-impl-09-deployment.md)): kcp with at least two shards and a front-proxy, cert-manager, platform-mesh-operator, providerconnections-operator, a connector per shard, and the [quickstart](./xxx-notes-011-v5-impl-08-provider-quickstart.md) Provider in a separate network reachable only through an ingress at its base URL. A test ingress that terminates TLS stands in for the Provider's edge.
+**Environment**, extending platform-mesh-operator's kind e2e setup (`operators/platform-mesh-operator/test/e2e/kind`; see also [09 Deployment, "Local development"](./xxx-notes-011-v5-impl-09-deployment.md)): kcp with at least two shards and a front-proxy, cert-manager, platform-mesh-operator, a connector per shard, and the [quickstart](./xxx-notes-011-v5-impl-08-provider-quickstart.md) Provider in a separate network reachable only through an ingress at its base URL. A test ingress that terminates TLS stands in for the Provider's edge.
 
-**Scenarios:**
+### Onboarding
 
 | Scenario | Checks |
 |---|---|
 | Onboarding | The request reaches `Registered`; the `Provider` goes `Provisioning → Ready`, with the `ProviderEndpoint` written only after the first control call; front-proxy session up; the Provider bootstraps its export through the connection; the token Secret's data is gone |
-| Consumers on a second shard | Binding on shard B makes shard B's connector open a session; the Provider reconciles consumers on both shards |
-| Restarts | Connector replica, platform-mesh-operator, Provider-side: traffic recovers without registration calls |
-| Connector replica killed | Every replica of the shard holds a session per connection: killing one cuts only the streams on its own sessions, which client-go reopens on the others' sessions at once; no connection loses its sessions on that shard |
-| Shard connector down | Only that shard's endpoint traffic stops |
-| platform-mesh-operator down | Traffic continues; onboarding waits |
-| platform-mesh-operator leader lost | A standby takes the Lease within seconds, rebuilds its caches and reconciles every connection once, within the per-Provider rate limits |
-| Readiness never arrives | kcp unreachable from the connectors: the request is `Registered`, the `Provider` stays `Provisioning` with `Connected=False` and the `KcpUnreachable` label, without a timeout; it becomes `Ready` once fixed |
-| Control path blocked at onboarding | The test edge blocks `/control`: the request is `Registered`, the `Provider` shows `Registered=False` with the edge-diagnosis label, no `ProviderEndpoint` is written and no session opens; unblocking lets it continue |
-| Connection breaks after `Ready` | The test edge cuts all sessions of a `Ready` remote Provider: `Connected=False` with `NoSessions`, `phase` `Degraded`; back to `Ready` once sessions return |
-| Operator crash during onboarding | platform-mesh-operator is killed after `POST`, after persisting its result, after deleting the token's data, and after the first control call, in turn: each time the request still reaches `Registered`, the `Provider` reaches `Ready` with the same `connectionID`, without a second connection on the Provider-side |
-| Two requests for one `Provider` | The newer one fails, naming the active one |
-| Misconfigured edge | The test ingress in turn: returns an HTML challenge page on upgrade, drops binary messages, enforces a short idle timeout, cuts connections at a short age. Each yields its distinct label in the `Provider`'s condition message |
-| Well-configured edge | The quickstart's traefik `HTTPRoute` passes sessions and control sessions; 32 KB binary messages pass both ways |
-| Secret change on demand | The `providers.platform-mesh.io/rotate-connection-secret` annotation on the `Provider`; re-applying the same value does nothing; a new value: the hash goes through the `ProviderEndpoint`, the Provider-side adopts it, the old secret is refused afterwards; sessions unaffected |
-| Lost Secret | The `ProviderEndpointRegistration`'s Secret is deleted: platform-mesh-operator repairs the secret through the `ProviderEndpoint`; `connectionID` and state kept; no owner action |
-| Lost `ProviderEndpointRegistration` | Deleted, and its Secret with it by owner reference: platform-mesh-operator rebuilds it from the `ProviderEndpoint` and repairs the secret; `connectionID` and state kept; no owner action |
-| Provider-side rejects PM's secret | The quickstart's store is restored from an older snapshot: platform-mesh-operator repairs the secret; repeated failures stay within the rate limit |
-| Secret change without sessions | All sessions blocked at the test edge: the change waits, the old secret keeps working, and the change completes once sessions return |
-| Connection unknown at the Provider-side | Deleted in the quickstart's portal: `Registered=False` with `ConnectionUnknown`; a new request for the same `Provider` registers a new connection, the `ProviderEndpoint` switches, consumers' bindings keep working, and the quickstart adopts existing `Cowboy` resources through the IDs in their status. A new request while the connection is still known fails, and so does one while the Provider-side is unreachable |
-| Switching Providers | A second quickstart instance at another base URL: after the first deletes the connection, a request with the second's token registers there; bindings keep working and the second adopts the existing APIExport |
+| Crash before persisting | platform-mesh-operator is killed after `POST`, before persisting its result: the retry returns the same `connectionID`, the `Provider` reaches `Ready`, and the Provider-side has no second connection |
+| Control path blocked | The test edge blocks `/control`: the request is `Registered`, the `Provider` shows `Registered=False` with the edge-diagnosis label, no `ProviderEndpoint` is written and no session opens; unblocking lets it continue |
+| kcp unreachable | kcp unreachable from the connectors: the `Provider` stays `Provisioning` with `Connected=False` and `KcpUnreachable`, without a timeout; it becomes `Ready` once fixed |
+
+### Shards and replicas
+
+| Scenario | Checks |
+|---|---|
+| Consumers on a second shard | A binding on shard B makes shard B's connector open a session; the Provider reconciles consumers on both shards; removing the last binding on shard B closes that session |
+| Connector replica killed | Every replica of the shard holds a session per connection: killing one cuts only the streams on its own sessions, which client-go reopens on the others' sessions at once |
+| Shard connector or virtual workspace down | Only that shard's endpoint traffic stops; with its virtual workspace down, connectors keep the last known `ProviderEndpoint`s and slices |
 | Host rename | A shard's virtual-workspace host changes: the connector lists old and new hosts in its hellos, endpoint slices switch, then the old host is dropped; no session gap in either order of changes, no certificate reissuance |
-| Provider with standby replicas | Two quickstart replicas behind the test ingress: upgrades reaching the standby get `503` with `Retry-After: 5` (default Lease) and connectors land on the leader within a few attempts, never retrying sooner than that; killing the leader moves all sessions to the new leader |
-| Server key rotation | `ProviderEndpoint` updated before switch; sessions keep working. With platform-mesh-operator stopped during the rotation, the Provider-side keeps the old key on that connection until the `ProviderEndpoint` lists the new one |
-| Provider-side state lost | The quickstart's `Connection` is deleted from etcd without its finalizer running and imported again with `kubectl apply`, with new server keys given to platform-mesh-operator as administrator input: sessions resume under the same `connectionID`, the secret is repaired through the `ProviderEndpoint`, and platform-mesh-operator adopts the existing `Cowboy` resources without creating new ones |
-| Automatic CA rollover | With shortened lifetimes, cert-manager renews the CA (or `cmctl renew` forces it): platform-mesh-operator pushes the trusted set, the new CA converges, connectors switch, and the old CA is dropped connection by connection within the spread window; sessions still on the old CA's certificate hand over with go-away and reopen at once; no connection is left without a session |
+| Provider standby replicas | Two quickstart replicas behind the test ingress: upgrades reaching the standby get `503` with `Retry-After: 5`, connectors land on the leader within a few attempts, never retrying sooner; killing the leader moves all sessions to the new leader |
+
+### PM-side restarts
+
+| Scenario | Checks |
+|---|---|
+| PM-side restarts | A connector replica, platform-mesh-operator, and platform-mesh-operator's leader in turn: each recovers without registration calls; a standby takes the Lease within seconds and reconciles every connection once, within the per-Provider rate limits; traffic continues while platform-mesh-operator is down, and onboarding waits |
+| Connection breaks after `Ready` | The test edge cuts all sessions of a `Ready` remote Provider: `Connected=False` with `NoSessions`, `phase` `Degraded`; back to `Ready` once sessions return |
+
+### Edge
+
+| Scenario | Checks |
+|---|---|
+| Edge | The quickstart's traefik `HTTPRoute` passes sessions and control sessions, and 32 KB binary messages both ways. The test ingress in turn returns an HTML challenge page on upgrade, drops binary messages, enforces a short idle timeout, and cuts connections at a short age: each yields its label on the `Provider`. With a private CA set as the `Provider`'s `caBundle`, registration, control sessions and sessions work; a rotation with the new CA added first keeps sessions working; without the update, new sessions fail with `EdgeTLS`, and updating `caBundle` recovers them |
+
+### Connection secret
+
+| Scenario | Checks |
+|---|---|
+| Secret change | A new value of the `providers.platform-mesh.io/rotate-connection-secret` annotation: the hash goes through the `ProviderEndpoint`, the Provider-side adopts it, the old secret is refused afterwards; sessions unaffected |
+| Secret change without sessions | All sessions blocked at the test edge: the change waits, the old secret keeps working, and the change completes once sessions return |
+| Secret repair | In turn: the `ProviderEndpointRegistration`'s Secret deleted; the `ProviderEndpointRegistration` deleted (its Secret goes with it, and it's rebuilt from the `ProviderEndpoint`); the quickstart's `Connection` restored from an older snapshot, so it rejects PM's secret. Each time the secret is repaired with the same `connectionID`, without owner action, and repeated failures stay within the rate limit |
+
+### Connector CA rollover
+
+| Scenario | Checks |
+|---|---|
+| Automatic CA rollover | With shortened lifetimes, cert-manager renews the CA (or `cmctl renew` forces it), and connector certificates renew along the way: platform-mesh-operator pushes the trusted set, the new CA converges, connectors switch, and the old CA is dropped connection by connection within the spread; sessions still on the old CA's certificate hand over with go-away and reopen at once; no connection is left without a session |
 | Control path broken during a rollover | The test edge blocks a Provider's `/control` path while its sessions stay up: convergence doesn't wait for it, it's listed as not reached, its sessions are lost after the connectors switch, and once `/control` is unblocked the catch-up push restores them within seconds |
 | Connector restarted mid-rollover | A connector restarted before the new CA converges uses its newest certificate at once; sessions to connections not yet pinning the new CA fail until the push lands, then recover |
 | Provider down during a rollover | The rollover completes for reachable connections; when the Provider returns, its first successful control call triggers the bundle push and sessions open within seconds. Also after two rollovers and with every pinned CA expired: the push is accepted and no tampering is reported |
-| Out-of-date bundle and a lost secret | A connection whose bundle missed the rollover and whose Provider-side rejects PM's secret stays without sessions; re-pinning by editing the `Connection`'s `connectorCABundle` brings sessions back, then the secret is repaired |
 | cert-manager down past the renewal budget | Connector certificates expire; the expiry metric reaches zero and readiness reports it; open sessions keep serving traffic, no replacements are attempted; a session cut by the test edge's maximum connection age isn't reopened until renewal; after cert-manager recovers, renewal and replacements resume |
+
+### Recovery and offboarding
+
+| Scenario | Checks |
+|---|---|
+| Connection unknown, onboarded again | The connection is deleted in the quickstart's portal: sessions and calls are refused, `Registered=False` with `ConnectionUnknown`; a new request for the same `Provider` registers a new connection, the `ProviderEndpoint` switches, consumers' bindings keep working, and the quickstart adopts existing `Cowboy` resources through the IDs in their status |
+| Switching Providers | A second quickstart instance at another base URL: after the first deletes the connection, a request with the second's token registers there; bindings keep working and the second adopts the existing APIExport |
+| Server key rotation | The new `ServerKey` is listed in the `ProviderEndpoint` before any connection presents it; sessions keep working. With platform-mesh-operator stopped during the rotation, the Provider-side keeps the old key on that connection until the `ProviderEndpoint` lists the new one |
+| Provider-side state lost | The quickstart's `Connection` is removed without its finalizer running and imported again with `kubectl apply`, its new server key given to PM's administrators, who edit the `ProviderEndpointRegistration`: sessions resume under the same `connectionID`, the secret is repaired through the `ProviderEndpoint`, and the quickstart adopts the existing `Cowboy` resources without creating new ones |
+| Out-of-date bundle and a lost secret | A connection whose bundle missed the rollover and whose Provider-side rejects PM's secret stays without sessions; re-pinning by editing the `Connection`'s `connectorCABundle` brings sessions back, then the secret is repaired |
 | Offboarding | `ProviderEndpoint` deleted, sessions closed, `DELETE` received, `ProviderEndpointRegistration` and its Secret deleted, workspace removed |
-| Administrator recovery input | A PM administrator edits the server keys in a `ProviderEndpointRegistration` after the quickstart's keys were replaced: the `ProviderEndpoint` follows and sessions verify again |
-| Private CA on the base URL | The test ingress serves a certificate from a private CA set as the `Provider`'s `caBundle`: registration, control sessions and connector sessions work. The CA is rotated with overlap (new CA added to `caBundle` before the switch): sessions keep working. Without the update: new sessions fail, `EdgeTLS` on the `Provider`; updating `caBundle` recovers them |
-| Provider-side deletes the connection | Sessions refused; `Registered=False` |
 
 ## Security tests
 
-- **Provider attempts through a session**: edit or delete its `ProviderEndpoint` (refused by kcp), delete the binding, write endpoint-slice status, create a TokenRequest, create an SA-token Secret, create a CSR, `exec`, impersonation headers, requests to another connection's workspace, streams to hosts outside the allow-list. All refused and audited.
+- **Provider attempts through a session**: edit or delete its `ProviderEndpoint` (refused by kcp, through the connection export's maximal permission policy), delete the binding, write endpoint-slice status, create a TokenRequest, create an SA-token Secret, make the connector act as any SA other than `default/provider`, create a CSR, `exec`, impersonation headers, requests to another connection's workspace, streams to hosts outside the allow-list. All refused and audited.
 - **Owner attempts**: edit the `ProviderEndpoint` (no rights), point `Provider` status or spec at another workspace (ignored by platform-mesh-operator), read a connection secret (none in the owner's workspace).
 - **Stolen connection secret**: used against the Provider-side to push a bundle with a foreign CA. platform-mesh-operator detects it, restores the bundle, changes the secret through the `ProviderEndpoint` and records an event on the `Provider`; the stolen secret is refused afterwards. No call lets the thief change the secret.
 - **Stolen onboarding token or portal account**: registers only a new, separate connection that receives no sessions from PM; it can't change an existing connection's secret or bundle.
@@ -89,26 +97,19 @@ Against a kcp test server, without Providers:
 
 ## Load
 
-The connector is a second, lighter hop in front of the APIExport virtual workspace (v5, "Load"). Measure, for one shard's connector at a realistic watch count:
-- memory and goroutines per idle watch, compared with the APIExport virtual workspace's;
-- peak memory per stream with a slow reader, with and without the HTTP/2 and multiplexer caps;
-- CPU per GB proxied;
-- cost per session.
+Load tests of the connector are a [follow-up](./xxx-notes-011-v5-impl-todo.md).
 
 ## Work breakdown
 
 1. Protocol test vectors.
 2. Unit tests per component (with each component's work).
-3. kcp integration tests (policy, claim, token minting, SA-token Secrets).
-4. Multi-shard kind environment with the network boundary and a TLS-terminating test ingress.
-5. E2E scenarios and security tests.
-6. Load test harness.
+3. Multi-shard kind environment with the network boundary and a TLS-terminating test ingress.
+4. E2E scenarios and security tests.
 
-## Follow-ups
-
-- **Profile validation** (platform-mesh-operator, a follow-up to this delivery): a profile whose `providerconnections` shard list doesn't match `infra`'s is refused and nothing changes in the cluster. Tested with that work, not here ([09 Deployment, "Charts"](./xxx-notes-011-v5-impl-09-deployment.md)).
+Follow-ups that need tests of their own (profile validation, load) are in the [follow-ups doc](./xxx-notes-011-v5-impl-todo.md).
 
 ## Decided
 
 - **The kind environment extends platform-mesh-operator's** `test/e2e/kind`.
-- **Shortened timings**: every component exposes its waiting periods, lifetimes and intervals as configuration (poll interval, repair rate limit, server key overlap deadline, connector CA and connector certificate lifetimes, the old CA's drop delay, the registration retry window, the session grace period, Lease durations), so CI can run full cycles in minutes.
+- **Shortened timings**: every component exposes its waiting periods, lifetimes and intervals as configuration (poll interval, repair rate limit, connector CA and connector certificate lifetimes, the old CA's drop delay and its spread, the registration retry window and with it orphan expiry, the session grace period, Lease durations, the delay before a `Connection`'s `Ready` reports a failure, the `lastSeen` interval), so CI can run full cycles in minutes.
+- **No separate kcp integration tests**: what they'd check (the maximal permission policy, the permission claim, token minting) is covered by the E2E scenarios and the security tests; kcp's own features (CEL, the policy mechanism) are tested by kcp.

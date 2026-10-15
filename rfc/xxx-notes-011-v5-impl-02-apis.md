@@ -131,4 +131,4 @@ One per provider workspace, cluster-scoped, with a fixed name (e.g. `default`), 
 - **The `caBundle`** stays a `Provider` setting, copied into the `ProviderEndpoint`; rotating it is out-of-band.
 - **Remote Providers' admin SA** has a fixed name; the `ProviderEndpoint` doesn't carry it.
 - **Version** of the new group: `v1alpha1`. The protocol coupling is carried by the protocol version ([01 Protocol, "Versioning"](./xxx-notes-011-v5-impl-01-protocol.md)), not the API version.
-- **`ProviderEndpoint` scope**: cluster-scoped with a fixed name; the integration tests confirm platform-mesh-operator can write it through the APIExport virtual workspace ([10 Testing, "Integration tests against kcp"](./xxx-notes-011-v5-impl-10-testing.md)).
+- **`ProviderEndpoint` scope**: cluster-scoped with a fixed name; every E2E onboarding confirms platform-mesh-operator can write it through the APIExport virtual workspace ([10 Testing, "Onboarding"](./xxx-notes-011-v5-impl-10-testing.md)).
