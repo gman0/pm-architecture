@@ -153,7 +153,7 @@ Single delivery, but the pieces depend on each other. Suggested order, with what
 
 ## Deployment target
 
-The plan targets PM's current deployment: platform-mesh-operator rendering `pm-helm-charts` from the `PlatformMesh` profile. The newer, not yet released platform-mesh-deployer (`OCMModule`s with `root-shard` and `per-shard` placements) is a later move; the components map onto it without design changes, but the deployer needs three extensions first ([09 Deployment, "Later: moving to platform-mesh-deployer"](./xxx-notes-011-v5-impl-09-deployment.md)).
+The plan targets PM's current deployment: platform-mesh-operator rendering `pm-helm-charts` from the `PlatformMesh` profile. The newer, not yet released platform-mesh-deployer (`OCMModule`s with `root-shard` and `per-shard` placements) is a later move; the components map onto it without design changes, but the deployer needs three extensions first ([follow-ups](./xxx-notes-011-v5-impl-todo.md)).
 
 ## External dependencies
 

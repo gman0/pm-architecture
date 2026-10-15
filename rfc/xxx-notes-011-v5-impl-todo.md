@@ -21,6 +21,15 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Wo
 - **Suspending a connection without deleting it**, if Providers need it: a field on the `Connection` that takes it out of the registry (its controllers disengage, sessions and upkeep continue), reported in the status `GET` so platform-mesh-operator can show it to the owner.
 - **Per-replica connector certificates** with an external issuer, so no private key is mounted into connectors.
 - **Iterate on the quickstart's portal** once the RFC is implemented: real login, owner notifications from `Connection` Events, more connection detail.
+- **Moving to platform-mesh-deployer** (`operators/platform-mesh-deployer`, unreleased as of 2026-10-12, today used only for kcp in the Tilt dev environment). It changes packaging, not design:
+  - *connectors* become a `per-shard` component in each shard's cluster, a plain workload on the virtual workspace framework with a minted kubeconfig, dropping kcp-operator's `VirtualWorkspace` and its accepted limitations (cache-server credentials);
+  - *the control plane* moves with the `Provider` part of platform-mesh-operator once that's its own operator, as a `root-shard` component;
+  - *kcp bootstrap* moves to the module workspace `root:modules:providerconnections`; the connection export's home changes, so `ProviderEndpoint`s and bindings are migrated or recreated;
+  - *`kcpTopology`* is replaced field for field by the deployer's per-shard context, and profile validation becomes unnecessary;
+  - *the connector CA*'s keys and issuers stay on the management cluster; connector certificates are minted there and synced to each shard's cluster;
+  - *identities* become minted users (`module:providerconnections:<kubeconfig>`); rights outside the module workspace are granted to those names.
+
+  The deployer needs first: hosts passed to per-shard instances (shard, virtual-workspace and front-proxy URLs, in-cluster addresses); client certificates per instance from a configurable issuer, with chosen key usages; rights outside the module workspace for minted identities, or a documented place where other components grant them.
 - **Load tests of the connector**, the second, lighter hop in front of the APIExport virtual workspace (v5, "Load"). For one shard's connector at a realistic watch count: memory and goroutines per idle watch, compared with the APIExport virtual workspace's; peak memory per stream with a slow reader, with and without the HTTP/2 and multiplexer caps; CPU per GB proxied; cost per session.
 - **In-band rotation of a private outer CA**, if Providers with many owners on private CAs need it: the Provider-side announces a new CA in the status `GET` (protected by the inner TLS), and platform-mesh-operator adds it to the `ProviderEndpoint`'s `caBundle`, so owners don't have to update theirs. Until then, rotation is out-of-band.
 
@@ -28,7 +37,6 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Wo
 
 - **Profile validation** in platform-mesh-operator: refuse a `providerconnections` shard list that doesn't match `infra`'s.
 - **Alerting**: PM has no alerting pipeline; the plan ships metrics, `ServiceMonitor`s and documented alert rules.
-- **Moving to platform-mesh-deployer**, which needs per-shard hosts, per-instance client certificates and rights outside the module workspace first.
 - **Narrowing the providers export's Secrets claim** with a label selector in PM's bindings, a PM-wide hardening.
 - **Audit policy and retention** for connector traffic.
 - **Proposing `ServeProxy` upstream** into the virtual workspace framework, instead of the connector's copy.
