@@ -166,7 +166,7 @@ The `Connected` step runs on every reconcile of a registered remote `Provider` a
   3. **kcp**: `KcpUnreachable`, when a host's requests don't reach kcp.
 
   The message adds counts and the last error, never shard names (overview, principle 9). If the control path fails, the status can't be read, so the control-path label wins and the message mentions the last known session state.
-- **Sets the warning condition `ProtocolOutdated`** while the connection still negotiates the previous protocol version, so the owner can ask the Provider to upgrade its SDK ([07 SDK, "Releases and protocol versions"](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
+- **Sets the warning condition `ProtocolOutdated`** while its control sessions still negotiate the previous protocol version through ALPN, so the owner can ask the Provider to upgrade its SDK ([07 SDK, "Releases and protocol versions"](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
 - **Does the connection's upkeep** on the same polls: server key updates in the `ProviderEndpoint`, secret changes (see "Secret changes"), and trusted-set pushes and the tamper check (see "Connector CA trusted set").
 - **Per-shard and per-host detail goes to metrics**, never to conditions (overview, principle 9).
 
@@ -209,7 +209,7 @@ Each case is covered elsewhere ([01 Protocol, "Recovery"](./xxx-notes-011-v5-imp
 - **A lost or rejected secret**: repaired automatically (see "Secret changes").
 - **A connection the Provider-side no longer knows**: `Registered=False` with `ConnectionUnknown`; the owner onboards the same `Provider` again, which registers a new connection (see "Onboarding requests").
 - **No session verifies**: `Connected=False` with `NoSessions`; the Provider's administrators re-pin the connector CA bundle out-of-band.
-- **Disasters on either side**: out-of-band, using the administrator input in "Writing ProviderEndpoints" and the SDK's administration commands ([07 SDK, "Administration"](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
+- **Disasters on either side**: out-of-band, using the administrator input in "Writing ProviderEndpoints" and the Provider administrators' runbooks ([07 SDK, "Administration"](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
 
 ## Connector CA trusted set
 

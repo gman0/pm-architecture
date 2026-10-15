@@ -53,9 +53,9 @@ It needs a working session. Without one, the change waits; the Provider-side kee
 
 ## Registration
 
-Request: idempotency key (the `ProviderOnboardingRequest` UID), `clusterName` (the logical cluster name of the provider workspace, as kcp assigns it), front-proxy URL, the secret's hash, the connector CA bundle (see "Connector CA bundle"), and the protocol versions the PM-side supports.
+Request: idempotency key (the `ProviderOnboardingRequest` UID), `clusterName` (the logical cluster name of the provider workspace, as kcp assigns it), front-proxy URL, the secret's hash, and the connector CA bundle (see "Connector CA bundle"). Its version is the path's (`/v1`).
 
-Response: `connectionID`, the Provider-side's **server keys** (public keys, a list to allow rotation), and the chosen protocol version.
+Response: `connectionID` and the Provider-side's **server keys** (public keys, a list to allow rotation).
 
 Rules:
 - **Only new connections.** Registration never changes an existing connection.
@@ -223,8 +223,7 @@ platform-mesh-operator turns this into aggregate conditions ([03 Operator, "Heal
 
 - **Path version** (`/v1`) for the endpoints, **ALPN** inside the inner TLS for the session and control protocols.
 - **Compatibility window: current and previous version.** The SDK and every PM-side component support both.
-- **Negotiated independently per channel**: registration negotiates the HTTP API version (path version) and stores it for control calls; each session negotiates its own version through ALPN. Connectors and SDKs can therefore be upgraded independently, without re-registering connections.
-- **Upgrading a connection's control-call version** happens on the next control session after both sides support the newer one; no new registration.
+- **Negotiated independently per channel, never stored**: registration uses the path version; every control session and every session negotiates its own version through ALPN (e.g. `pm-control/1`, `pm-session/1`). A channel opened after both sides upgrade uses the newer version, so connectors, platform-mesh-operator and SDKs can be upgraded independently, without re-registering connections.
 
 ## Deliverables
 

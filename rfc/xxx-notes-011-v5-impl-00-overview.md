@@ -14,7 +14,7 @@ Start here, then follow the walkthrough below, or jump to a component.
 | [03 platform-mesh-operator](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md) | The control plane: reconciling local and remote `Provider`s and onboarding requests; registration, `ProviderEndpoint`s, health, secret changes, the connector CA trusted set, deletion |
 | [04 Connector CA](./xxx-notes-011-v5-impl-04-connector-ca.md) | The connector CA managed by cert-manager, connector certificates, the trusted set Providers pin, and the automatic rollover |
 | [05 Connector](./xxx-notes-011-v5-impl-05-connector.md) | The data plane: the per-shard `providerconnections` virtual workspace, sessions, proxying, policy |
-| [07 Provider SDK](./xxx-notes-011-v5-impl-07-provider-sdk.md) | The Provider-side library: connection API, store, session server, transport, lifecycle, portal primitives |
+| [07 Provider SDK](./xxx-notes-011-v5-impl-07-provider-sdk.md) | The Provider-side library: connection API, its resources (`Connection`, `OnboardingToken`, `ServerKey`), session server, transport, lifecycle |
 | [08 Provider quickstart](./xxx-notes-011-v5-impl-08-provider-quickstart.md) | The reference Provider in pm-provider-quickstart |
 | [09 Deployment](./xxx-notes-011-v5-impl-09-deployment.md) | Charts, kcp bootstrap manifests, kcp-operator and cert-manager resources, network, rollout |
 | [10 Testing](./xxx-notes-011-v5-impl-10-testing.md) | Unit, integration, multi-shard kind e2e, security and load tests |
@@ -33,8 +33,8 @@ Start here, then follow the walkthrough below, or jump to a component.
 | Connection export home | **`:root:providers:system`**. |
 | Multiplexer | **yamux** over the WebSocket. |
 | Connector CA | **Managed by cert-manager and rolled over automatically**: 1 year, renewed 90 days before expiry, self-signed by default or from an `issuerRef`. platform-mesh-operator pushes each new CA to every Provider before connectors use it; a status-only **`ConnectorCABundle`** reports progress ([04](./xxx-notes-011-v5-impl-04-connector-ca.md)). |
-| Provider-side state | SDK **stores per entity** (connections, tokens, server keys), with **Kubernetes defaults** in the Provider's runtime cluster; server keys used only through a `crypto.Signer`. |
-| Portal | **SDK primitives** (token issuing and verification, connection lifecycle, hooks) plus a minimal flow in **pm-provider-quickstart**. |
+| Provider-side state | **Custom resources in the Provider's cluster** (`Connection`, `OnboardingToken`, `ServerKey` in `provider-sdk.platform-mesh.io`), the only source of truth; the only Secrets hold private keys, unless they're in a KMS or HSM. |
+| Portal | **The Kubernetes API on the SDK's resources**, plus a token helper; the quickstart has its own small portal. |
 | E2E | **kind, multi-shard**, with the Provider behind a network boundary, extending platform-mesh-operator's `test/e2e/kind`. |
 | Naming | `xxx-notes-011-v5-impl-*.md` in `rfc/`. |
 | Control plane replicas | **One active replica** by platform-mesh-operator's leader election, with one multicluster-runtime provider per export; no partitioning by shard ([03](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)). |
@@ -43,13 +43,13 @@ Start here, then follow the walkthrough below, or jump to a component.
 | Secret access | **Connection secrets in platform-mesh-operator's namespace** in PM's runtime cluster, never in owners' workspaces; token Secrets read by name, uncached, with **no Secret informers in kcp** ([02](./xxx-notes-011-v5-impl-02-apis.md), [03](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)). |
 | Connection secret changes | **Only through the PM-written `ProviderEndpoint`** (`pendingSecretHash`), adopted by the Provider-side over a session; no call changes a secret, so a thief can't lock PM out. Lost or rejected secrets are repaired automatically; changes happen on demand (an annotation) or after tampering, never periodically; a connection the Provider-side no longer knows is replaced by onboarding the same `Provider` again ([01](./xxx-notes-011-v5-impl-01-protocol.md), [03](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)). |
 | Connector CA bundle at Providers | **Compare-and-swap** (`etag`, `If-Match`); an unexpired pinned CA that isn't one of PM's unexpired CAs is treated as tampering: PM restores the bundle and changes the secret. When the bundle changes, the Provider-side closes sessions that no longer chain to it ([01](./xxx-notes-011-v5-impl-01-protocol.md), [03](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)). |
-| Recovery | **Out-of-band, but always possible**: stable `connectionID`s, an SDK import of connection entries, re-pinning a bundle, and administrator input for base URL and server keys on the PM-side. Procedures aren't part of this plan ([01](./xxx-notes-011-v5-impl-01-protocol.md), [07](./xxx-notes-011-v5-impl-07-provider-sdk.md)). |
+| Recovery | **Out-of-band, but always possible**: stable `connectionID`s, importing and re-pinning `Connection`s with `kubectl`, and administrator input for base URL and server keys on the PM-side. Procedures aren't part of this plan ([01](./xxx-notes-011-v5-impl-01-protocol.md), [07](./xxx-notes-011-v5-impl-07-provider-sdk.md)). |
 | Requests | Owners create them (one ClusterRole with `Provider`s), no creator checks; the oldest request per `Provider` wins; a request ends at registration (`Pending → Registering → Registered`, or `Failed` before registration succeeds), and everything after is reported on the `Provider`; spent token data deleted ([02](./xxx-notes-011-v5-impl-02-apis.md), [03](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)). |
 | `Provider` status | One writer; one condition per reconcile step, with labelled messages; `phase` for both kinds: `Pending → Provisioning → Ready ⇄ Degraded`, and `Deleting`; CEL rejects local fields on remote Providers ([02](./xxx-notes-011-v5-impl-02-apis.md), [03](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)). |
 | Migration | None: no remote Providers exist yet ([03](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)). |
 | Protocol | Current and previous version supported; sessions authenticated by the inner mutual TLS alone, with a hello message; streams carry HTTP from the first byte; control calls over HTTP/1.1; registration is the only plain-HTTPS call ([01](./xxx-notes-011-v5-impl-01-protocol.md)). |
 | Connector | Every replica serves every connection its shard needs; cache-server credentials accepted; child workspaces denied; one identity group for all shards ([05](./xxx-notes-011-v5-impl-05-connector.md)). |
-| SDK | One active replica by leader election (standbys answer `503` with `Retry-After: 5`), horizontal scale as a later opt-in; hooks as optional typed functions for customer-facing changes, metrics for operators; server keys rotated only on demand; Go only; per-entity stores with CRDs plus Secrets as defaults; PEM connector CA bundles ([07](./xxx-notes-011-v5-impl-07-provider-sdk.md)). |
+| SDK | One active replica by leader election (standbys answer `503` with `Retry-After: 5`), horizontal scale as a later opt-in; Kubernetes-API-first resources, Events instead of hooks, metrics for operators; server keys rotated only on demand, through `kubectl`; Go only; PEM connector CA bundles ([07](./xxx-notes-011-v5-impl-07-provider-sdk.md)). |
 | Quickstart | Keeps kubeconfig mode alongside connection mode ([08](./xxx-notes-011-v5-impl-08-provider-quickstart.md)). |
 | API version | `connections.platform-mesh.io/v1alpha1` ([02](./xxx-notes-011-v5-impl-02-apis.md)). |
 
@@ -78,7 +78,7 @@ Start here, then follow the walkthrough below, or jump to a component.
  │ SA (admin), Provider's own exports/slices│              ┌──────────────────────────────────────────────┐
  └──────────────────────────────────────────┘              │ Provider runtime                             │
                                                            │   Provider SDK (doc 07): connection API,     │
-                                                           │   session server, transport, store           │
+                                                           │   session server, transport, its CRDs        │
                                                            │   Provider controllers + portal (doc 08)     │
                                                            └──────────────────────────────────────────────┘
 ```
@@ -87,7 +87,7 @@ Start here, then follow the walkthrough below, or jump to a component.
 
 Each step names the document and section that owns it; read them in this order to follow the flow.
 
-1. **The owner gets a token** from the Provider's portal. The token format and its single-use rules: [01 Protocol, "Onboarding token"](./xxx-notes-011-v5-impl-01-protocol.md). Issuing and verifying: [07 SDK, "Onboarding tokens and portal primitives"](./xxx-notes-011-v5-impl-07-provider-sdk.md).
+1. **The owner gets a token** from the Provider's portal. The token format and its single-use rules: [01 Protocol, "Onboarding token"](./xxx-notes-011-v5-impl-01-protocol.md). Issuing and verifying: [07 SDK, "OnboardingToken"](./xxx-notes-011-v5-impl-07-provider-sdk.md).
 2. **The owner creates a remote `Provider` and a `ProviderOnboardingRequest`** referencing it and the token Secret, in either order: [02 APIs, "ProviderOnboardingRequest"](./xxx-notes-011-v5-impl-02-apis.md).
 3. **platform-mesh-operator finds the `Provider`**, waiting until it exists: [03 Operator, "Onboarding requests"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md).
 4. **platform-mesh-operator bootstraps the provider workspace** (workspace, SA, connection export binding, connector RBAC), without a kubeconfig for remote Providers: [03 Operator, "Reconciling Providers"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md).
@@ -145,7 +145,7 @@ Clear ownership avoids two controllers fighting over the same fields. "pm-operat
 Single delivery, but the pieces depend on each other. Suggested order, with what each step unblocks:
 
 1. **Protocol and APIs** ([01](./xxx-notes-011-v5-impl-01-protocol.md), [02](./xxx-notes-011-v5-impl-02-apis.md)): the contract everyone builds against. Includes protocol test vectors.
-2. **SDK core** ([07](./xxx-notes-011-v5-impl-07-provider-sdk.md)): connection API, store, session server, transport. Can be tested against a fake PM side.
+2. **SDK core** ([07](./xxx-notes-011-v5-impl-07-provider-sdk.md)): connection API, its resources and controllers, session server, transport. Can be tested against a fake PM side.
 3. **Connector CA** ([04](./xxx-notes-011-v5-impl-04-connector-ca.md)) and **kcp bootstrap** of the connection export ([09](./xxx-notes-011-v5-impl-09-deployment.md)).
 4. **platform-mesh-operator** ([03](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)) and **connector** ([05](./xxx-notes-011-v5-impl-05-connector.md)), in parallel; they meet only at the `ProviderEndpoint` and the protocol.
 6. **Quickstart** ([08](./xxx-notes-011-v5-impl-08-provider-quickstart.md)).
