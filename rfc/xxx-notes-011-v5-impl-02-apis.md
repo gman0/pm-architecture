@@ -1,6 +1,6 @@
 # v5 implementation plan: APIs
 
-Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). The kcp-side types, exports and policies, and the one type in PM's runtime cluster that holds each Connection's state. Types for `providers.platform-mesh.io` already exist in `platform-mesh/apis/providers/v1alpha1`; this document lists what changes there and what's new.
+Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). The kcp-side types, exports and policies, and the type in PM's runtime cluster that holds each Connection's state. Every PM-side type is in one API group, `providers.platform-mesh.io`, served in kcp through two exports and in PM's runtime cluster as CRDs; each kind is served either in kcp or in PM's runtime cluster, never both, and the tables say which (`ConnectorCASet` there is described in [04 Connector CA](./xxx-notes-011-v5-impl-04-connector-ca.md)). Types for `providers.platform-mesh.io` already exist in `platform-mesh/apis/providers/v1alpha1`; this document lists what changes there and what's new.
 
 ## Principles
 
@@ -8,7 +8,7 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Th
 - **Owner-writable data is input, never a link** (overview, principle 4).
 - **PM-written data in Provider Workspaces is protected by kcp**, not by convention.
 
-## `providers.platform-mesh.io`, facing Owners
+## The Providers Export, facing Owners
 
 ### ProviderOnboardingRequest
 
@@ -42,9 +42,9 @@ Defined in `provideronboardingrequest_types.go` (bringing the type in line with 
 
 ### ProviderConnection (remove)
 
-`providerconnection_types.go` in `providers.platform-mesh.io` is replaced by `ProviderEndpoint` in its own group (below). It isn't served yet, so removal has no migration.
+`providerconnection_types.go` in `providers.platform-mesh.io` is replaced by `ProviderEndpoint` in the same group, served by the Connection Export (below). It isn't served yet, so removal has no migration.
 
-## `providers.platform-mesh.io` in PM's runtime cluster
+## In PM's runtime cluster
 
 ### ProviderEndpointRegistration
 
@@ -85,11 +85,11 @@ spec:
 - **Read and written only by `platform-mesh-operator`.** In an Owner's workspace, every Provider with an accepted `Secret`s claim there could read it, since PM's bindings accept that claim with `matchAll`; and an Owner could delete it.
 - **Lost `Secret`s are repaired** through a Secret Change; nobody has to act.
 
-## `connections.platform-mesh.io` (new), facing Provider Workspaces
+## The Connection Export, facing Provider Workspaces
 
 ### ProviderEndpoint
 
-One per Provider Workspace, cluster-scoped, with a fixed name (e.g. `default`), written only by `platform-mesh-operator`, from the `ProviderEndpointRegistration`, its `Secret` and the `Provider`'s `caBundle`:
+`providers.platform-mesh.io/v1alpha1`, served only by the Connection Export. One per Provider Workspace, cluster-scoped, with a fixed name (e.g. `default`), written only by `platform-mesh-operator`, from the `ProviderEndpointRegistration`, its `Secret` and the `Provider`'s `caBundle`:
 
 | Field | Purpose |
 |---|---|
@@ -108,8 +108,8 @@ One per Provider Workspace, cluster-scoped, with a fixed name (e.g. `default`), 
 
 ### Connection Export
 
-`APIExport connections.platform-mesh.io` in **`:root:providers:system`**:
-- **Resources**: `providerendpoints`.
+`APIExport connections.providers.platform-mesh.io` in **`:root:providers:system`**:
+- **Resources**: `providerendpoints` in `providers.platform-mesh.io`. The Providers Export serves other resources of the same group; kcp checks binding conflicts per resource name, not per group, and no workspace binds both exports.
 - **Permission claim**: `apis.kcp.io/apiexportendpointslices`, verbs `get`, `list`, `watch`. The only claim. Connectors use it to see which shards have consumers ([05 Connector, "Which Sessions"](./xxx-notes-011-v5-impl-05-connector.md)).
 - **`maximalPermissionPolicy.local`**, with RBAC in `:root:providers:system`:
   - `get`, `list`, `watch` on `providerendpoints` for the group `apis.kcp.io:binding:system:authenticated`;
@@ -119,7 +119,7 @@ One per Provider Workspace, cluster-scoped, with a fixed name (e.g. `default`), 
 
 ### The binding in Provider Workspaces
 
-- **Created by `platform-mesh-operator`** with the workspace, with a **fixed name** (e.g. `connections.platform-mesh.io`), accepting the one permission claim ([03 Operator, "Connection Export binding"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
+- **Created by `platform-mesh-operator`** with the workspace, with a **fixed name** (e.g. `connections.providers.platform-mesh.io`), accepting the one permission claim ([03 Operator, "Connection Export binding"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
 - **Protected by the Connector's policy**: the Provider can't update or delete it through a Session ([05 Connector, "Authorization and policy"](./xxx-notes-011-v5-impl-05-connector.md)). If it disappears anyway, `platform-mesh-operator` recreates it and rewrites the `ProviderEndpoint`.
 
 ## Decided
@@ -130,5 +130,6 @@ One per Provider Workspace, cluster-scoped, with a fixed name (e.g. `default`), 
 - **Connection state** lives in `platform-mesh-operator`'s namespace, not in Owners' workspaces: a `ProviderEndpointRegistration` per Connection, authoritative, with a `Secret` holding only the credentials; `ProviderEndpoint`s are written from them.
 - **The `caBundle`** stays a `Provider` setting, copied into the `ProviderEndpoint`; rotating it is out-of-band.
 - **Remote Providers' admin SA** has a fixed name; the `ProviderEndpoint` doesn't carry it.
-- **Version** of the new group: `v1alpha1`. The protocol coupling is carried by the protocol version ([01 Protocol, "Versioning"](./xxx-notes-011-v5-impl-01-protocol.md)), not the API version.
+- **One API group** for every PM-side type, `providers.platform-mesh.io`; `ProviderEndpoint` is served by its own export.
+- **Version** of `ProviderEndpoint`: `v1alpha1`. The protocol coupling is carried by the protocol version ([01 Protocol, "Versioning"](./xxx-notes-011-v5-impl-01-protocol.md)), not the API version.
 - **`ProviderEndpoint` scope**: cluster-scoped with a fixed name; every E2E Onboarding confirms `platform-mesh-operator` can write it through the APIExport virtual workspace ([10 Testing, "Onboarding"](./xxx-notes-011-v5-impl-10-testing.md)).

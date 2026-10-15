@@ -76,8 +76,8 @@ Control Calls:
 
 | Call | Effect |
 |---|---|
-| `GET /v1/connections/{id}` | Status (see "Status"), Server Keys, the Pinned Bundle's `etag` and fingerprints |
-| `PUT /v1/connections/{id}/connector-ca-bundle` | Replace the Pinned Bundle (Rollover), with `If-Match`; see "Pinned Bundle" |
+| `GET /v1/connections/{id}` | Status (see "Status"), Server Keys, and `pinnedBundle`: the Pinned Bundle's `etag` and fingerprints |
+| `PUT /v1/connections/{id}/connector-ca-set` | Replace the Pinned Bundle (Rollover), with `If-Match`; see "Pinned Bundle" |
 | `DELETE /v1/connections/{id}` | Delete the Connection; all its Sessions close |
 
 There's no call that changes the Connection Secret (see "Changing the Connection Secret").
@@ -86,9 +86,9 @@ There's no call that changes the Connection Secret (see "Changing the Connection
 
 The Connector CA certificates a Connection pins travel as a **PEM bundle**, like every other CA bundle in Kubernetes: one `CERTIFICATE` block per CA of PM's **Connector CA Set**, the current Connector CA, and during a Rollover the previous one ([04 Connector CA, "The Connector CA Set"](./xxx-notes-011-v5-impl-04-connector-ca.md)). The rationale, including how this compares with other trust-anchor APIs, is in v5, "Distributing the Connector CA to Providers".
 
-- **Sent at Registration** and **replaced by `PUT …/connector-ca-bundle`** whenever the Connector CA Set changes, which is a few times a year. Both carry it as a JSON string field, `connectorCABundle`.
+- **Sent at Registration** and **replaced by `PUT …/connector-ca-set`** whenever the Connector CA Set changes, which is a few times a year. Both carry the Connector CA Set as a JSON string field, `connectorCASet`; the Provider-side stores it as the Connection's Pinned Bundle.
 - **Parsed strictly**: only `CERTIFICATE` blocks, without PEM headers; only whitespace before, between and after blocks; no duplicate certificates; every certificate a CA (`basicConstraints CA:true`, `keyCertSign`); bounded number of certificates and total size. Anything else is refused as a whole.
-- **Compare-and-swap**: `GET` returns the Pinned Bundle's `etag` (a hash over the sorted SHA-256 fingerprints of its certificates, computed by the Provider-side) and the CAs' fingerprints. A `PUT` must carry `If-Match: <etag>`; a mismatch is refused with `412` and the current `etag`, and a bundle with the same set of certificates as the pinned one is a no-op, whatever its order or whitespace. Reordered or duplicated calls, for example from two operator workers during a handover, therefore can't overwrite a newer bundle unnoticed.
+- **Compare-and-swap**: `GET` returns, in `pinnedBundle`, the Pinned Bundle's `etag` (a hash over the sorted SHA-256 fingerprints of its certificates, computed by the Provider-side) and the CAs' fingerprints. A `PUT` must carry `If-Match: <etag>`; a mismatch is refused with `412` and the current `etag`, and a bundle with the same set of certificates as the pinned one is a no-op, whatever its order or whitespace. Reordered or duplicated calls, for example from two operator workers during a handover, therefore can't overwrite a newer bundle unnoticed.
 - **PM can always restore its bundle**, even after someone holding the Connection Secret replaced it (see [03 Operator, "Connector CA Set"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
 - **Accepted even if every pinned CA has expired.** A push is authenticated by the Connection Secret and protected by compare-and-swap; the pinned CAs play no part. A Provider that was down through any number of Rollovers is caught up by its first successful Control Call.
 - **Only on the control channel**, never through a Session: a Session is authenticated by the CA it would be changing.

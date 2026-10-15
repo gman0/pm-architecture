@@ -35,15 +35,15 @@ These notes and the [implementation plan](./xxx-notes-011-v5-impl-00-overview.md
 | `ProviderOnboardingRequest` | kind, `providers.platform-mesh.io` (kcp) | the Owner's workspace | [02](./xxx-notes-011-v5-impl-02-apis.md) |
 | `ProviderEndpointRegistration` | kind, `providers.platform-mesh.io` (runtime cluster): the PM-side half of a Connection, authoritative | `platform-mesh-operator`'s namespace | [02](./xxx-notes-011-v5-impl-02-apis.md) |
 | `<clusterName>-secret` | `Secret` holding the Connection Secret (`secret`, `pendingSecret`) | `platform-mesh-operator`'s namespace | [02](./xxx-notes-011-v5-impl-02-apis.md) |
-| `ProviderEndpoint` | kind, `connections.platform-mesh.io` (kcp), named `default`: the PM-side half of a Connection, as Connectors and the Provider see it | the Provider Workspace | [02](./xxx-notes-011-v5-impl-02-apis.md) |
-| `connections.platform-mesh.io` | `APIExport` (the Connection Export), with its `APIExportEndpointSlice` and maximal permission policy | `:root:providers:system` | [02](./xxx-notes-011-v5-impl-02-apis.md) |
-| `providers.platform-mesh.io` | `APIExport` (the Providers Export) | its existing home | [02](./xxx-notes-011-v5-impl-02-apis.md) |
-| `ConnectorCASet` | kind, `providerconnections.platform-mesh.io` (runtime cluster) representing the Connector CA Set: its members and how far each has reached the Connections (status only) | PM's runtime cluster | [04](./xxx-notes-011-v5-impl-04-connector-ca.md) |
+| `ProviderEndpoint` | kind, `providers.platform-mesh.io` (kcp, served only by the Connection Export), named `default`: the PM-side half of a Connection, as Connectors and the Provider see it | the Provider Workspace | [02](./xxx-notes-011-v5-impl-02-apis.md) |
+| `connections.providers.platform-mesh.io` | `APIExport` (the Connection Export), serving `providerendpoints`, with its `APIExportEndpointSlice` and maximal permission policy | `:root:providers:system` | [02](./xxx-notes-011-v5-impl-02-apis.md) |
+| `providers.platform-mesh.io` | the one API group for every PM-side kind; also the name of the `APIExport` that is the Providers Export | its existing home | [02](./xxx-notes-011-v5-impl-02-apis.md) |
+| `ConnectorCASet` | kind, `providers.platform-mesh.io` (runtime cluster) representing the Connector CA Set: its members and how far each has reached the Connections (status only) | PM's runtime cluster | [04](./xxx-notes-011-v5-impl-04-connector-ca.md) |
 | `Connection` | kind, `provider-sdk.platform-mesh.io`: the Provider-side half of a Connection | the Provider's cluster | [07](./xxx-notes-011-v5-impl-07-provider-sdk.md) |
 | `OnboardingToken` | kind, `provider-sdk.platform-mesh.io` | the Provider's cluster | [07](./xxx-notes-011-v5-impl-07-provider-sdk.md) |
 | `ServerKey` | kind, `provider-sdk.platform-mesh.io` | the Provider's cluster | [07](./xxx-notes-011-v5-impl-07-provider-sdk.md) |
 | `providers.platform-mesh.io/rotate-connection-secret` | annotation on `Provider`: triggers a Secret Change | the Owner's workspace | [03](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md) |
-| `/v1/connections…` | the Connection API's endpoints: `POST /v1/connections`, `GET /v1/connections/{id}`, `…/control`, `…/session`, `PUT …/connector-ca-bundle`, `DELETE` | under the Base URL | [01](./xxx-notes-011-v5-impl-01-protocol.md) |
+| `/v1/connections…` | the Connection API's endpoints: `POST /v1/connections`, `GET /v1/connections/{id}`, `…/control`, `…/session`, `PUT …/connector-ca-set`, `DELETE` | under the Base URL | [01](./xxx-notes-011-v5-impl-01-protocol.md) |
 | `pm1.…`, `pmc1_…` | formats of the Onboarding Token and the Connection Secret | — | [01](./xxx-notes-011-v5-impl-01-protocol.md) |
 | `kcpTopology` | values of the `providerconnections` chart: shards and hosts | the `PlatformMesh` profile | [09](./xxx-notes-011-v5-impl-09-deployment.md) |
 
@@ -80,11 +80,11 @@ These notes and the [implementation plan](./xxx-notes-011-v5-impl-00-overview.md
 | **Stream** | one yamux stream in a Session, opened by the Provider-side, carrying HTTP for one kcp host; each request on it belongs to the Session's Connection | — |
 | **Inner TLS** | the TLS 1.3 handshake inside a Session or a Control Session, authenticating both ends | — |
 | **Hello** | a Connector Replica's first message inside a Session's Inner TLS: `clusterName` and served hosts | — |
-| **Connector CA Set** | the Connector CA certificates PM currently trusts: the current one, plus the previous one until its drop time; expired, distrusted and dropped CAs aren't members | derived from the Connector CA's `CertificateRequest`s; sent at Registration and in `PUT …/connector-ca-bundle`; reported in `ConnectorCASet` |
-| **Pinned Bundle** | a Connection's copy of the Connector CA Set, pinned on the Provider-side | `connectorCABundle` (protocol field), `Connection.spec.connectorCABundle` |
+| **Connector CA Set** | the Connector CA certificates PM currently trusts: the current one, plus the previous one until its drop time; expired, distrusted and dropped CAs aren't members | derived from the Connector CA's `CertificateRequest`s; sent in `connectorCASet` at Registration and in `PUT …/connector-ca-set`; reported in `ConnectorCASet` |
+| **Pinned Bundle** | a Connection's copy of the Connector CA Set, pinned on the Provider-side | `pinnedBundle` in `GET`; `Connection.spec.pinnedBundle` |
 | **Rollover** | a new Connector CA reaching every Pinned Bundle before Connectors switch to it | cert-manager, `platform-mesh-operator` |
 | **Server Key** | a Provider-side keypair for Inner TLS, pinned by the PM-side | `ServerKey`; `ProviderEndpoint.spec.serverKeys` |
-| **Connection Export** | PM's export through which `ProviderEndpoint`s reach Provider Workspaces | `APIExport` `connections.platform-mesh.io` |
+| **Connection Export** | PM's export through which `ProviderEndpoint`s reach Provider Workspaces | `APIExport` `connections.providers.platform-mesh.io` |
 | **Providers Export** | PM's export of `Provider` and `ProviderOnboardingRequest` to Owners' workspaces | `APIExport` `providers.platform-mesh.io` |
 | **Denylist** | the requests a Connector refuses on top of the Provider's RBAC | `providerconnections-connector` |
 | **PM Administrator** | a person running the PM Instance | — |
@@ -207,7 +207,7 @@ Authorization: Bearer <tokenID>.<tokenSecret>
   "clusterName": "<logical cluster name of the provider workspace>",
   "frontProxyURL": "https://...",
   "secretHash": "sha256:<hex>",
-  "connectorCABundle": "-----BEGIN CERTIFICATE-----\n…"    # PEM bundle, CA certificates only (see below)
+  "connectorCASet": "-----BEGIN CERTIFICATE-----\n…"       # the Connector CA Set, PEM, CA certificates only (see below)
 }
 → 201 { "connectionID": "...", "serverKeys": [ … ] }
 
@@ -219,11 +219,11 @@ GET /v1/connections/{id}/control                 (WebSocket upgrade)
 
   GET /v1/connections/{id}
   → 200 { "requiredHosts": { "<host:port>": { "sessions": 1, "kcpReachable": true, "lastError": "" } },
-          "serverKeys": [ … ], "connectorCABundle": { "etag": "...", "fingerprints": [ … ] } }
+          "serverKeys": [ … ], "pinnedBundle": { "etag": "...", "fingerprints": [ … ] } }
 
-  PUT /v1/connections/{id}/connector-ca-bundle   # connector CA rollover, compare-and-swap
+  PUT /v1/connections/{id}/connector-ca-set      # Rollover: replaces the Pinned Bundle, compare-and-swap
   If-Match: "<etag from GET>"
-  { "connectorCABundle": "<PEM>" }               # the trusted set: current CA, and the previous one during a rollover
+  { "connectorCASet": "<PEM>" }                  # the Connector CA Set: current CA, and the previous one during a Rollover
   → 204                                          # identical body: a no-op
   → 412 { "etag": "..." }                        # changed since: read again
 
@@ -292,7 +292,7 @@ Giving an external relying party CA certificates through an API is an establishe
 - **Push: the relying party offers an API to register trust anchors.** AWS IAM Roles Anywhere lets a customer register its own CA as a trust anchor (`CreateTrustAnchor`, `UpdateTrustAnchor`), authenticated with the customer's account credentials; workloads then authenticate with certificates from that CA. Google Cloud's workload identity federation takes an X.509 trust store the same way. Business-to-business mTLS integrations (payment providers, banks) have partners upload their client CA, usually by hand.
 - **Pull: the issuer publishes its trust material, and relying parties fetch it periodically.** SPIFFE federation exchanges trust bundles (CA certificates as a JWKS with `x5c`) through bundle endpoints, with a sequence number and a refresh hint, and rotates by overlapping generations. OIDC JWKS and SAML metadata URLs do the same for signing keys. Pull is the more common model for ongoing rotation.
 
-v5 pushes because **the PM-side may be behind NAT**: Providers can't fetch anything from PM, only PM can open Connections. Registration and `PUT /connector-ca-bundle` are the pull model turned around, authenticated with the credential that controls the whole Connection (the Onboarding Token, then the Connection Secret), as AWS authenticates `UpdateTrustAnchor` with the account's credentials. Structurally, v5's Registration plus Rollover is the same as Roles Anywhere's trust anchor plus update.
+v5 pushes because **the PM-side may be behind NAT**: Providers can't fetch anything from PM, only PM can open Connections. Registration and `PUT /connector-ca-set` are the pull model turned around, authenticated with the credential that controls the whole Connection (the Onboarding Token, then the Connection Secret), as AWS authenticates `UpdateTrustAnchor` with the account's credentials. Structurally, v5's Registration plus Rollover is the same as Roles Anywhere's trust anchor plus update.
 
 Three choices follow from this:
 - **CA updates travel only on the control channel**, never over a Session. A Session authenticated by one CA could announce the next and save a Control Call, but then a stolen Connector Certificate could plant a CA of the attacker's choosing, turning a day of compromise into a permanent one.
@@ -611,7 +611,7 @@ Within one shard, the Connector runs several replicas, and **every replica keeps
 | Register the Connection (with the Connector CA Set), make a first Control Call, write its `ProviderEndpoint` through the Connection Export | once per Connection | `POST /v1/connections`, one `GET` |
 | Confirm readiness, then keep health current | every few minutes, per Connection, with jitter | one `GET`, in a Control Session |
 | Change the Connection Secret | on demand, after tampering, or to repair a lost or rejected Connection Secret (rate-limited) | none to change it (the hash goes into the `ProviderEndpoint`); one confirming `GET` |
-| Push the Connector CA Set | about once a year, when cert-manager renews the CA, and when a Connection is reached again | one `PUT /connector-ca-bundle` with `If-Match` per Connection whose pinned fingerprints differ |
+| Push the Connector CA Set | about once a year, when cert-manager renews the CA, and when a Connection is reached again | one `PUT /connector-ca-set` with `If-Match` per Connection whose pinned fingerprints differ |
 | Update Server Keys in the `ProviderEndpoint` | when the Provider-side announces a new key | none (seen in `GET`) |
 | `DELETE` | at offboarding | one call |
 
@@ -752,11 +752,11 @@ stringData:
 apiVersion: apis.kcp.io/v1alpha2
 kind: APIExport                                      # in :root:providers:system
 metadata:
-  name: connections.platform-mesh.io
+  name: connections.providers.platform-mesh.io
 spec:
   resources:
     - name: providerendpoints                        # served by this export
-      group: connections.platform-mesh.io
+      group: providers.platform-mesh.io            # the Providers Export serves other resources of this group
       # …schema reference
   maximalPermissionPolicy:
     local: {}                                        # RBAC below, in this workspace, caps every binding workspace
@@ -770,7 +770,7 @@ kind: ClusterRole                                    # in the export's workspace
 metadata:
   name: connections-mpp-read
 rules:
-  - apiGroups: [ connections.platform-mesh.io ]
+  - apiGroups: [ providers.platform-mesh.io ]
     resources: [ providerendpoints ]
     verbs: [ get, list, watch ]
 ---
@@ -787,7 +787,7 @@ kind: ClusterRole                                    # in the export's workspace
 metadata:
   name: connections-mpp-write
 rules:
-  - apiGroups: [ connections.platform-mesh.io ]
+  - apiGroups: [ providers.platform-mesh.io ]
     resources: [ providerendpoints, providerendpoints/status ]  # no status today; covered if ever added
     verbs: [ create, update, patch, delete, deletecollection ]
 ---
@@ -799,19 +799,19 @@ roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: connect
 subjects:
   - { apiGroup: rbac.authorization.k8s.io, kind: User, name: "apis.kcp.io:binding:<platform-mesh-operator user>" }
 ---
-apiVersion: connections.platform-mesh.io/v1alpha1
-kind: ProviderEndpoint                               # cluster-scoped, in the provider workspace :root:providers:<name>-<suffix>
+apiVersion: providers.platform-mesh.io/v1alpha1
+kind: ProviderEndpoint                               # cluster-scoped, in the Provider Workspace :root:providers:<name>-<suffix>
 metadata:
-  name: default                                      # fixed name, one per provider workspace
+  name: default                                      # fixed name, one per Provider Workspace
 spec:
   connectionID: "..."
   url: https://provider.example.com/pm               # validated against the egress rules (https only, in the schema too)
-  serverKeys: [ "<PEM SPKI>", ... ]                  # the Provider-side's pinned server keys, for the inner TLS
+  serverKeys: [ "<PEM SPKI>", ... ]                  # the Provider-side's pinned Server Keys, for the Inner TLS
   caBundle: ""                                       # the Provider's spec.remote.caBundle, for the outer TLS; web PKI if empty
-  pendingSecretHash: ""                              # set while the connection secret changes; the Provider-side adopts it
+  pendingSecretHash: ""                              # set while the Connection Secret changes; the Provider-side adopts it
 ```
 
-- **`ProviderEndpoint`, in its own group.** `platform-mesh-operator` already has a `ProviderConnection` type for its own components' kubeconfigs, and `providers.platform-mesh.io` had an unserved `ProviderConnection`; that one is removed, and the `ProviderEndpoint` lives only in `connections.platform-mesh.io/v1alpha1`, served only by the Connection Export.
+- **`ProviderEndpoint`, in `providers.platform-mesh.io`, served by its own export.** `platform-mesh-operator` already has a `ProviderConnection` type for its own components' kubeconfigs, and `providers.platform-mesh.io` had an unserved `ProviderConnection`; that one is removed, and the `ProviderEndpoint` is served only by the Connection Export, which kcp allows next to the Providers Export: binding conflicts are checked per resource name, and no workspace binds both.
 - **No `clusterName` field and no status**: the `ProviderEndpoint`'s logical cluster is the Provider Workspace, and Connectors write nothing. The front-proxy URL is deployment configuration, and the SA that Connectors act as has a fixed name, `default/provider`, in every Remote Provider's workspace.
 - **RBAC**: `platform-mesh-operator` writes `ProviderEndpoint`s through the export's virtual workspace; Connectors get read-only `apiexports/content`. The Provider's SA stays admin in its workspace, as in RFC 006; the export's maximal permission policy keeps it from writing `ProviderEndpoint`s, and the Connector's Denylist keeps it from changing the binding.
 - **Who may create requests**: whoever manages `Provider`s in the Owner's workspace; PM ships one ClusterRole that grants both together, and `platform-mesh-operator` doesn't check the creator. The oldest unfinished request per `Provider` wins; newer ones fail at once, naming the active one.
@@ -960,7 +960,8 @@ Detailed decisions are in the [implementation plan](./xxx-notes-011-v5-impl-00-o
 - **Secret Changes**: only through the PM-written `ProviderEndpoint` (`pendingSecretHash`), adopted by the Provider-side over a Session; no call changes a Connection Secret; on demand (an annotation), after tampering, and repair (automatic, rate-limited); no periodic rotation ([01 Protocol](./xxx-notes-011-v5-impl-01-protocol.md), [03 Operator](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
 - **Pinned Bundles**: compare-and-swap with `etag` and `If-Match`; an unexpired pinned CA that isn't one of PM's unexpired CAs triggers restore, a Secret Change and an event on the `Provider` ([01 Protocol](./xxx-notes-011-v5-impl-01-protocol.md), [03 Operator](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
 - **Recovery**: the `ProviderEndpointRegistration` is authoritative and the `ProviderEndpoint` is written from it; a lost `ProviderEndpointRegistration` is rebuilt from the `ProviderEndpoint` and its Connection Secret repaired; PM Administrators supply recovery input by editing it; Owners onboard a `Provider` again only after the Provider-side reports its Connection unknown; disasters are handled out-of-band, with stable `connectionID`s, importing and re-pinning `Connection`s with `kubectl`, and PM Administrator input keeping that possible ([01 Protocol](./xxx-notes-011-v5-impl-01-protocol.md), [07 SDK](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
-- **Connection Export and `ProviderEndpoint`**: `connections.platform-mesh.io/v1alpha1` `ProviderEndpoint`, cluster-scoped with a fixed name, exported from `:root:providers:system`; `platform-mesh-operator` creates the binding with the workspace and recreates it if deleted ([02 APIs](./xxx-notes-011-v5-impl-02-apis.md), [03 Operator](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
+- **API groups**: one for every PM-side kind, `providers.platform-mesh.io`, and one for the SDK's kinds, `provider-sdk.platform-mesh.io` ([02 APIs](./xxx-notes-011-v5-impl-02-apis.md)).
+- **Connection Export and `ProviderEndpoint`**: `providers.platform-mesh.io/v1alpha1` `ProviderEndpoint`, cluster-scoped with a fixed name, served by the APIExport `connections.providers.platform-mesh.io` in `:root:providers:system`; `platform-mesh-operator` creates the binding with the workspace and recreates it if deleted ([02 APIs](./xxx-notes-011-v5-impl-02-apis.md), [03 Operator](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
 - **Connector policy**: SA-token `Secret` writes are inspected and refused; child workspaces are denied; both kcp path shapes are parsed explicitly ([05 Connector](./xxx-notes-011-v5-impl-05-connector.md)).
 - **Where Service endpoint slices live**: a documented requirement for Providers, in the Provider Workspace, for exports in that workspace ([07 SDK](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
 - **Connector**: a standalone proxy server modelled on kcp's front-proxy; a plain Deployment per shard with its identity from a kcp-operator `Kubeconfig`; no request timeouts of its own, limits per Connection; every replica serves every Connection its shard needs ([05 Connector](./xxx-notes-011-v5-impl-05-connector.md), [09 Deployment](./xxx-notes-011-v5-impl-09-deployment.md)).

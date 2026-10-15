@@ -41,7 +41,7 @@ spec:
     owner: alice@example.com                   # selectable field
     clusterName: 2x8k9abc
     frontProxyURL: https://pm.example.com
-  connectorCABundle: |                         # PEM; PM push or administrator re-pin
+  pinnedBundle: |                              # the Pinned Bundle, PEM; PM push or administrator re-pin
     -----BEGIN CERTIFICATE-----
     ...
 status:
@@ -56,7 +56,7 @@ status:
 ```
 
 - **Created at Registration** by the SDK. `spec.registration` is immutable (CEL: `self == oldSelf`); `spec.registration.owner` is a selectable field, so a portal lists one Owner's Connections with a field selector.
-- **`spec.connectorCABundle`** is what Sessions are verified against. A PM push writes it ([01 Protocol, "Pinned Bundle"](./xxx-notes-011-v5-impl-01-protocol.md)), and so does an administrator re-pinning; either change makes the SDK re-check open Sessions (see "Session server").
+- **`spec.pinnedBundle`** is what Sessions are verified against. A PM push writes it ([01 Protocol, "Pinned Bundle"](./xxx-notes-011-v5-impl-01-protocol.md)), and so does an administrator re-pinning; either change makes the SDK re-check open Sessions (see "Session server").
 - **`Ready`** says whether every host the Provider's clients use has a Session and reaches kcp. It reports `NoSessions` or `KcpUnreachable` only after the state has lasted a few minutes (e.g. 5), so a failover, when a new leader briefly sees no Sessions, doesn't flip every Connection. Per-host detail stays in memory, where `GET` reads it, and in metrics.
 - **`lastSeen`**: the last Control Call or Session, written at most once an hour. Empty means never used, which is what orphan expiry looks for; an old value marks a Connection whose PM Instance went away without `DELETE`.
 - **`listedServerKeys`**: the `ServerKey`s PM's `ProviderEndpoint` last listed. Set at Registration to the keys returned, then updated whenever the SDK reads the `ProviderEndpoint`. The Inner TLS handshake picks the key from it before any Session exists (see "Server Keys").
@@ -137,7 +137,7 @@ The handler for the one plain-HTTPS endpoint:
 - **WebSocket upgrade, then the Inner TLS server** with the Connection's Server Key (see "Server Keys"), speaking HTTP/1.1 with keep-alive. The version is negotiated through ALPN ([01 Protocol, "Versioning"](./xxx-notes-011-v5-impl-01-protocol.md)).
 - **Bearer check** on each request, against `secretHash` only. **The first failed check closes the Control Session**, so every guess costs a new WebSocket and handshake.
 - **Handlers**: status, Pinned Bundle replacement, delete ([01 Protocol, "Control Sessions"](./xxx-notes-011-v5-impl-01-protocol.md)). None changes the Connection Secret. Delete deletes the `Connection`.
-- **Pinned Bundle**: a PEM bundle, parsed strictly (only `CERTIFICATE` blocks, no PEM headers, only whitespace around blocks, no duplicates, every certificate a CA, bounded size); Go's `AppendCertsFromPEM` isn't used, since it skips what it can't parse. Replacement is compare-and-swap on the Pinned Bundle's `etag`, a hash over its certificates' fingerprints, computed from `spec.connectorCABundle`: a missing or stale `If-Match` is refused with `412`, the same set of certificates is a no-op ([01 Protocol, "Pinned Bundle"](./xxx-notes-011-v5-impl-01-protocol.md)). The `etag` and fingerprints are reported in `GET`. The bundle is only ever accepted on the control channel or at Registration, never from a Session. A push is accepted even if every pinned CA has expired: it's authenticated by the Connection Secret, not by the pinned CAs.
+- **Pinned Bundle**: a PEM bundle, parsed strictly (only `CERTIFICATE` blocks, no PEM headers, only whitespace around blocks, no duplicates, every certificate a CA, bounded size); Go's `AppendCertsFromPEM` isn't used, since it skips what it can't parse. Replacement is compare-and-swap on the Pinned Bundle's `etag`, a hash over its certificates' fingerprints, computed from `spec.pinnedBundle`: a missing or stale `If-Match` is refused with `412`, the same set of certificates is a no-op ([01 Protocol, "Pinned Bundle"](./xxx-notes-011-v5-impl-01-protocol.md)). The `etag` and fingerprints are reported in `GET`. The bundle is only ever accepted on the control channel or at Registration, never from a Session. A push is accepted even if every pinned CA has expired: it's authenticated by the Connection Secret, not by the pinned CAs.
 
 ### The Connection's ProviderEndpoint
 
@@ -200,7 +200,7 @@ The SDK enforces the protocol's framing on every Session and Control Session ([0
 ### Administration
 
 Runbooks for Provider Administrators, for cases no protocol call can fix safely. Everything is `kubectl` on the resources; the SDK's controllers react. Inputs are exchanged out-of-band with the PM Administrators.
-- **Re-pin a Connection's Pinned Bundle**, when no Session verifies (for example, a bundle that missed a whole Rollover while the Connection also lost its Connection Secret): edit `spec.connectorCABundle`. Once Sessions work again, PM repairs the Connection Secret through the `ProviderEndpoint`.
+- **Re-pin a Connection's Pinned Bundle**, when no Session verifies (for example, a bundle that missed a whole Rollover while the Connection also lost its Connection Secret): edit `spec.pinnedBundle`. Once Sessions work again, PM repairs the Connection Secret through the `ProviderEndpoint`.
 - **Import a Connection** after the Provider-side lost its state: apply a `Connection` with its `connectionID`, Owner, `clusterName`, front-proxy URL and the Pinned Bundle. No Connection Secret hash: `platform-mesh-operator` notices the failed authentication and changes the Connection Secret through the `ProviderEndpoint`. New Server Keys go to PM Administrators, since PM never fetches them over plain HTTPS.
 - **Rotate the Server Key**:
   1. create a new `ServerKey`: without a KMS, a manifest with just `generateName: sk-` (`kubectl create`); with one, create the key in the KMS first and name its version in `signerRef`;

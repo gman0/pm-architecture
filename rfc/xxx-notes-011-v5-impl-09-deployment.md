@@ -12,7 +12,7 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Ho
 
 In `platform-mesh-operator`'s kcp manifests (`manifests/kcp`), next to the existing Providers Export:
 - **Providers Export**: add `provideronboardingrequests` and its `APIResourceSchema` ([02 APIs, "ProviderOnboardingRequest"](./xxx-notes-011-v5-impl-02-apis.md)).
-- **In `:root:providers:system`** (the `03-providers` group): the `connections.platform-mesh.io` `APIResourceSchema` for `providerendpoints`, the `APIExport` with its permission claim and maximal permission policy, its `APIExportEndpointSlice`, and the policy's RBAC ([02 APIs, "Connection Export"](./xxx-notes-011-v5-impl-02-apis.md)).
+- **In `:root:providers:system`** (the `03-providers` group): the `APIResourceSchema` for `providerendpoints` in `providers.platform-mesh.io`, the `APIExport` `connections.providers.platform-mesh.io` with its permission claim and maximal permission policy, its `APIExportEndpointSlice`, and the policy's RBAC ([02 APIs, "Connection Export"](./xxx-notes-011-v5-impl-02-apis.md)).
 - **Access**: `apiexports/content` on the Connection Export for `platform-mesh-operator` (read and write) and the Connectors' group (read); `bind` on it for `platform-mesh-operator`.
 
 ## Charts
@@ -47,10 +47,10 @@ kcpTopology:
 ### `platform-mesh-operator`
 
 `platform-mesh-operator` ([03 Operator](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)) runs as its own Deployment, with leader election (one active replica). For Remote Providers it needs:
-- **The `ProviderEndpointRegistration` CRD**, shipped with `platform-mesh-operator`'s chart ([02 APIs, "ProviderEndpointRegistration"](./xxx-notes-011-v5-impl-02-apis.md)).
+- **The `ProviderEndpointRegistration` and `ConnectorCASet` CRDs**, in `providers.platform-mesh.io`, shipped with `platform-mesh-operator`'s chart; `platform-mesh-operator` creates the `ConnectorCASet` object `default` when it's missing ([02 APIs, "ProviderEndpointRegistration"](./xxx-notes-011-v5-impl-02-apis.md)).
 - **RBAC in its namespace** for `ProviderEndpointRegistration`s and their `Secret`s. That namespace is separate from cert-manager's, which holds the Connector CA's key. PM Administrators get `update` on `providerendpointregistrations` there, for recovery, without access to the `Secret`s.
 - **kcp rights** listed in [03 Operator, "Identity and permissions"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md): the Connection Export's content and `bind`, and the Connector RBAC in Provider Workspaces.
-- **In the runtime cluster**: write the `ConnectorCASet`'s status; a Role in cert-manager's cluster resource namespace with only `get`, `list` and `watch` on `certificaterequests`, for the CA's public certificates ([04 Connector CA, "The Connector CA Set"](./xxx-notes-011-v5-impl-04-connector-ca.md)). No access to `Secret`s there.
+- **In the runtime cluster**: create the `ConnectorCASet` object `default` and write its status; a Role in cert-manager's cluster resource namespace with only `get`, `list` and `watch` on `certificaterequests`, for the CA's public certificates ([04 Connector CA, "The Connector CA Set"](./xxx-notes-011-v5-impl-04-connector-ca.md)). No access to `Secret`s there.
 - **Egress to the internet**, for Providers' Base URLs.
 - **Configuration**: the `distrust` list of CA fingerprints, from values.
 
@@ -68,7 +68,7 @@ In the `providerconnections` chart ([04 Connector CA](./xxx-notes-011-v5-impl-04
 - **The CA `Certificate`** (`isCA: true`, 1 year, renewed 90 days before expiry, `rotationPolicy: Always`, `revisionHistoryLimit: 3`) in cert-manager's cluster resource namespace, taken from values (default `cert-manager`), issued by a self-signed issuer by default or by the `issuerRef` from values (e.g. Vault or a cloud CA).
 - **A `ClusterIssuer` of type CA** on the CA's `Secret`, issuing the Connector Certificates.
 - **Per-shard Connector `Certificate`s** from that `ClusterIssuer`.
-- **The status-only `ConnectorCASet` CRD** and its singleton; `platform-mesh-operator` fills in its status. Its `distrust` list (CA fingerprints to drop at once after a compromise) is part of `platform-mesh-operator`'s configuration.
+- **Not the `ConnectorCASet` CRD**: it ships with `platform-mesh-operator`, which writes it (see "`platform-mesh-operator`"). The `distrust` list (CA fingerprints to drop at once after a compromise) is part of `platform-mesh-operator`'s configuration.
 
 The same templates serve development and production; nothing about the CA has to be prepared outside the chart.
 
@@ -96,7 +96,7 @@ Checked against kcp-operator `8994ed7`: the Connectors' identity comes from a `K
 3. `platform-mesh-operator` ([03](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)). It tolerates the Connectors' absence either way.
 4. Owners can now create `ProviderOnboardingRequest`s.
 
-Upgrades keep this order. Connectors and `platform-mesh-operator` tolerate each other's absence: without `platform-mesh-operator`, no `ProviderEndpoint`s appear; without Connectors, `Connected` stays false.
+Upgrades keep this order. Connectors and `platform-mesh-operator` tolerate each other's absence: without `platform-mesh-operator`, no `ProviderEndpoint`s appear, and until the `ConnectorCASet` exists Connectors switch to a renewed certificate only when the current one has less than an hour left; without Connectors, `Connected` stays false.
 
 ## Local development
 

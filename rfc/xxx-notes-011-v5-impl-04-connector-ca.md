@@ -50,10 +50,10 @@ What Providers pin. `platform-mesh-operator` keeps no state for it: everything i
 
 ## ConnectorCASet
 
-A cluster-scoped, status-only singleton in PM's runtime cluster, `connectorcasets.providerconnections.platform-mesh.io` (short name `ccs`), named `default`. It represents the Connector CA Set: `status.certificates` lists its members, identified by fingerprint, and how far each has reached the Connections. Its status is purely derived (see "The Connector CA Set"): rebuilt on every reconcile, so losing it costs nothing. Example, mid-Rollover:
+A cluster-scoped, status-only singleton in PM's runtime cluster, `connectorcasets.providers.platform-mesh.io` (short name `ccs`), named `default`, shipped and created by `platform-mesh-operator`. It represents the Connector CA Set: `status.certificates` lists its members, identified by fingerprint, and how far each has reached the Connections. Its status is purely derived (see "The Connector CA Set"): rebuilt on every reconcile, so losing it costs nothing. Example, mid-Rollover:
 
 ```yaml
-apiVersion: providerconnections.platform-mesh.io/v1alpha1
+apiVersion: providers.platform-mesh.io/v1alpha1
 kind: ConnectorCASet
 metadata:
   name: default
@@ -143,7 +143,7 @@ For **PM Administrators** (Owners and Providers never see these). PM has no aler
 
 ## Work breakdown
 
-1. The status-only `ConnectorCASet` CRD and its printer columns.
+1. `platform-mesh-operator`: the status-only `ConnectorCASet` CRD in `providers.platform-mesh.io`, with its printer columns, and creating the `default` object.
 2. Chart templates: the CA `Certificate` and its issuer (self-signed or `issuerRef`), the CA `ClusterIssuer`, per-shard Connector `Certificate`s, the `distrust` configuration ([09 Deployment](./xxx-notes-011-v5-impl-09-deployment.md)).
 3. `platform-mesh-operator`: watching the CA's `CertificateRequest`s, deriving the Connector CA Set, drop times and unexpired CAs from them, the `ConnectorCASet` status ([03 Operator](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
 4. Connector: the switch rule ([05 Connector](./xxx-notes-011-v5-impl-05-connector.md)).
@@ -162,4 +162,4 @@ For **PM Administrators** (Owners and Providers never see these). PM has no aler
 - **No intermediates**: Connector Certificates are issued directly by the CA that Providers pin. The CA rolls over yearly by itself, so an intermediate would add nothing; with an external PKI, PM's CA is itself the intermediate, pinned as the trust anchor. **No name constraints** on the CA: there are no meaningful names in Connector Certificates to constrain.
 - **No PM Instance identifier**: the CA of each PM Instance is the binding. A PM-wide identity for PM Instances would be a broader design.
 - **Connector Certificates**: 24 hours, renewed halfway, no revocation. kcp doesn't revoke its certificates either, but relies on removing RBAC bindings, which Providers can't do for PM; a short lifetime is the equivalent.
-- **Naming**: Connector CA, Connector Certificates, Connector CA Set, `ConnectorCASet`.
+- **Naming**: Connector CA, Connector Certificates, Connector CA Set, `ConnectorCASet` (in `providers.platform-mesh.io`, shipped by `platform-mesh-operator`).

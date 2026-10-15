@@ -149,7 +149,7 @@ For the request's Connection:
 - **The Connector's own identity** comes from a kcp-operator `Kubeconfig` per shard ([09 Deployment, "Connector"](./xxx-notes-011-v5-impl-09-deployment.md)): a client certificate for **one group** shared by all shards' Connectors. The identity needs:
   - read-only `apiexports/content` on the Connection Export;
   - in every Provider Workspace, `access` and `create` on `serviceaccounts/token` for that one SA (`resourceNames: [provider]`), granted by `platform-mesh-operator` ([03 Operator, "Connector RBAC"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
-- **In the runtime cluster**: read access to the `ConnectorCASet` (public data, for the switch rule) and its own Connector Certificate `Secret`. Nothing else.
+- **In the runtime cluster**: read access to the `ConnectorCASet` in `providers.platform-mesh.io` (public data, for the switch rule) and its own Connector Certificate `Secret`. Nothing else.
 - **No `Shard` objects, no `/services/admin`, no cache server.**
 
 ## Egress to Providers

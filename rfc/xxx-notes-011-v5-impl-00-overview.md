@@ -29,7 +29,7 @@ Start here, then follow the walkthrough below, or jump to a component.
 | `platform-mesh-operator` | **`platform-mesh-operator`** owns each `Provider`, local or remote, end to end. It moves with the `Provider` part when that becomes its own operator; until then, internet-facing code in PM's most privileged component is an accepted interim risk ([03](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md), [03](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)). |
 | `providerconnections-connector` | A new service: **`services/providerconnections-connector`**, a **standalone proxy server modelled on kcp's front-proxy**, one per shard, deployed as a plain Deployment with its identity from a kcp-operator `Kubeconfig`. |
 | the SDK | **`platform-mesh/provider-sdk`**, module `go.platform-mesh.io/provider-sdk`, its own semver line released through `cmd/release` ([07](./xxx-notes-011-v5-impl-07-provider-sdk.md)). |
-| Connection object type | **`connections.platform-mesh.io/ProviderEndpoint`**, served only by the Connection Export. `ProviderConnection` is removed from `providers.platform-mesh.io`. |
+| Connection object type | **`providers.platform-mesh.io/ProviderEndpoint`**, served only by the Connection Export. `ProviderConnection` is removed. |
 | Connection Export home | **`:root:providers:system`**. |
 | Multiplexer | **yamux** over the WebSocket. |
 | Connector CA | **Managed by cert-manager and rolled over automatically**: 1 year, renewed 90 days before expiry, self-signed by default or from an `issuerRef`. `platform-mesh-operator` pushes each new CA to every Provider before Connectors use it; a status-only **`ConnectorCASet`** reports progress ([04](./xxx-notes-011-v5-impl-04-connector-ca.md)). |
@@ -38,7 +38,7 @@ Start here, then follow the walkthrough below, or jump to a component.
 | E2E | **kind, multi-shard**, with the Provider behind a network boundary, extending `platform-mesh-operator`'s `test/e2e/kind`. |
 | Naming | `xxx-notes-011-v5-impl-*.md` in `rfc/`. |
 | `platform-mesh-operator` replicas | **One active replica** by `platform-mesh-operator`'s leader election, with one multicluster-runtime provider per export; no partitioning by shard ([03](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)). |
-| Chart | One new `providerconnections` chart (the Connector CA and per-shard Connector resources), deployed by `platform-mesh-operator` as a profile service, with an explicit `kcpTopology` that duplicates `infra`'s shards (must match; profile validation enforcing it is a follow-up) ([09](./xxx-notes-011-v5-impl-09-deployment.md)). |
+| Chart | One new `providerconnections` chart (the Connector CA and per-shard Connector resources; the `ConnectorCASet` CRD ships with `platform-mesh-operator`), deployed by `platform-mesh-operator` as a profile service, with an explicit `kcpTopology` that duplicates `infra`'s shards (must match; profile validation enforcing it is a follow-up) ([09](./xxx-notes-011-v5-impl-09-deployment.md)). |
 | Connection state | **A `ProviderEndpointRegistration` per Connection in `platform-mesh-operator`'s namespace** in PM's runtime cluster, authoritative, with a `Secret` holding only the Connection Secret; `ProviderEndpoint`s are written from them ([02](./xxx-notes-011-v5-impl-02-apis.md)). |
 | `Secret` access | **Connection Secrets in `platform-mesh-operator`'s namespace** in PM's runtime cluster, never in Owners' workspaces; token `Secret`s read by name, uncached, with **no `Secret` informers in kcp** ([02](./xxx-notes-011-v5-impl-02-apis.md), [03](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)). |
 | Secret Changes | **Only through the PM-written `ProviderEndpoint`** (`pendingSecretHash`), adopted by the Provider-side over a Session; no call changes a Connection Secret, so a thief can't lock PM out. Lost or rejected Connection Secrets are repaired automatically; changes happen on demand (an annotation) or after tampering, never periodically; a Connection the Provider-side no longer knows is replaced by Onboarding the same `Provider` again ([01](./xxx-notes-011-v5-impl-01-protocol.md), [03](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)). |
@@ -51,7 +51,7 @@ Start here, then follow the walkthrough below, or jump to a component.
 | Connector | Every replica serves every Connection its shard needs; no request timeouts of its own, limits per Connection; child workspaces denied; one identity group for all shards ([05](./xxx-notes-011-v5-impl-05-connector.md)). |
 | SDK | One active replica by leader election (standbys answer `503` with `Retry-After: 5`), horizontal scale as a later opt-in; Kubernetes-API-first resources, Events instead of hooks, metrics for operators; Server Keys rotated only on demand, through `kubectl`; Go only; Pinned Bundles in PEM ([07](./xxx-notes-011-v5-impl-07-provider-sdk.md)). |
 | Quickstart | Keeps kubeconfig mode alongside Connection mode ([08](./xxx-notes-011-v5-impl-08-provider-quickstart.md)). |
-| API version | `connections.platform-mesh.io/v1alpha1` ([02](./xxx-notes-011-v5-impl-02-apis.md)). |
+| API groups | **Two**: `providers.platform-mesh.io` for every PM-side kind (in kcp, through the Providers Export and the Connection Export; in PM's runtime cluster, as CRDs), and `provider-sdk.platform-mesh.io` for the SDK's kinds; `v1alpha1` ([02](./xxx-notes-011-v5-impl-02-apis.md)). |
 
 ## Component map
 
