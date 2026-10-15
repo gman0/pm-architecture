@@ -84,10 +84,11 @@ There's no call that changes the secret (see "Changing the secret").
 
 ### Connector CA bundle
 
-The connector CA certificates a connection pins travel as a **trust bundle in SPIFFE's format**: a JWKS whose keys each carry one CA certificate of PM's **trusted set** in `x5c`: the current connector CA, and during a rollover the previous one ([04 Connector CA, "The trusted set"](./xxx-notes-011-v5-impl-04-connector-ca.md)). The rationale, including how this compares with other trust-anchor APIs, is in v5, "Distributing the connector CA to Providers".
+The connector CA certificates a connection pins travel as a **PEM bundle**, like every other CA bundle in Kubernetes: one `CERTIFICATE` block per CA of PM's **trusted set**, the current connector CA, and during a rollover the previous one ([04 Connector CA, "The trusted set"](./xxx-notes-011-v5-impl-04-connector-ca.md)). The rationale, including how this compares with other trust-anchor APIs, is in v5, "Distributing the connector CA to Providers".
 
-- **Sent at registration** and **replaced by `PUT …/connector-ca-bundle`** whenever the trusted set changes, which is a few times a year.
-- **Compare-and-swap**: `GET` returns the pinned bundle's `etag` (a hash of its canonical content, computed by the Provider-side) and the CAs' fingerprints. A `PUT` must carry `If-Match: <etag>`; a mismatch is refused with `412` and the current `etag`, and a body identical to the pinned bundle is a no-op. Reordered or duplicated calls, for example from two operator workers during a handover, therefore can't overwrite a newer bundle unnoticed.
+- **Sent at registration** and **replaced by `PUT …/connector-ca-bundle`** whenever the trusted set changes, which is a few times a year. Both carry it as a JSON string field, `connectorCABundle`.
+- **Parsed strictly**: only `CERTIFICATE` blocks, without PEM headers; only whitespace before, between and after blocks; no duplicate certificates; every certificate a CA (`basicConstraints CA:true`, `keyCertSign`); bounded number of certificates and total size. Anything else is refused as a whole.
+- **Compare-and-swap**: `GET` returns the pinned bundle's `etag` (a hash over the sorted SHA-256 fingerprints of its certificates, computed by the Provider-side) and the CAs' fingerprints. A `PUT` must carry `If-Match: <etag>`; a mismatch is refused with `412` and the current `etag`, and a bundle with the same set of certificates as the pinned one is a no-op, whatever its order or whitespace. Reordered or duplicated calls, for example from two operator workers during a handover, therefore can't overwrite a newer bundle unnoticed.
 - **PM can always restore its bundle**, even after someone holding the connection secret replaced it (see [03 Operator, "Connector CA trusted set"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
 - **Accepted even if every pinned CA has expired.** A push is authenticated by the connection secret and protected by compare-and-swap; the pinned CAs play no part. A Provider that was down through any number of rollovers is caught up by its first successful control call.
 - **Only on the control channel**, never through a session: a session is authenticated by the CA it would be changing.
@@ -228,7 +229,7 @@ platform-mesh-operator turns this into aggregate conditions ([03 Operator, "Heal
 ## Deliverables
 
 - **This contract as a versioned specification** in the SDK module, with the message schemas.
-- **Test vectors**: inner TLS (a client certificate from an unpinned CA, expired, without the `clientAuth` EKU, or with an intermediate in its chain; a pinned CA that has expired; an unpinned server key), hellos (wrong `clusterName`, missing or malformed `hosts`, oversized), control sessions (wrong secret, closed on the first failure). Shared by the SDK and the connector's tests ([10 Testing](./xxx-notes-011-v5-impl-10-testing.md)).
+- **Test vectors**: inner TLS (a client certificate from an unpinned CA, expired, without the `clientAuth` EKU, or with an intermediate in its chain; a pinned CA that has expired; an unpinned server key), hellos (wrong `clusterName`, missing or malformed `hosts`, oversized), control sessions (wrong secret, closed on the first failure), connector CA bundles (malformed PEM, a non-`CERTIFICATE` block, a block with PEM headers, text between blocks, a duplicated certificate, a non-CA certificate, too many certificates, the same set in another order). Shared by the SDK and the connector's tests ([10 Testing](./xxx-notes-011-v5-impl-10-testing.md)).
 
 ## Decided
 

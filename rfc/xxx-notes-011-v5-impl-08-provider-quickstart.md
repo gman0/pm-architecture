@@ -13,7 +13,7 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). `p
 
 ## Principles
 
-- **Show the intended way, nothing more.** The quickstart uses SDK defaults, the Kubernetes reference store, and the multicluster-runtime helper; anything Provider-specific is clearly marked as such.
+- **Show the intended way, nothing more.** The quickstart uses SDK defaults, including the Kubernetes stores, and the multicluster-runtime helper; anything Provider-specific is clearly marked as such.
 - **Bootstrap of the Provider's own APIs stays the Provider's job.** The quickstart keeps creating its APIExport, schemas and endpoint slices in its provider workspace, now through a connection instead of a kubeconfig, and keeps its Service endpoint slices in that workspace (the connector's session rule depends on it, [05 Connector, "Which sessions"](./xxx-notes-011-v5-impl-05-connector.md)).
 
 ## Pieces
@@ -34,7 +34,8 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). `p
   - **a server certificate from a public CA**, or, with a private CA, owners set it as their `Provider`'s `caBundle`. Before switching to a new private CA, tell owners, so they add it next to the old one; otherwise their new sessions fail with `EdgeTLS`.
 
   The quickstart's README walks through checking each point on the deployed base URL; platform-mesh-operator reports violations it sees on the `Provider` with a labelled message ([03 Operator, "Edge diagnosis"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
-- Storage: the SDK's Kubernetes reference store, in the quickstart's namespace.
+- Storage: the SDK's Kubernetes defaults, in the quickstart's namespace.
+- Metrics: the SDK's collectors on the operator's metrics endpoint, scraped by a `ServiceMonitor` in the manifests.
 
 ### Replicas
 
@@ -57,7 +58,7 @@ The Wild West operator (`operator/wild-west`) reads its clusters from the mode a
 The existing Angular portal gains:
 - **Issue token**: shows the token once, with a `kubectl create secret` command, never a manifest, and never puts the token in a URL; next to it, the `Provider` and `ProviderOnboardingRequest` manifests to apply;
 - **Connections**: list with status (from the SDK store), delete;
-- **Notifications**: a simple list of events, filled by the quickstart's SDK hooks.
+- **Notifications**: a simple list of events, filled by the quickstart's SDK hooks (registered, removed, secret changed, connector CA bundle changed, administrative change).
 
 Authentication of portal users is out of scope; the quickstart uses a placeholder login and says so.
 

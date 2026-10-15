@@ -137,7 +137,7 @@ For the **people running the PM installation** (owners and Providers never see t
 | Connector holding its previous certificate | `providerconnections_connector_certificate_pending_switch_seconds{shard}` (connector) | — | > 6 hours: warning (the new CA hasn't converged) |
 | Connector certificate not renewed | `providerconnections_connector_certificate_expiry_seconds{shard}` (connector) | Event on the connector's `Certificate` (cert-manager) | < 6 hours left (half the renewal budget used): warning |
 | Connector certificate expired | same | Connector readiness reports it (rollout tooling can hold) | ≤ 0: critical. From then on every session that ends is an outage for its connection on that shard ([05 Connector, "Opening a session"](./xxx-notes-011-v5-impl-05-connector.md)) |
-| A pinned bundle held a CA PM never trusted | `providerconnections_connector_ca_bundle_tampered_total` (operator) | An event on the `Provider` ([03 Operator, "Connector CA trusted set"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)) | Increase: critical (a connection secret was used by someone other than PM) |
+| A pinned bundle held an unexpired CA that isn't one of PM's | `providerconnections_connector_ca_bundle_tampered_total` (operator) | An event on the `Provider` ([03 Operator, "Connector CA trusted set"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)) | Increase: critical (a connection secret was used by someone other than PM) |
 
 ## Work breakdown
 

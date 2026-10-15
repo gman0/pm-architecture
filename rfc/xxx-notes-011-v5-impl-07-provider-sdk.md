@@ -7,9 +7,10 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Th
 - **A connection server** to mount under its base URL: registration, control sessions, sessions.
 - **Connections for its controllers**: for each connection, a client config whose requests travel over that connection's sessions, and events when connections come and go.
 - **Portal primitives**: issuing onboarding tokens, listing and deleting connections, and hooks reporting what happened.
-- **A storage interface** with a Kubernetes reference store.
+- **Metrics** for its operators.
+- **Storage** in Kubernetes by default, replaceable per entity.
 
-What a Provider still does itself: its portal and user accounts, its operator code (which endpoint slices it reconciles), its ingress, and where it stores state if it doesn't use the reference store.
+What a Provider still does itself: its portal and user accounts, its operator code (which endpoint slices it reconciles), its ingress, and where it stores state if it doesn't use the Kubernetes defaults.
 
 ## Principles
 
@@ -30,19 +31,15 @@ What a Provider still does itself: its portal and user accounts, its operator co
 
 ### Hooks
 
-The SDK tells the Provider's code what happened, so the Provider can inform the owning customer, audit, or alert its operators. A struct of optional, typed functions, one per event, passed in when the connection server is set up:
+The SDK tells the Provider's code about changes to a connection, so the Provider can inform the owning customer or keep an audit trail. Operational signals for the Provider's operators are metrics instead (see "Metrics"). A struct of optional, typed functions, one per event, passed in when the connection server is set up:
 
 ```go
 type Hooks struct {
-    OnRegistered                func(ctx context.Context, conn Connection)
-    OnConnectionDeleted         func(ctx context.Context, conn Connection, by DeletedBy)
-    OnConnectionExpired         func(ctx context.Context, conn Connection)
-    OnSecretChanged             func(ctx context.Context, conn Connection)
-    OnConnectorCABundleChanged  func(ctx context.Context, conn Connection, old, new []Fingerprint)
-    OnConnectorCABundleRejected func(ctx context.Context, conn Connection, reason RejectReason)
-    OnSessionsClosed            func(ctx context.Context, conn Connection, count int)
-    OnAdministrativeChange      func(ctx context.Context, conn Connection, change AdminChange)
-    OnAuthenticationFailures    func(ctx context.Context, conn Connection, count int)
+    OnRegistered               func(ctx context.Context, conn Connection)
+    OnConnectionRemoved        func(ctx context.Context, conn Connection, reason RemovalReason) // DeletedByOwner, DeletedByPM, DeletedByAdmin, Expired
+    OnSecretChanged            func(ctx context.Context, conn Connection)
+    OnConnectorCABundleChanged func(ctx context.Context, conn Connection, change BundleChange) // old and new fingerprints, sessions closed
+    OnAdministrativeChange     func(ctx context.Context, conn Connection, change AdminChange)
 }
 ```
 
@@ -50,9 +47,19 @@ type Hooks struct {
 - **The implementor keeps hooks fast**, or hands the work off to run asynchronously, and retries whatever it does if it needs to. The SDK has no queue and no retries for hooks.
 - **A hook left `nil`** means the Provider doesn't handle that event. The SDK logs every event either way, never with secrets.
 - **New events in later SDK releases are new fields**, so adding one never breaks a Provider's code.
-- **Authentication failures** are counted by the SDK and reported once they pass a threshold per connection.
 
 The quickstart's hooks log events and list them in its portal ([08 Quickstart](./xxx-notes-011-v5-impl-08-provider-quickstart.md)).
+
+### Metrics
+
+Prometheus collectors, which the Provider adds to the registry it already serves (controller-runtime's, for most):
+- authentication failures on control sessions and sessions;
+- connector CA bundles refused, by reason;
+- sessions by state, and sessions closed, by reason (go-away, edge cut, bundle re-check, connection removed);
+- handshakes refused before or during the upgrade, by reason (unknown ID, limits, timeout);
+- connections.
+
+**No `connectionID` labels**: with thousands of connections, they'd explode cardinality. Per-connection detail is in the logs and in the status `GET`.
 
 ### Connection API
 
@@ -65,7 +72,7 @@ The handler for the one plain-HTTPS endpoint:
 - **WebSocket upgrade, then the inner TLS server** with the server key the connection's `ProviderEndpoint` lists (see "Server keys"), speaking HTTP/1.1 with keep-alive.
 - **Bearer check** on each request, against the current secret hash only. **The first failed check closes the control session**, so every guess costs a new WebSocket and handshake.
 - **Handlers**: status, connector CA bundle replacement, delete ([01 Protocol, "Control sessions"](./xxx-notes-011-v5-impl-01-protocol.md)). None changes the secret.
-- **Connector CA bundle**: parsed as a SPIFFE-format trust bundle (JWKS with `x5c`); every certificate is checked to be a CA before it's pinned. Replacement is compare-and-swap on the pinned bundle's `etag`: a missing or stale `If-Match` is refused with `412`, an identical body is a no-op ([01 Protocol, "Connector CA bundle"](./xxx-notes-011-v5-impl-01-protocol.md)). The `etag` and fingerprints are reported in `GET`. The bundle is only ever accepted on the control channel or at registration, never from a session. A push is accepted even if every pinned CA has expired: it's authenticated by the secret, not by the pinned CAs.
+- **Connector CA bundle**: a PEM bundle, parsed strictly (only `CERTIFICATE` blocks, no PEM headers, only whitespace around blocks, no duplicates, every certificate a CA, bounded size); Go's `AppendCertsFromPEM` isn't used, since it skips what it can't parse. Replacement is compare-and-swap on the pinned bundle's `etag`, a hash over its certificates' fingerprints: a missing or stale `If-Match` is refused with `412`, the same set of certificates is a no-op ([01 Protocol, "Connector CA bundle"](./xxx-notes-011-v5-impl-01-protocol.md)). The `etag` and fingerprints are reported in `GET`. The bundle is only ever accepted on the control channel or at registration, never from a session. A push is accepted even if every pinned CA has expired: it's authenticated by the secret, not by the pinned CAs.
 
 ### The connection's ProviderEndpoint
 
@@ -104,7 +111,7 @@ Answers `GET` with, per host the Provider's clients actually use: live sessions,
 
 ### Server keys
 
-- **Generated by the SDK** on first start, stored with the reference store or the Provider's own.
+- **Generated by the SDK** on first start, stored through the `ServerKeyStore` (Secrets by default, or an HSM or KMS behind a `crypto.Signer`).
 - **Rotation only on demand**, through an administration command (see "Administration"), for example after a suspected key compromise. Nothing rotates on a schedule.
 - **Rotation with overlap**: announce the new key in `GET`; switch each connection to it once that connection's `ProviderEndpoint` lists it ([03 Operator, "Writing ProviderEndpoints"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)); retire the old key once every connection's `ProviderEndpoint` lists the new one, or at the deadline given to the command. A long deadline (e.g. 7 days) gives every connection time to catch up; after a suspected compromise, a short one accepts that connections not reached in time lose their sessions until a PM administrator supplies the new key. There's no plain-HTTPS key endpoint ([01 Protocol, "Server keys"](./xxx-notes-011-v5-impl-01-protocol.md)).
 
@@ -123,11 +130,37 @@ All of them write to the store with compare-and-swap and report through `OnAdmin
 
 ## Storage
 
-**An interface**, with entities for: connections (owner, addressing, secret hash, pinned connector CA bundle, negotiated version), tokens (hash, owner, expiry, spent), and server keys (current, announced, retired, private keys).
+**Per entity, with Kubernetes defaults.** One small interface per kind of state, set in a struct passed in when the connection server is set up; a field left `nil` uses the SDK's Kubernetes implementation:
 
-**The Kubernetes reference store** keeps these in the Provider's runtime cluster: non-secret state as **custom resources** (compare-and-swap through `resourceVersion`, inspectable with kubectl), private keys and hashes in **Secrets**. The SDK ships the CRDs. Requirements on any store:
-- atomic updates of a connection entry (compare-and-swap), since several replicas may handle calls;
-- private keys never readable by anything but the connection server.
+```go
+type Storage struct {
+    Connections ConnectionStore // nil: custom resources in the configured namespace
+    Tokens      TokenStore      // nil: custom resources
+    ServerKeys  ServerKeyStore  // nil: Secrets
+}
+
+type ConnectionStore interface {
+    Get(ctx context.Context, id string) (Connection, Version, error)
+    List(ctx context.Context, owner string) ([]Connection, error)
+    Create(ctx context.Context, c Connection) error
+    Update(ctx context.Context, c Connection, expected Version) error // compare-and-swap
+    Delete(ctx context.Context, id string, expected Version) error
+}
+
+type ServerKeyStore interface {
+    Keys(ctx context.Context) ([]ServerKey, error) // public key, state (current, announced, retired), crypto.Signer
+    Generate(ctx context.Context) (ServerKey, error)
+    SetState(ctx context.Context, id string, s KeyState, expected Version) error
+}
+```
+
+- **Swapped per entity, never per function**: an entity's operations must agree with each other. A Provider can keep connections in its database and leave tokens and server keys in Kubernetes.
+- **Entities**: connections (owner, addressing, secret hash, pinned connector CA bundle, negotiated version), tokens (hash, owner, expiry, spent), server keys.
+- **Server keys are used only through a `crypto.Signer`.** The SDK never handles private key bytes, so a store backed by an HSM or a KMS keeps them inside it.
+- **The Kubernetes defaults** keep non-secret state as **custom resources** (compare-and-swap through `resourceVersion`, inspectable with kubectl) and private keys and hashes in **Secrets**. The SDK ships the CRDs.
+- **Requirements on any store**: compare-and-swap on every update, since several replicas may handle calls; spending a token atomic, so it can't be spent twice; private keys usable only through the signer.
+- **A conformance test**, `storetest.Run(t, store)`, checks them. Implementors run it against their stores; the SDK runs it against its defaults and its in-memory store.
+- **The three interfaces are kept stable** across SDK releases.
 
 **Keep the store as durable as consumer data.** If the store survives what consumer data survives, a rebuilt cluster only needs the store back; otherwise the administrators import connection entries (see "Administration").
 
@@ -169,8 +202,8 @@ Documented for Provider authors ([08 Quickstart, "Documentation for Provider aut
 ## Work breakdown
 
 1. Module scaffold, protocol types, test vectors.
-2. Storage interface, in-memory store for tests, Kubernetes reference store.
-3. Tokens and portal primitives, hooks.
+2. Storage: the per-entity interfaces, the Kubernetes defaults, an in-memory store, the conformance test.
+3. Tokens and portal primitives, hooks, metrics.
 4. Connection API handlers.
 5. Control sessions (inner TLS server, bearer check, compare-and-swap on the bundle).
 6. Session server (handshake limits, inner mutual TLS, hello, yamux, registry, re-checking sessions on a bundle change).
@@ -192,9 +225,10 @@ Documented for Provider authors ([08 Quickstart, "Documentation for Provider aut
 ## Decided
 
 - **One active replica** (leader election, standbys answer `503` with `Retry-After: 5`); horizontal scale is a follow-up needing no PM-side work.
-- **Hooks**: a struct of optional typed functions, called directly; reliability is the implementor's choice.
+- **Hooks**: a struct of optional typed functions, called directly, for changes a Provider tells customers or audits; reliability is the implementor's choice. Operational signals are metrics, without `connectionID` labels.
 - **Server keys rotate only on demand**, through an administration command with a deadline.
 - **Go only.** The protocol specification and test vectors exist, but third-party implementations aren't a supported target.
-- **Reference store**: custom resources plus Secrets.
+- **Storage**: per-entity interfaces with Kubernetes defaults (custom resources plus Secrets); server keys only through a `crypto.Signer`; a conformance test for any store.
+- **Connector CA bundle**: PEM, parsed strictly.
 - **Recovery**: secrets change only through the `ProviderEndpoint`; recovery beyond that is out-of-band, through the administration commands.
 - **Module**: `go.platform-mesh.io/provider-sdk`; independent semver; upgrade signals as above.
