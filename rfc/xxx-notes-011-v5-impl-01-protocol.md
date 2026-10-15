@@ -1,242 +1,242 @@
 # v5 implementation plan: protocol
 
-Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). The wire contract between the PM-side ([platform-mesh-operator](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md), which makes every registration and control call, and the [connectors](./xxx-notes-011-v5-impl-05-connector.md)) and the Provider-side (the [SDK](./xxx-notes-011-v5-impl-07-provider-sdk.md)). Both sides implement exactly this document; neither relies on anything the other does beyond it.
+Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). The wire contract between the PM-side ([platform-mesh-operator](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md), which makes every Registration and Control Call, and the [connectors](./xxx-notes-011-v5-impl-05-connector.md)) and the Provider-side (the [SDK](./xxx-notes-011-v5-impl-07-provider-sdk.md)). Both sides implement exactly this document; neither relies on anything the other does beyond it.
 
 ## Principles
 
-- **Everything that grants anything travels inside inner TLS.** Plain HTTPS carries only the onboarding token (single-use, spent on first use) and public material.
-- **The Provider-side is the verifier of every PM credential**; PM verifies the Provider-side by pinned server keys. Neither side needs the other's CA infrastructure beyond pinned material.
+- **Everything that grants anything travels inside Inner TLS.** Plain HTTPS carries only the Onboarding Token (single-use, spent on first use) and public material.
+- **The Provider-side is the verifier of every PM credential**; PM verifies the Provider-side by pinned Server Keys. Neither side needs the other's CA infrastructure beyond pinned material.
 - **Every request is idempotent or safely retryable**, and responses carry nothing secret.
 - **The protocol is versioned** from the first release, and every message is forward-compatible (unknown fields ignored).
 
 ## Endpoints at a glance
 
-All paths are relative to the Provider's **base URL** from the onboarding token.
+All paths are relative to the Provider's **Base URL** from the Onboarding Token.
 
 | Endpoint | Transport | Caller | Authenticated by | Purpose |
 |---|---|---|---|---|
-| `POST /v1/connections` | plain HTTPS | platform-mesh-operator | onboarding token | Register a connection |
-| `GET /v1/connections/{id}/control` | WebSocket + inner TLS | platform-mesh-operator | inner TLS: pinned server key (server); connection secret inside (client) | Control calls |
-| `GET /v1/connections/{id}/session` | WebSocket + inner mutual TLS | connector | inner TLS: connector certificate (client), pinned server key (server) | A session carrying the multiplexer |
+| `POST /v1/connections` | plain HTTPS | `platform-mesh-operator` | Onboarding Token | Register a Connection |
+| `GET /v1/connections/{id}/control` | WebSocket + Inner TLS | `platform-mesh-operator` | Inner TLS: pinned Server Key (server); Connection Secret inside (client) | Control Calls |
+| `GET /v1/connections/{id}/session` | WebSocket + inner mutual TLS | Connector | Inner TLS: Connector Certificate (client), pinned Server Key (server) | A Session carrying the multiplexer |
 
-Registration is the only plain-HTTPS call. Every TLS connection to the base URL (registration, and the outer TLS of control sessions and sessions) is verified with web PKI, or with the `Provider`'s `spec.remote.caBundle` when set; connectors get it from the `ProviderEndpoint`. The outer TLS isn't what protects sessions (the inner TLS is), but it has to succeed for anything to connect.
+Registration is the only plain-HTTPS call. Every TLS connection to the Base URL (Registration, and the outer TLS of Control Sessions and Sessions) is verified with web PKI, or with the `Provider`'s `spec.remote.caBundle` when set; Connectors get it from the `ProviderEndpoint`. The outer TLS isn't what protects Sessions (the Inner TLS is), but it has to succeed for anything to connect.
 
-The two WebSocket endpoints accept the upgrade before the caller is authenticated; authentication happens in the inner TLS (sessions) or on each request inside it (control sessions). The Provider-side refuses unknown or deleted connection IDs before the upgrade, caps the handshakes in progress, per connection and in total, and gives each a short timeout (a few seconds); callers beyond the cap get `503` before the upgrade. Connection IDs are random and unguessable, so probing can't find valid ones, but they aren't secret: owners, provider workspaces and the Provider's edge all see them.
+The two WebSocket endpoints accept the upgrade before the caller is authenticated; authentication happens in the Inner TLS (Sessions) or on each request inside it (Control Sessions). The Provider-side refuses unknown or deleted Connection IDs before the upgrade, caps the handshakes in progress, per Connection and in total, and gives each a short timeout (a few seconds); callers beyond the cap get `503` before the upgrade. Connection IDs are random and unguessable, so probing can't find valid ones, but they aren't secret: Owners, Provider Workspaces and the Provider's Edge all see them.
 
-## Onboarding token
+## Onboarding Token
 
-- **Format**: `pm1.<base64url(base URL)>.<tokenID>.<tokenSecret>`. The base URL inside ensures the token is only ever sent to its issuer.
+- **Format**: `pm1.<base64url(base URL)>.<tokenID>.<tokenSecret>`. The Base URL inside ensures the token is only ever sent to its issuer.
 - **Single-use and short-lived**; the Provider-side stores only a hash of `tokenSecret`.
-- **Bound to the issuing owner account** on the Provider-side, which owns the connection it registers (portal listing, billing).
-- **Spent on first successful `POST`**, but a retry with the same idempotency key and secret hash within a window (7 days by default) returns the same result (see "Idempotency").
+- **Bound to the issuing Owner account** on the Provider-side, which owns the Connection it registers (portal listing, billing).
+- **Spent on first successful `POST`**, but a retry with the same idempotency key and Connection Secret hash within a window (7 days by default) returns the same result (see "Idempotency").
 
-## Connection secret
+## Connection Secret
 
 - **Generated by the PM-side**: prefix plus 256 random bits, `pmc1_<base64url>`. The prefix lets secret scanners recognise it.
-- **Only its hash leaves the PM-side** (`sha256:<hex>`): in the registration request, and in the connection's `ProviderEndpoint` when it changes (see "Changing the secret"). High entropy makes a plain SHA-256 sufficient.
-- **Used only inside control sessions**, never on plain HTTPS.
-- **Stored by the PM-side outside kcp**, in platform-mesh-operator's namespace in PM's runtime cluster ([02 APIs, "Its Secret"](./xxx-notes-011-v5-impl-02-apis.md)). The Provider-side stores only the current hash.
+- **Only its hash leaves the PM-side** (`sha256:<hex>`): in the Registration request, and in the Connection's `ProviderEndpoint` when it changes (see "Changing the Connection Secret"). High entropy makes a plain SHA-256 sufficient.
+- **Used only inside Control Sessions**, never on plain HTTPS.
+- **Stored by the PM-side outside kcp**, in `platform-mesh-operator`'s namespace in PM's runtime cluster ([02 APIs, "Its `Secret`"](./xxx-notes-011-v5-impl-02-apis.md)). The Provider-side stores only the current hash.
 
-## Changing the secret
+## Changing the Connection Secret
 
-The secret changes only through the connection's **`ProviderEndpoint`**, never through a call:
-1. platform-mesh-operator generates a new secret, stores it, and writes its hash into the `ProviderEndpoint`'s `pendingSecretHash`.
-2. The Provider-side reads the `ProviderEndpoint` over one of the connection's sessions and makes that hash the current one. The old secret stops working.
-3. platform-mesh-operator confirms with a control call using the new secret, then clears `pendingSecretHash`.
+The Connection Secret changes only through the Connection's **`ProviderEndpoint`**, never through a call:
+1. `platform-mesh-operator` generates a new Connection Secret, stores it, and writes its hash into the `ProviderEndpoint`'s `pendingSecretHash`.
+2. The Provider-side reads the `ProviderEndpoint` over one of the Connection's Sessions and makes that hash the current one. The old Connection Secret stops working.
+3. `platform-mesh-operator` confirms with a Control Call using the new Connection Secret, then clears `pendingSecretHash`.
 
 Why this is safe:
-- **Only PM can write the `ProviderEndpoint`**: the connection export's maximal permission policy refuses writes even to the provider workspace's admins ([02 APIs, "Connection export"](./xxx-notes-011-v5-impl-02-apis.md)).
-- **The Provider-side reads it only over a valid session**: one whose connector certificate verified against the connection's pinned connector CA bundle, and whose hello named the connection's `clusterName` (see "Sessions").
-- **So nobody but PM can change the secret.** Holding the current secret, an onboarding token or a portal account doesn't help, which also means a thief can't lock PM out.
+- **Only PM can write the `ProviderEndpoint`**: the Connection Export's maximal permission policy refuses writes even to the Provider Workspace's admins ([02 APIs, "Connection Export"](./xxx-notes-011-v5-impl-02-apis.md)).
+- **The Provider-side reads it only over a valid Session**: one whose Connector Certificate verified against the Connection's Pinned Bundle, and whose Hello named the Connection's `clusterName` (see "Sessions").
+- **So nobody but PM can change the Connection Secret.** Holding the current Connection Secret, an Onboarding Token or a portal account doesn't help, which also means a thief can't lock PM out.
 
-It needs a working session. Without one, the change waits; the Provider-side keeps the current hash meanwhile.
+It needs a working Session. Without one, the change waits; the Provider-side keeps the current hash meanwhile.
 
 ## Registration
 
-Request: idempotency key (the `ProviderOnboardingRequest` UID), `clusterName` (the logical cluster name of the provider workspace, as kcp assigns it), front-proxy URL, the secret's hash, and the connector CA bundle (see "Connector CA bundle"). Its version is the path's (`/v1`).
+Request: idempotency key (the `ProviderOnboardingRequest` UID), `clusterName` (the logical cluster name of the Provider Workspace, as kcp assigns it), front-proxy URL, the Connection Secret's hash, and the Trusted Set, which becomes the Connection's Pinned Bundle (see "Pinned Bundle"). Its version is the path's (`/v1`).
 
-Response: `connectionID` and the Provider-side's **server keys** (public keys, a list to allow rotation).
+Response: `connectionID` and the Provider-side's **Server Keys** (public keys, a list to allow rotation).
 
 Rules:
-- **Only new connections.** Registration never changes an existing connection.
-- **Idempotency**: keyed on `(tokenID, idempotencyKey)`. A retry with the same `secretHash` returns the same response (`connectionID` and server keys); a different hash is refused. After the token's expiry, a retry is still honoured for a **generous window, 7 days by default**, so an operator that crashed between the call and persisting its result can always recover it.
-- **Orphans expire**: a connection that has seen neither a control call nor a session by the end of that window is removed by the Provider-side. That's a registration whose result PM never stored. A connection that was used once is never expired for being idle.
-- **Addressing is immutable**: `clusterName` and front-proxy URL are fixed for the connection's life.
-- **Trust in the response** comes from web PKI on the base URL, or the `Provider`'s `caBundle`; it's what makes the returned server keys safe to pin.
+- **Only new Connections.** Registration never changes an existing Connection.
+- **Idempotency**: keyed on `(tokenID, idempotencyKey)`. A retry with the same `secretHash` returns the same response (`connectionID` and Server Keys); a different hash is refused. After the token's expiry, a retry is still honoured for a **generous window, 7 days by default**, so an operator that crashed between the call and persisting its result can always recover it.
+- **Orphans expire**: a Connection that has seen neither a Control Call nor a Session by the end of that window is removed by the Provider-side. That's a Registration whose result PM never stored. A Connection that was used once is never expired for being idle.
+- **Addressing is immutable**: `clusterName` and front-proxy URL are fixed for the Connection's life.
+- **Trust in the response** comes from web PKI on the Base URL, or the `Provider`'s `caBundle`; it's what makes the returned Server Keys safe to pin.
 
-## Control sessions
+## Control Sessions
 
 A WebSocket upgrade on `/v1/connections/{id}/control`, then a TLS 1.3 handshake inside the WebSocket:
-- **Server**: the Provider-side presents a self-signed certificate for one of its server keys; platform-mesh-operator accepts only keys pinned for this connection.
-- **Client**: no client certificate. platform-mesh-operator sends the connection secret as a bearer credential on each request inside the inner TLS. A client certificate can't be used: the only candidate is one from the connector CA, and control calls must not depend on the connector CA, since they're what brings a Provider with an outdated bundle up to date.
-- **Inside**: HTTP/1.1 with keep-alive, so one control session can carry several calls in a row. ALPN names the control protocol and its version (e.g. `pm-control/1`).
-- **First failed authentication closes the control session.** Every attempt with a wrong secret therefore costs a new WebSocket and handshake, which the limits on handshakes govern; platform-mesh-operator never fails authentication on purpose.
+- **Server**: the Provider-side presents a self-signed certificate for one of its Server Keys; `platform-mesh-operator` accepts only keys pinned for this Connection.
+- **Client**: no client certificate. `platform-mesh-operator` sends the Connection Secret as a bearer credential on each request inside the Inner TLS. A client certificate can't be used: the only candidate is one from the Connector CA, and Control Calls must not depend on the Connector CA, since they're what brings a Provider with an outdated bundle up to date.
+- **Inside**: HTTP/1.1 with keep-alive, so one Control Session can carry several calls in a row. ALPN names the control protocol and its version (e.g. `pm-control/1`).
+- **First failed authentication closes the Control Session.** Every attempt with a wrong Connection Secret therefore costs a new WebSocket and handshake, which the limits on handshakes govern; `platform-mesh-operator` never fails authentication on purpose.
 
-Control calls:
+Control Calls:
 
 | Call | Effect |
 |---|---|
-| `GET /v1/connections/{id}` | Status (see "Status"), server keys, the pinned connector CA bundle's `etag` and fingerprints |
-| `PUT /v1/connections/{id}/connector-ca-bundle` | Replace the pinned connector CA bundle (rollover), with `If-Match`; see "Connector CA bundle" |
-| `DELETE /v1/connections/{id}` | Delete the connection; all its sessions close |
+| `GET /v1/connections/{id}` | Status (see "Status"), Server Keys, the Pinned Bundle's `etag` and fingerprints |
+| `PUT /v1/connections/{id}/connector-ca-bundle` | Replace the Pinned Bundle (Rollover), with `If-Match`; see "Pinned Bundle" |
+| `DELETE /v1/connections/{id}` | Delete the Connection; all its Sessions close |
 
-There's no call that changes the secret (see "Changing the secret").
+There's no call that changes the Connection Secret (see "Changing the Connection Secret").
 
-### Connector CA bundle
+### Pinned Bundle
 
-The connector CA certificates a connection pins travel as a **PEM bundle**, like every other CA bundle in Kubernetes: one `CERTIFICATE` block per CA of PM's **trusted set**, the current connector CA, and during a rollover the previous one ([04 Connector CA, "The trusted set"](./xxx-notes-011-v5-impl-04-connector-ca.md)). The rationale, including how this compares with other trust-anchor APIs, is in v5, "Distributing the connector CA to Providers".
+The Connector CA certificates a Connection pins travel as a **PEM bundle**, like every other CA bundle in Kubernetes: one `CERTIFICATE` block per CA of PM's **Trusted Set**, the current Connector CA, and during a Rollover the previous one ([04 Connector CA, "The Trusted Set"](./xxx-notes-011-v5-impl-04-connector-ca.md)). The rationale, including how this compares with other trust-anchor APIs, is in v5, "Distributing the Connector CA to Providers".
 
-- **Sent at registration** and **replaced by `PUT …/connector-ca-bundle`** whenever the trusted set changes, which is a few times a year. Both carry it as a JSON string field, `connectorCABundle`.
+- **Sent at Registration** and **replaced by `PUT …/connector-ca-bundle`** whenever the Trusted Set changes, which is a few times a year. Both carry it as a JSON string field, `connectorCABundle`.
 - **Parsed strictly**: only `CERTIFICATE` blocks, without PEM headers; only whitespace before, between and after blocks; no duplicate certificates; every certificate a CA (`basicConstraints CA:true`, `keyCertSign`); bounded number of certificates and total size. Anything else is refused as a whole.
-- **Compare-and-swap**: `GET` returns the pinned bundle's `etag` (a hash over the sorted SHA-256 fingerprints of its certificates, computed by the Provider-side) and the CAs' fingerprints. A `PUT` must carry `If-Match: <etag>`; a mismatch is refused with `412` and the current `etag`, and a bundle with the same set of certificates as the pinned one is a no-op, whatever its order or whitespace. Reordered or duplicated calls, for example from two operator workers during a handover, therefore can't overwrite a newer bundle unnoticed.
-- **PM can always restore its bundle**, even after someone holding the connection secret replaced it (see [03 Operator, "Connector CA trusted set"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
-- **Accepted even if every pinned CA has expired.** A push is authenticated by the connection secret and protected by compare-and-swap; the pinned CAs play no part. A Provider that was down through any number of rollovers is caught up by its first successful control call.
-- **Only on the control channel**, never through a session: a session is authenticated by the CA it would be changing.
-- **Open sessions are checked against a new bundle.** Sessions are only verified when they open, so on its own, removing a CA wouldn't affect sessions already opened under it. When the Provider-side accepts a new bundle (a push, or a re-pin by its administrators), it checks each open session of that connection: if the session's client certificate, kept from its handshake, no longer chains to a CA in the new bundle, the Provider-side sends go-away, lets in-flight requests finish within a short grace period (e.g. 30 seconds), then closes the session. Only the issuer counts, not the certificate's expiry, so sessions still outlive an expired connector certificate. A bundle that only adds CAs closes nothing. PM's connectors reconnect at once with a certificate from a trusted CA; anyone else can't.
+- **Compare-and-swap**: `GET` returns the Pinned Bundle's `etag` (a hash over the sorted SHA-256 fingerprints of its certificates, computed by the Provider-side) and the CAs' fingerprints. A `PUT` must carry `If-Match: <etag>`; a mismatch is refused with `412` and the current `etag`, and a bundle with the same set of certificates as the pinned one is a no-op, whatever its order or whitespace. Reordered or duplicated calls, for example from two operator workers during a handover, therefore can't overwrite a newer bundle unnoticed.
+- **PM can always restore its bundle**, even after someone holding the Connection Secret replaced it (see [03 Operator, "Trusted Set"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
+- **Accepted even if every pinned CA has expired.** A push is authenticated by the Connection Secret and protected by compare-and-swap; the pinned CAs play no part. A Provider that was down through any number of Rollovers is caught up by its first successful Control Call.
+- **Only on the control channel**, never through a Session: a Session is authenticated by the CA it would be changing.
+- **Open Sessions are checked against a new bundle.** Sessions are only verified when they open, so on its own, removing a CA wouldn't affect Sessions already opened under it. When the Provider-side accepts a new bundle (a push, or a re-pin by its administrators), it checks each open Session of that Connection: if the Session's client certificate, kept from its handshake, no longer chains to a CA in the new bundle, the Provider-side sends go-away, lets in-flight requests finish within a short grace period (e.g. 30 seconds), then closes the Session. Only the issuer counts, not the certificate's expiry, so Sessions still outlive an expired Connector Certificate. A bundle that only adds CAs closes nothing. PM's Connectors reconnect at once with a certificate from a trusted CA; anyone else can't.
 
-  Why: someone who gets a connector CA's key or a connector certificate's key on its own (from a compromised external PKI, or a single Secret leaked in a backup or log) can open sessions and act as PM's connector, feeding the Provider made-up objects and receiving what it writes back, without any kcp access. PM's response is to renew the CA and drop the leaked one; this rule is what ends the sessions already opened with it. It doesn't help against an attacker who still has access to PM's runtime cluster, who would also have kcp access and could do it again. In a normal rollover, this is also how sessions still on the old CA's certificate move to the new one: platform-mesh-operator spreads the old CA's drop over several hours, so the handovers, and the relists of long-running watches on those sessions, are spread too ([03 Operator, "Connector CA trusted set"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
+  Why: someone who gets a Connector CA's key or a Connector Certificate's key on its own (from a compromised external PKI, or a single `Secret` leaked in a backup or log) can open Sessions and act as PM's Connector, feeding the Provider made-up objects and receiving what it writes back, without any kcp access. PM's response is to renew the CA and drop the leaked one; this rule is what ends the Sessions already opened with it. It doesn't help against an attacker who still has access to PM's runtime cluster, who would also have kcp access and could do it again. In a normal Rollover, this is also how Sessions still on the old CA's certificate move to the new one: `platform-mesh-operator` spreads the old CA's drop over several hours, so the handovers, and the relists of long-running watches on those Sessions, are spread too ([03 Operator, "Trusted Set"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
 
 ## WebSocket framing
 
-Applies to control sessions and sessions alike, so that they pass common edges (ingresses, load balancers, CDNs, WAFs) unchanged:
-- **Binary messages only.** Everything inside is TLS ciphertext; text messages are a protocol error and close the connection.
-- **At most 32 KB per message**, in both directions. TLS records are at most 16 KB anyway; the cap keeps every message under common edge limits. A larger message is a protocol error.
+Applies to Control Sessions and Sessions alike, so that they pass common edges (ingresses, load balancers, CDNs, WAFs) unchanged:
+- **Binary messages only.** Everything inside is TLS ciphertext; text messages are a protocol error and close the WebSocket.
+- **At most 32 KB per message**, in both directions. TLS records are at most 16 KB anyway; the cap keeps every message under common Edge limits. A larger message is a protocol error.
 - **Pings at the outer level** at a fixed interval (e.g. 30 seconds), so idle timeouts above that never fire.
-- **No reliance on message boundaries**: the inner TLS is a byte stream over the messages; either side may split or coalesce.
+- **No reliance on message boundaries**: the Inner TLS is a byte stream over the messages; either side may split or coalesce.
 - **Only the upgrade request is plain HTTP.** It's an ordinary `GET` with the `Upgrade: websocket` handshake, from a non-browser client: no cookies, no JavaScript. Edges must not answer it with a bot challenge.
 
-## Diagnosing the edge
+## Diagnosing the Edge
 
-Most onboarding problems come from the Provider's edge, not the protocol. The PM-side classifies failures on the first control session after registration, and on every reconnect, and reports them with distinct reasons ([03 Operator, "Health"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)):
+Most Onboarding problems come from the Provider's Edge, not the protocol. The PM-side classifies failures on the first Control Session after Registration, and on every reconnect, and reports them with distinct reasons ([03 Operator, "Health"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)):
 - **upgrade refused** (a non-`101` response), including **an HTML page in response**, the typical sign of a bot challenge or WAF block page;
-- **connection closed right after a binary message**, the typical sign of a WAF inspecting WebSocket payloads;
-- **connection closed at a regular age or after a regular idle time**, the sign of an edge timeout below what the protocol needs.
+- **The WebSocket closed right after a binary message**, the typical sign of a WAF inspecting WebSocket payloads;
+- **The WebSocket closed at a regular age or after a regular idle time**, the sign of an Edge timeout below what the protocol needs.
 
-Providers check their edge against the quickstart's checklist ([08 Quickstart, "Connection server"](./xxx-notes-011-v5-impl-08-provider-quickstart.md)); a self-test tool for Providers is a [follow-up](./xxx-notes-011-v5-impl-todo.md).
+Providers check their Edge against the quickstart's checklist ([08 Quickstart, "Connection API server"](./xxx-notes-011-v5-impl-08-provider-quickstart.md)); a self-test tool for Providers is a [follow-up](./xxx-notes-011-v5-impl-todo.md).
 
 ## Sessions
 
-### Sessions and streams
+### Sessions and Streams
 
-A **session** is a long-lived tunnel between PM and a Provider; **streams** are the lightweight connections running inside it.
+A **Session** is a long-lived tunnel between PM and a Provider; **Streams** are the lightweight connections running inside it.
 
 | | Session | Stream |
 |---|---|---|
-| **What it is** | One WebSocket, with inner TLS and the yamux multiplexer inside | One logical connection inside a session, created by yamux |
-| **Who opens it** | PM: a connector replica dials the Provider | The Provider-side: the SDK opens one whenever client-go wants a new connection to a kcp host |
-| **For what** | One connection (one provider workspace), on one shard | One HTTP connection from client-go: requests one after another, or one long watch |
-| **Authentication** | Once, when it opens: the inner TLS handshake, then the hello | None of its own: it inherits the session's. The connector authorizes each request on it |
-| **Cost to open** | A WebSocket upgrade through the Provider's edge, plus a TLS handshake | A yamux frame |
-| **Lifetime** | Hours; replaced before the edge's maximum connection age | Seconds for requests (or reused with keep-alive), hours for a watch |
-| **How many** | One per (connection, shard with traffic, connector replica): typically single digits per PM installation | One per concurrent request or watch: typically tens per Provider |
-| **Visible at the Provider's edge** | Yes, as one WebSocket connection | No, only as opaque bytes inside the session |
-| **If it ends** | All its streams end; client-go reopens them on another session | Only that request or watch; client-go retries or re-watches |
+| **What it is** | One WebSocket, with Inner TLS and the yamux multiplexer inside | One logical connection inside a Session, created by yamux |
+| **Who opens it** | PM: a Connector Replica dials the Provider | The Provider-side: the SDK opens one whenever client-go wants a new connection to a kcp host |
+| **For what** | One Connection (one Provider Workspace), on one shard | One HTTP connection from client-go: requests one after another, or one long watch |
+| **Authentication** | Once, when it opens: the Inner TLS handshake, then the Hello | None of its own: it inherits the Session's. The Connector authorizes each request on it |
+| **Cost to open** | A WebSocket upgrade through the Provider's Edge, plus a TLS handshake | A yamux frame |
+| **Lifetime** | Hours; replaced before the Edge's maximum connection age | Seconds for requests (or reused with keep-alive), hours for a watch |
+| **How many** | One per (Connection, shard with traffic, Connector Replica): typically single digits per PM Instance | One per concurrent request or watch: typically tens per Provider |
+| **Visible at the Provider's Edge** | Yes, as one WebSocket connection | No, only as opaque bytes inside the Session |
+| **If it ends** | All its Streams end; client-go reopens them on another Session | Only that request or watch; client-go retries or re-watches |
 
-It's like an HTTP/2 connection and its streams, with one difference in direction: PM sets up the session, because the Provider can't reach PM, but the Provider opens the streams, because it's the client talking to kcp.
+It's like an HTTP/2 connection and its streams, with one difference in direction: PM sets up the Session, because the Provider can't reach PM, but the Provider opens the Streams, because it's the client talking to kcp.
 
-**How they fit together in practice.** The Provider's controller wants to watch `cowboys` on shard B. client-go asks the SDK for a connection to shard B's virtual-workspace host. The SDK picks one of the sessions serving that host and opens a stream on it. client-go sends `GET …/cowboys?watch=true` over that stream; the connector authorizes it, adds the SA token and forwards it to kcp; the watch events stream back on the same stream for hours. Other watches and requests on shard B get their own streams, on the same session or another one serving that host.
+**How they fit together in practice.** The Provider's controller wants to watch `cowboys` on shard B. client-go asks the SDK for a connection to shard B's virtual-workspace host. The SDK picks one of the Sessions serving that host and opens a Stream on it. client-go sends `GET …/cowboys?watch=true` over that Stream; the Connector authorizes it, adds the SA token and forwards it to kcp; the watch events stream back on the same Stream for hours. Other watches and requests on shard B get their own Streams, on the same Session or another one serving that host.
 
 ### Upgrade
 
-A plain WebSocket upgrade on `/v1/connections/{id}/session`, without credentials. Unknown connection IDs are refused, and the handshake limits apply (see "Endpoints at a glance").
+A plain WebSocket upgrade on `/v1/connections/{id}/session`, without credentials. Unknown Connection IDs are refused, and the handshake limits apply (see "Endpoints at a glance").
 
 ### Inner layer
 
 After the upgrade, a TLS 1.3 handshake inside the WebSocket, with mutual authentication:
-- **Client**: the connector presents its connector certificate. The Provider-side verifies it against **only** the CA certificates in the connection's pinned connector CA bundle: the certificate must be issued directly by one of them (no intermediates), be valid, with the pinned CA itself unexpired too, and allow signing and client authentication (key usage `digitalSignature`, EKU `clientAuth`). Go's verifier requires EKU `serverAuth` unless told otherwise, so the SDK passes `clientAuth` explicitly.
-- **Server**: the Provider-side presents a self-signed certificate for one of its server keys; the connector accepts only keys pinned for this connection (read from the `ProviderEndpoint`, see [02 APIs](./xxx-notes-011-v5-impl-02-apis.md)).
-- **ALPN** names the session protocol and version (e.g. `pm-session/1`), so a future change is negotiated, not guessed.
+- **Client**: the Connector presents its Connector Certificate. The Provider-side verifies it against **only** the CA certificates in the Connection's Pinned Bundle: the certificate must be issued directly by one of them (no intermediates), be valid, with the pinned CA itself unexpired too, and allow signing and client authentication (key usage `digitalSignature`, EKU `clientAuth`). Go's verifier requires EKU `serverAuth` unless told otherwise, so the SDK passes `clientAuth` explicitly.
+- **Server**: the Provider-side presents a self-signed certificate for one of its Server Keys; the Connector accepts only keys pinned for this Connection (read from the `ProviderEndpoint`, see [02 APIs](./xxx-notes-011-v5-impl-02-apis.md)).
+- **ALPN** names the Session protocol and version (e.g. `pm-session/1`), so a future change is negotiated, not guessed.
 
 That handshake is the whole authentication; no separate token is needed:
-- **Possession of the key**: the connector signs the handshake transcript with its certificate's key.
+- **Possession of the key**: the Connector signs the handshake transcript with its certificate's key.
 - **No replay**: the transcript includes fresh random values from both sides, so a recorded handshake is useless for a new one.
-- **Bound to this Provider**: the transcript includes the Provider's server certificate, and the connector only accepts the server key pinned for this connection. A Provider that forwarded the connector's handshake to another Provider would present the wrong key.
+- **Bound to this Provider**: the transcript includes the Provider's server certificate, and the Connector only accepts the Server Key pinned for this Connection. A Provider that forwarded the Connector's handshake to another Provider would present the wrong key.
 
 ### Hello
 
-The first message inside the inner TLS, before the multiplexer starts, sent by the connector:
-- **`clusterName`**: the provider workspace this session is for. The connector takes it from the logical cluster of the `ProviderEndpoint` it acts on.
-- **`hosts`**: the hosts this session serves (see "Hosts a session serves").
-- **`sub`**: an opaque session-group ID, for audit.
+The first message inside the Inner TLS, before the multiplexer starts, sent by the Connector:
+- **`clusterName`**: the Provider Workspace this Session is for. The Connector takes it from the logical cluster of the `ProviderEndpoint` it acts on.
+- **`hosts`**: the hosts this Session serves (see "Hosts a Session serves").
+- **`sub`**: an opaque Session-group ID, for audit.
 
-It's protected by the inner TLS, so it needs no signature. The Provider-side checks that `clusterName` equals the one stored at registration and closes the session otherwise. `ProviderEndpoint`s can only be written by PM, so this is defense in depth: even a PM-side bug that mixed up `ProviderEndpoint`s couldn't make a connector serve one connection's session with another provider workspace's SA. A length-prefixed message, with a small maximum size.
+It's protected by the Inner TLS, so it needs no signature. The Provider-side checks that `clusterName` equals the one stored at Registration and closes the Session otherwise. `ProviderEndpoint`s can only be written by PM, so this is defense in depth: even a PM-side bug that mixed up `ProviderEndpoint`s couldn't make a Connector serve one Connection's Session with another Provider Workspace's SA. A length-prefixed message, with a small maximum size.
 
 ### Multiplexer
 
-- **yamux** runs inside the inner TLS.
-- **Only the Provider-side opens streams.** The connector refuses streams it didn't expect and never opens any.
-- **Each stream carries plain HTTP/1.1 from its first byte.** The connector checks each request's `Host` against its allow-list before forwarding it ([05 Connector, "Request pipeline"](./xxx-notes-011-v5-impl-05-connector.md)). The Provider-side uses the target address only to choose which session to open the stream on.
-- **Flow control per stream** is required: a slow reader on one stream must not stall others or force unbounded buffering.
-- **Go-away from either side**: the connector signals graceful replacement with yamux's go-away, and the Provider-side may send it too (e.g. when a connection moves between its replicas). On go-away from the connector, the Provider-side stops opening streams on that session and lets in-flight ones finish.
+- **yamux** runs inside the Inner TLS.
+- **Only the Provider-side opens Streams.** The Connector refuses Streams it didn't expect and never opens any.
+- **Each Stream carries plain HTTP/1.1 from its first byte.** The Connector checks each request's `Host` against its allow-list before forwarding it ([05 Connector, "Request pipeline"](./xxx-notes-011-v5-impl-05-connector.md)). The Provider-side uses the target address only to choose which Session to open the Stream on.
+- **Flow control per Stream** is required: a slow reader on one Stream must not stall others or force unbounded buffering.
+- **Go-away from either side**: the Connector signals graceful replacement with yamux's go-away, and the Provider-side may send it too (e.g. when a Connection moves between its replicas). On go-away from the Connector, the Provider-side stops opening Streams on that Session and lets in-flight ones finish.
 - **Liveness**: WebSocket pings at the outer level (so ingresses see traffic), yamux keepalives inside.
 
-### Hosts a session serves
+### Hosts a Session serves
 
-- **The hosts in the hello's `hosts`**: the shard's virtual-workspace host, taken from the connector's configuration and sent at the start of every new session.
-- **The connection's front-proxy host**, on every session.
+- **The hosts in the Hello's `hosts`**: the shard's virtual-workspace host, taken from the Connector's configuration and sent at the start of every new Session.
+- **The Connection's front-proxy host**, on every Session.
 
-The hosts are **routing information, not authority**. The Provider-side never resolves them (its dial hook opens streams on sessions), so they're labels it can't verify independently, and it doesn't need to: a session that passed the inner TLS and the hello's `clusterName` check already belongs to PM's connector for this connection, and which host it serves only decides where streams go. Keeping hosts out of the connector certificate means a hostname change on PM's side never waits for certificates to be reissued: during a rename, connectors list both the old and the new host until endpoint slices have switched, so the order of DNS, configuration and endpoint-slice changes doesn't matter.
+The hosts are **routing information, not authority**. The Provider-side never resolves them (its dial hook opens Streams on Sessions), so they're labels it can't verify independently, and it doesn't need to: a Session that passed the Inner TLS and the Hello's `clusterName` check already belongs to PM's Connector for this Connection, and which host it serves only decides where Streams go. Keeping hosts out of the Connector Certificate means a hostname change on PM's side never waits for certificates to be reissued: during a rename, Connectors list both the old and the new host until endpoint slices have switched, so the order of DNS, configuration and endpoint-slice changes doesn't matter.
 
-### What binds a session to its PM installation
+### What binds a Session to its PM Instance
 
-The connector CA pinned **for this connection**: each PM installation has its own CA, managed by its own cert-manager; with an external PKI, each installation has its own intermediate, and that's what Providers pin ([04 Connector CA, "The CA"](./xxx-notes-011-v5-impl-04-connector-ca.md)). Connector certificates carry no installation identity and no hostnames. If two installations shared a CA, a compromised connector of one could open sessions for the other's connections.
+The Connector CA pinned **for this Connection**: each PM Instance has its own CA, managed by its own cert-manager; with an external PKI, each installation has its own intermediate, and that's what Providers pin ([04 Connector CA, "The CA"](./xxx-notes-011-v5-impl-04-connector-ca.md)). Connector Certificates carry no installation identity and no hostnames. If two installations shared a CA, a compromised Connector of one could open Sessions for the other's Connections.
 
 ## Provider replicas
 
-The protocol makes **no assumption about which Provider replica a session or control session reaches.** Two sessions of one connection, or two consecutive sessions on one shard, may end on different replicas; the Provider-side may close or go-away any session at any time and expects the connector to reconnect. This keeps every replica strategy the SDK offers ([07 SDK, "Replicas"](./xxx-notes-011-v5-impl-07-provider-sdk.md)) invisible to PM.
+The protocol makes **no assumption about which Provider replica a Session or Control Session reaches.** Two Sessions of one Connection, or two consecutive Sessions on one shard, may end on different replicas; the Provider-side may close or go-away any Session at any time and expects the Connector to reconnect. This keeps every replica strategy the SDK offers ([07 SDK, "Replicas"](./xxx-notes-011-v5-impl-07-provider-sdk.md)) invisible to PM.
 
 ## Recovery
 
 What each side can lose, and how it comes back:
-- **The PM-side loses the secret, or the Provider-side rejects it** (e.g. its store was restored from an older backup): platform-mesh-operator changes the secret through the `ProviderEndpoint` (see "Changing the secret"). The `connectionID` and all Provider-side state stay.
-- **The Provider-side no longer knows the connection** (deleted in the portal, or its store lost): it answers with the stable "unknown connection" status (see "Errors and retries"). Two ways back: the Provider's administrators import the old entry, which keeps the `connectionID` and is preferred when the Provider still has the data; or the owner onboards the same `Provider` again, which registers a **new** connection, meant for switching Providers or a connection the Provider won't restore ([03 Operator, "Onboarding requests"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
-- **No session verifies and control calls fail authentication** (a pinned bundle that missed a rollover, and a secret the Provider-side lost or rejects): nothing in the protocol can fix this. Pushing a bundle needs the secret, and repairing the secret needs a session. A missed rollover alone isn't this case: platform-mesh-operator's first successful control call pushes the current bundle. The Provider's administrators re-pin the bundle out-of-band ([07 SDK, "Administration"](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
+- **The PM-side loses the Connection Secret, or the Provider-side rejects it** (e.g. its store was restored from an older backup): `platform-mesh-operator` changes the Connection Secret through the `ProviderEndpoint` (see "Changing the Connection Secret"). The `connectionID` and all Provider-side state stay.
+- **The Provider-side no longer knows the Connection** (deleted in the portal, or its store lost): it answers with the stable "unknown Connection" status (see "Errors and retries"). Two ways back: Provider Administrators import the old entry, which keeps the `connectionID` and is preferred when the Provider still has the data; or the Owner onboards the same `Provider` again, which registers a **new** Connection, meant for switching Providers or a Connection the Provider won't restore ([03 Operator, "Onboarding requests"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
+- **No Session verifies and Control Calls fail authentication** (a Pinned Bundle that missed a Rollover, and a Connection Secret the Provider-side lost or rejects): nothing in the protocol can fix this. Pushing a bundle needs the Connection Secret, and repairing the Connection Secret needs a Session. A missed Rollover alone isn't this case: `platform-mesh-operator`'s first successful Control Call pushes the current bundle. The Provider Administrators re-pin the bundle out-of-band ([07 SDK, "Administration"](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
 
-Disasters on either side (a Provider's cluster rebuilt, for example) are handled the same way: out-of-band steps between the people running both sides, on top of the properties above. The protocol keeps them possible: `connectionID`s are stable, the Provider-side can import a connection entry, and the PM-side can take a connection's base URL and server keys from an administrator. The procedures themselves aren't part of this plan.
+Disasters on either side (a Provider's cluster rebuilt, for example) are handled the same way: out-of-band steps between the people running both sides, on top of the properties above. The protocol keeps them possible: `connectionID`s are stable, the Provider-side can import a `Connection`, and the PM-side can take a Connection's Base URL and Server Keys from an administrator. The procedures themselves aren't part of this plan.
 
-## Server keys
+## Server Keys
 
 - **A list**, so the Provider-side can rotate with overlap: when its administrators start a rotation, a new key is announced in `GET` before it's used, and the old one retired after the overlap.
-- **Switch per connection when the `ProviderEndpoint` is ready**: the Provider-side presents a new key on a connection only once that connection's `ProviderEndpoint` lists it (it reads the `ProviderEndpoint` over sessions anyway), and retires the old key once every connection's `ProviderEndpoint` lists the new one, or after a deadline. A connection whose operator is down for longer doesn't lose its sessions.
-- **No refresh over plain HTTPS.** A server key endpoint verified only by web PKI would let the Provider's edge swap keys and undo the inner TLS. After a lost or missed key, a PM administrator supplies the new keys ([03 Operator, "Writing ProviderEndpoints"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
+- **Switch per Connection when the `ProviderEndpoint` is ready**: the Provider-side presents a new key on a Connection only once that Connection's `ProviderEndpoint` lists it (it reads the `ProviderEndpoint` over Sessions anyway), and retires the old key once every Connection's `ProviderEndpoint` lists the new one, or after a deadline. A Connection whose `platform-mesh-operator` is down for longer doesn't lose its Sessions.
+- **No refresh over plain HTTPS.** A Server Key endpoint verified only by web PKI would let the Provider's Edge swap keys and undo the Inner TLS. After a lost or missed key, a PM Administrator supplies the new keys ([03 Operator, "Writing ProviderEndpoints"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
 
 ## Status
 
 `GET /v1/connections/{id}` returns, per host the Provider-side actually needs (the front-proxy, plus each endpoint-slice host its clients use):
-- the number of live sessions covering it;
+- the number of live Sessions covering it;
 - whether its last requests reached kcp;
 - the last error, without sensitive detail.
 
-platform-mesh-operator turns this into aggregate conditions ([03 Operator, "Health"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)). No shard names or PM topology appear.
+`platform-mesh-operator` turns this into aggregate conditions ([03 Operator, "Health"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)). No shard names or PM topology appear.
 
 ## Errors and retries
 
-- **Upgrades refused with `503` and `Retry-After`** (e.g. by a standby Provider replica): the connector treats the value as the **lower bound for its normal reconnect backoff** (jitter, growth on repeated failures), with no special handling. A standby built on the SDK sends `Retry-After: 5` ([07 SDK, "Replicas"](./xxx-notes-011-v5-impl-07-provider-sdk.md)). A `503` from the Provider's edge without `Retry-After` falls back to the normal backoff.
-- **A session closed gracefully by the Provider-side** (go-away, then close): connectors reconnect at once, with jitter.
+- **Upgrades refused with `503` and `Retry-After`** (e.g. by a standby Provider replica): the Connector treats the value as the **lower bound for its normal reconnect backoff** (jitter, growth on repeated failures), with no special handling. A standby built on the SDK sends `Retry-After: 5` ([07 SDK, "Replicas"](./xxx-notes-011-v5-impl-07-provider-sdk.md)). A `503` from the Provider's Edge without `Retry-After` falls back to the normal backoff.
+- **A Session closed gracefully by the Provider-side** (go-away, then close): Connectors reconnect at once, with jitter.
 
-- **Authentication failures** reveal no detail: a failed session handshake ends with a standard TLS alert (e.g. `unknown_ca` when the connector's CA isn't pinned, which the connector reports in its metrics), and a failed control call gets a uniform response, then the control session closes. The Provider-side records the reason for its own audit and notifications.
+- **Authentication failures** reveal no detail: a failed Session handshake ends with a standard TLS alert (e.g. `unknown_ca` when the Connector's CA isn't pinned, which the Connector reports in its metrics), and a failed Control Call gets a uniform response, then the Control Session closes. The Provider-side records the reason for its own audit and notifications.
 - **Rate limits** return `429` with `Retry-After`; the PM-side honours it with jitter.
-- **Transient failures** (`5xx`, connection errors) are retried with backoff; registration retries reuse the same idempotency key and hash.
-- **An unknown or deleted connection** refuses everything with a stable, distinguishable status, so the PM-side can report it instead of retrying forever. "Unknown" is also what lets an owner onboard the same `Provider` again (see "Recovery").
+- **Transient failures** (`5xx`, connection errors) are retried with backoff; Registration retries reuse the same idempotency key and hash.
+- **An unknown or deleted Connection** refuses everything with a stable, distinguishable status, so the PM-side can report it instead of retrying forever. "Unknown" is also what lets an Owner onboard the same `Provider` again (see "Recovery").
 
 ## Versioning
 
-- **Path version** (`/v1`) for the endpoints, **ALPN** inside the inner TLS for the session and control protocols.
+- **Path version** (`/v1`) for the endpoints, **ALPN** inside the Inner TLS for the Session and control protocols.
 - **Compatibility window: current and previous version.** The SDK and every PM-side component support both.
-- **Negotiated independently per channel, never stored**: registration uses the path version; every control session and every session negotiates its own version through ALPN (e.g. `pm-control/1`, `pm-session/1`). A channel opened after both sides upgrade uses the newer version, so connectors, platform-mesh-operator and SDKs can be upgraded independently, without re-registering connections.
+- **Negotiated independently per channel, never stored**: Registration uses the path version; every Control Session and every Session negotiates its own version through ALPN (e.g. `pm-control/1`, `pm-session/1`). A channel opened after both sides upgrade uses the newer version, so Connectors, `platform-mesh-operator` and SDKs can be upgraded independently, without re-registering Connections.
 
 ## Deliverables
 
 - **This contract as a versioned specification** in the SDK module, with the message schemas.
-- **Test vectors**: inner TLS (a client certificate from an unpinned CA, expired, without the `clientAuth` EKU, or with an intermediate in its chain; a pinned CA that has expired; an unpinned server key), hellos (wrong `clusterName`, missing or malformed `hosts`, oversized), control sessions (wrong secret, closed on the first failure), connector CA bundles (malformed PEM, a non-`CERTIFICATE` block, a block with PEM headers, text between blocks, a duplicated certificate, a non-CA certificate, too many certificates, the same set in another order). Shared by the SDK and the connector's tests ([10 Testing](./xxx-notes-011-v5-impl-10-testing.md)).
+- **Test vectors**: Inner TLS (a client certificate from an unpinned CA, expired, without the `clientAuth` EKU, or with an intermediate in its chain; a pinned CA that has expired; an unpinned Server Key), Hellos (wrong `clusterName`, missing or malformed `hosts`, oversized), Control Sessions (wrong Connection Secret, closed on the first failure), Pinned Bundles (malformed PEM, a non-`CERTIFICATE` block, a block with PEM headers, text between blocks, a duplicated certificate, a non-CA certificate, too many certificates, the same set in another order). Shared by the SDK and the Connector's tests ([10 Testing](./xxx-notes-011-v5-impl-10-testing.md)).
 
 ## Decided
 
 - Compatibility window: current and previous version, negotiated per channel (see "Versioning").
-- Sessions are authenticated by the inner mutual TLS alone, with a hello message for `clusterName`, `hosts` and `sub`; no session token.
+- Sessions are authenticated by the inner mutual TLS alone, with a Hello message for `clusterName`, `hosts` and `sub`; no Session token.
 - Streams carry HTTP from the first byte; no preamble.
-- No intermediate certificates: connector certificates are issued directly by a pinned CA.
-- Control calls use HTTP/1.1; the first failed authentication closes the control session.
-- `clusterName` is the provider workspace's logical cluster name, as kcp assigns it.
-- Rate limits on registration per owner: SDK defaults, configurable by each Provider ([07 SDK](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
-- The secret changes only through the `ProviderEndpoint`; the connector CA bundle is replaced by compare-and-swap.
+- No intermediate certificates: Connector Certificates are issued directly by a pinned CA.
+- Control Calls use HTTP/1.1; the first failed authentication closes the Control Session.
+- `clusterName` is the Provider Workspace's logical cluster name, as kcp assigns it.
+- Rate limits on Registration per Owner: SDK defaults, configurable by each Provider ([07 SDK](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
+- The Connection Secret changes only through the `ProviderEndpoint`; the Pinned Bundle is replaced by compare-and-swap.
