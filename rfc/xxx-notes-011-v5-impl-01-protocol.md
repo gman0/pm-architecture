@@ -1,6 +1,6 @@
 # v5 implementation plan: protocol
 
-Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). The wire contract between the PM-side ([platform-mesh-operator](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md), which makes every Registration and Control Call, and the [connectors](./xxx-notes-011-v5-impl-05-connector.md)) and the Provider-side (the [SDK](./xxx-notes-011-v5-impl-07-provider-sdk.md)). Both sides implement exactly this document; neither relies on anything the other does beyond it.
+Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). The wire contract between the PM-side ([platform-mesh-operator](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md), which makes every Registration and Control Call, and the [Connectors](./xxx-notes-011-v5-impl-05-connector.md)) and the Provider-side (the [SDK](./xxx-notes-011-v5-impl-07-provider-sdk.md)). Both sides implement exactly this document; neither relies on anything the other does beyond it.
 
 ## Principles
 
@@ -128,7 +128,7 @@ A **Session** is a long-lived tunnel between PM and a Provider; **Streams** are 
 | **Authentication** | Once, when it opens: the Inner TLS handshake, then the Hello | None of its own: it inherits the Session's. The Connector authorizes each request on it |
 | **Cost to open** | A WebSocket upgrade through the Provider's Edge, plus a TLS handshake | A yamux frame |
 | **Lifetime** | Hours; replaced before the Edge's maximum connection age | Seconds for requests (or reused with keep-alive), hours for a watch |
-| **How many** | One per (Connection, shard with traffic, Connector Replica): typically single digits per PM Instance | One per concurrent request or watch: typically tens per Provider |
+| **How many** | One per (Connection, shard with traffic, Connector Replica): typically single digits per Connection | One per concurrent request or watch: typically tens per Provider |
 | **Visible at the Provider's Edge** | Yes, as one WebSocket connection | No, only as opaque bytes inside the Session |
 | **If it ends** | All its Streams end; client-go reopens them on another Session | Only that request or watch; client-go retries or re-watches |
 
@@ -179,7 +179,7 @@ The hosts are **routing information, not authority**. The Provider-side never re
 
 ### What binds a Session to its PM Instance
 
-The Connector CA pinned **for this Connection**: each PM Instance has its own CA, managed by its own cert-manager; with an external PKI, each installation has its own intermediate, and that's what Providers pin ([04 Connector CA, "The CA"](./xxx-notes-011-v5-impl-04-connector-ca.md)). Connector Certificates carry no installation identity and no hostnames. If two installations shared a CA, a compromised Connector of one could open Sessions for the other's Connections.
+The Connector CA pinned **for this Connection**: each PM Instance has its own CA, managed by its own cert-manager; with an external PKI, each PM Instance has its own intermediate, and that's what Providers pin ([04 Connector CA, "The CA"](./xxx-notes-011-v5-impl-04-connector-ca.md)). Connector Certificates carry no PM Instance identity and no hostnames. If two PM Instances shared a CA, a compromised Connector of one could open Sessions for the other's Connections.
 
 ## Provider replicas
 

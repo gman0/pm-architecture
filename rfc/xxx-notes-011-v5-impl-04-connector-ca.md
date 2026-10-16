@@ -1,6 +1,6 @@
 # v5 implementation plan: Connector CA
 
-Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). The PKI that authenticates [connectors](./xxx-notes-011-v5-impl-05-connector.md) to Providers: a Connector CA managed by cert-manager, Connector Certificates issued from it, the Connector CA Set that Providers pin, and the `ConnectorCASet` resource that reports it. The design rationale is in v5, "Session credentials: the Connector CA" and "Distributing the Connector CA to Providers".
+Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). The PKI that authenticates [Connectors](./xxx-notes-011-v5-impl-05-connector.md) to Providers: a Connector CA managed by cert-manager, Connector Certificates issued from it, the Connector CA Set that Providers pin, and the `ConnectorCASet` resource that reports it. The design rationale is in v5, "Session credentials: the Connector CA" and "Distributing the Connector CA to Providers".
 
 ## What it provides
 
@@ -60,12 +60,12 @@ metadata:
 status:
   certificates:                          # the members: Connector CA certificates PM currently trusts
     - fingerprint: sha256:9a07…
-      notAfter: "2027-10-13T00:00:00Z"
+      notAfter: "2027-10-13T08:00:00Z"
       issued: "2026-10-13T08:00:00Z"     # its CertificateRequest's creation time
       converged: false                   # not yet pinned by every Connection platform-mesh-operator reaches
     - fingerprint: sha256:4f1c…
-      notAfter: "2027-01-12T00:00:00Z"
-      issued: "2025-10-13T08:00:00Z"
+      notAfter: "2027-01-11T08:00:00Z"
+      issued: "2026-01-11T08:00:00Z"
       converged: true
       dropWindow:                        # dropped per Connection within this window
         from: "2026-10-15T08:00:00Z"     # 48 hours after its successor was issued

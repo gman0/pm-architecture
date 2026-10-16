@@ -19,7 +19,7 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Th
 
 - **Stateless** (overview, principle 5): everything comes from its deployment (shard name, its virtual-workspace host, the front-proxy host, its Connector Certificate) and the Connection Export.
 - **The Provider's only path into kcp**: whatever it allows, the Provider can do; the policy is the security guarantee and is tested as such ([10 Testing](./xxx-notes-011-v5-impl-10-testing.md)).
-- **A standalone proxy, like kcp's front-proxy** (`kcp/pkg/proxy`): its own `http.Server`, a few filters taken from upstream `k8s.io/apiserver` (`WithRequestInfo`, `WithPanicRecovery`, `WithHTTPLogging`), and `httputil.ReverseProxy`. No generic apiserver.
+- **A standalone proxy, like kcp's front-proxy** (`kcp/pkg/proxy`): its own `http.Server`, a few filters taken from upstream `k8s.io/apiserver` (`WithPanicRecovery`, `WithHTTPLogging`), its own path parsing (see "Path parsing"), and `httputil.ReverseProxy`. No generic apiserver.
 - **kcp owns request timeouts.** The Connector applies none of its own to proxied requests and has no shared in-flight cap; its limits are per Connection (see "Limits").
 - **Forward bytes, don't decode objects.** The Connector never parses response bodies.
 

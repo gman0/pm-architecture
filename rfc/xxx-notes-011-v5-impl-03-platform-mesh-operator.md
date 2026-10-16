@@ -161,13 +161,13 @@ The `Connected` step runs on every reconcile of a registered remote `Provider` a
 - **Polls `GET /v1/connections/{id}`** over a Control Session, reusing an open one where possible.
 - **Never gives up on a Connection it can't reach.** Failed polls back off, capped at about the normal poll interval, so a Provider that returns after any outage is caught up within minutes (see "Connector CA Set").
 - **Reports the Connection's state** as the `Connected` condition, from the first failing check:
-  1. **Control path**: the edge-diagnosis labels (see "Edge diagnosis"), or `ControlUnreachable` (DNS, connection refused, timeout);
+  1. **Control path**: the edge-diagnosis labels (see "Edge diagnosis"), `ControlUnreachable` (DNS, connection refused, timeout), or `SecretRejected` (the Inner TLS succeeds but the Connection Secret is refused, which starts a repair, see "Secret Changes");
   2. **Sessions**: `NoSessions`, when a host the Provider-side needs has none;
   3. **kcp**: `KcpUnreachable`, when a host's requests don't reach kcp.
 
   The message adds counts and the last error, never shard names (overview, principle 9). If the control path fails, the status can't be read, so the control-path label wins and the message mentions the last known Session state.
 - **Sets the warning condition `ProtocolOutdated`** while its Control Sessions still negotiate the previous protocol version through ALPN, so the Owner can ask the Provider to upgrade its SDK ([07 SDK, "Releases and protocol versions"](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
-- **Does the Connection's upkeep** on the same polls: Server Key updates in the `ProviderEndpoint`, Secret Changes (see "Secret Changes"), and trusted-set pushes and the tamper check (see "Connector CA Set").
+- **Does the Connection's upkeep** on the same polls: Server Key updates in the `ProviderEndpoint`, Secret Changes (see "Secret Changes"), and Connector CA Set pushes and the tamper check (see "Connector CA Set").
 - **Per-shard and per-host detail goes to metrics**, never to conditions (overview, principle 9).
 
 **Readiness for Onboarding**: at least the front-proxy host is covered and reachable; before any consumer binds, that's the only required host.
@@ -208,7 +208,7 @@ The only way a Connection Secret changes ([01 Protocol, "Changing the Connection
 Each case is covered elsewhere ([01 Protocol, "Recovery"](./xxx-notes-011-v5-impl-01-protocol.md)):
 - **A lost or rejected Connection Secret**: repaired automatically (see "Secret Changes").
 - **A Connection the Provider-side no longer knows**: `Registered=False` with `ConnectionUnknown`; the Owner onboards the same `Provider` again, which registers a new Connection (see "Onboarding requests").
-- **No Session verifies**: `Connected=False` with `NoSessions`; Provider Administrators re-pin the Pinned Bundle out-of-band.
+- **No Session verifies**: `Connected=False` with `SecretRejected`, its message noting that no Session verifies; Provider Administrators re-pin the Pinned Bundle out-of-band.
 - **Disasters on either side**: out-of-band, using the administrator input in "Writing ProviderEndpoints" and the Provider Administrators' runbooks ([07 SDK, "Administration"](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
 
 ## Connector CA Set

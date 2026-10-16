@@ -7,7 +7,7 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Wo
 - **Rename the Local Provider steps in `platform-mesh-operator`'s code** (`ProviderWorkspaceSubroutine`, `ScopedKubeconfigSubroutine`) to `Workspace` and `Kubeconfig`. Their names become the condition types Owners see, consistent with the remote steps (`Workspace`, `ConnectionBinding`, `ConnectorAccess`, `Registered`, `Connected`).
 - **ManagedProviders and `Degraded`**: decide how a ManagedProvider reacts when its `Provider` goes from `Ready` to `Degraded`. Its wait step compares `phase` with `Ready`.
 - **Fix the `Provider`'s `KubeconfigSecret` printer column**: it points at `.status.kubeconfigSecretRef.name`, while the field is `providerKubeconfigSecretRef`.
-- **Update the types in `platform-mesh/apis`** to the plan: the `ProviderOnboardingRequest` type still has the `Rebinding` phase, `connectionSecretRef` and no `VerifyingControl`; `Provider`'s condition constants still list `SessionsConnected`, `KcpReachable`, `SecretCurrent` and `Rebinding`; the doc comment on `status.connection` still mentions rebinding. The new `ProviderEndpointRegistration`, `ConnectorCASet` and `ProviderEndpoint` kinds go into `providers.platform-mesh.io`, next to `ManagedProvider` in `platform-mesh-operator`'s `api/providers/v1alpha1`.
+- **Update the types in `platform-mesh/apis`** to the plan: the `ProviderOnboardingRequest` type still has the `Rebinding` phase and `connectionSecretRef`; `Provider`'s condition constants still list `SessionsConnected`, `KcpReachable`, `SecretCurrent` and `Rebinding`; the doc comment on `status.connection` still mentions rebinding. The new `ProviderEndpointRegistration`, `ConnectorCASet` and `ProviderEndpoint` kinds go into `providers.platform-mesh.io`, next to `ManagedProvider` in `platform-mesh-operator`'s `api/providers/v1alpha1`.
 
 ## Larger follow-ups
 
@@ -39,5 +39,4 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Wo
 - **Alerting**: PM has no alerting pipeline; the plan ships metrics, `ServiceMonitor`s and documented alert rules.
 - **Narrowing the Providers Export's `Secret`s claim** with a label selector in PM's bindings, a PM-wide hardening.
 - **Retention of the Connector's request log**, PM's audit trail for Provider traffic.
-- **Proposing `ServeProxy` upstream** into the virtual workspace framework, instead of the Connector's copy.
 - **Possible kcp issue**: impersonation on the APIExport virtual workspace (v5 notes, observation 5). Confirm with an e2e test before reporting it.

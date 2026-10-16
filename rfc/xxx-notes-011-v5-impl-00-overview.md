@@ -14,7 +14,7 @@ Start here, then follow the walkthrough below, or jump to a component.
 | [03 platform-mesh-operator](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md) | Reconciling local and remote `Provider`s and `ProviderOnboardingRequest`s; Registration, `ProviderEndpoint`s, health, Secret Changes, the Connector CA Set, deletion |
 | [04 Connector CA](./xxx-notes-011-v5-impl-04-connector-ca.md) | The Connector CA managed by cert-manager, Connector Certificates, the Connector CA Set that Providers pin, and the automatic Rollover |
 | [05 Connector](./xxx-notes-011-v5-impl-05-connector.md) | The per-shard Connector, a standalone proxy; Sessions, proxying, policy |
-| [07 Provider SDK](./xxx-notes-011-v5-impl-07-provider-sdk.md) | The Provider-side library: Connection API, its resources (`Connection`, `OnboardingToken`, `ServerKey`), Session server, transport, lifecycle |
+| [07 SDK](./xxx-notes-011-v5-impl-07-provider-sdk.md) | The Provider-side library: Connection API, its resources (`Connection`, `OnboardingToken`, `ServerKey`), Session server, transport, lifecycle |
 | [08 Provider quickstart](./xxx-notes-011-v5-impl-08-provider-quickstart.md) | The reference Provider in pm-provider-quickstart |
 | [09 Deployment](./xxx-notes-011-v5-impl-09-deployment.md) | Charts, kcp bootstrap manifests, kcp-operator and cert-manager resources, network, rollout |
 | [10 Testing](./xxx-notes-011-v5-impl-10-testing.md) | Unit tests per component, multi-shard kind e2e, security tests; load tests as a follow-up |
@@ -26,7 +26,7 @@ Start here, then follow the walkthrough below, or jump to a component.
 |---|---|
 | Inner TLS on Sessions | **Required, the only mode.** Plain Sessions aren't implemented. |
 | Delivery | **Single delivery**: each document describes its full scope; "Build order" below orders the work. |
-| `platform-mesh-operator` | **`platform-mesh-operator`** owns each `Provider`, local or remote, end to end. It moves with the `Provider` part when that becomes its own operator; until then, internet-facing code in PM's most privileged component is an accepted interim risk ([03](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md), [03](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)). |
+| `platform-mesh-operator` | **`platform-mesh-operator`** owns each `Provider`, local or remote, end to end. It moves with the `Provider` part when that becomes its own operator; until then, internet-facing code in PM's most privileged component is an accepted interim risk ([03](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)). |
 | `providerconnections-connector` | A new service: **`services/providerconnections-connector`**, a **standalone proxy server modelled on kcp's front-proxy**, one per shard, deployed as a plain Deployment with its identity from a kcp-operator `Kubeconfig`. |
 | the SDK | **`platform-mesh/provider-sdk`**, module `go.platform-mesh.io/provider-sdk`, its own semver line released through `cmd/release` ([07](./xxx-notes-011-v5-impl-07-provider-sdk.md)). |
 | Connection object type | **`providers.platform-mesh.io/ProviderEndpoint`**, served only by the Connection Export. `ProviderConnection` is removed. |
@@ -64,20 +64,21 @@ Start here, then follow the walkthrough below, or jump to a component.
  └──────────────────────────────────────────┘    side)     │   consumes: providers export,                │
                                                            │             connection export                │
                                                            │   ProviderEndpointRegistrations (own ns)     │
- :root:providers:system                                    │ connector CA (cert-manager, doc 04)            │
+ :root:providers:system                                    │ connector CA (cert-manager, doc 04)          │
  ┌──────────────────────────────────────────┐              └──────────────┬───────────────────────────────┘
- │ connection export connections.pm.io      │                             │ connector certificates
+ │ connection export                        │                             │ connector certificates
+ │   connections.providers.platform-mesh.io │                             │
  │   + maximal permission policy RBAC       │                             ▼
  │ providers export (unchanged home)        │              ┌──────────────────────────────────────────────┐
  └──────────────────────────────────────────┘              │ connector @ shard-A, -B, …                   │
-                                                           │ (doc 05)  reads ProviderEndpoints + slices,   │
+                                                           │ (doc 05)  reads ProviderEndpoints + slices,  │
  provider workspace :root:providers:<name>-<owner cluster> │   mints SA tokens, proxies to kcp            │
  ┌──────────────────────────────────────────┐              └──────────────┬───────────────────────────────┘
  │ APIBinding to the connection export      │                             │ outbound WebSocket + inner TLS
  │ ProviderEndpoint (PM-written only)       │                             ▼   (protocol, doc 01)
  │ SA (admin), Provider's own exports/slices│              ┌──────────────────────────────────────────────┐
  └──────────────────────────────────────────┘              │ Provider runtime                             │
-                                                           │   Provider SDK (doc 07): connection API,     │
+                                                           │   the SDK (doc 07): connection API,          │
                                                            │   session server, transport, its CRDs        │
                                                            │   Provider controllers + portal (doc 08)     │
                                                            └──────────────────────────────────────────────┘
@@ -92,13 +93,13 @@ Each step names the document and section that owns it; read them in this order t
 3. **`platform-mesh-operator` finds the `Provider`**, waiting until it exists: [03 Operator, "Onboarding requests"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md).
 4. **`platform-mesh-operator` bootstraps the Provider Workspace** (workspace, SA, Connection Export binding, Connector RBAC), without a kubeconfig for Remote Providers: [03 Operator, "Reconciling Providers"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md).
 5. **The request registers the Connection** with the Provider-side: generates the Connection Secret, sends its hash and the Connector CA certificates, receives the `connectionID` and Server Keys, and is done (`Registered`): [03 Operator, "Registration"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md); the Provider's side: [07 SDK, "Connection API"](./xxx-notes-011-v5-impl-07-provider-sdk.md); the CA certificates it sends: [04 Connector CA, "ConnectorCASet"](./xxx-notes-011-v5-impl-04-connector-ca.md).
-6. **`platform-mesh-operator` makes a first Control Call and writes the `ProviderEndpoint`** into the Provider Workspace through the Connection Export: [03 Operator, "First Control Call and ProviderEndpoint" and "Writing ProviderEndpoints"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md); type and policy: [02 APIs, "ProviderEndpoint" and "Connection export"](./xxx-notes-011-v5-impl-02-apis.md).
-7. **Connectors discover the `ProviderEndpoint` and open Sessions** where needed: [05 Connector, "Discovery" and "Which sessions"](./xxx-notes-011-v5-impl-05-connector.md); the Session handshake: [01 Protocol, "Sessions"](./xxx-notes-011-v5-impl-01-protocol.md); the Provider's side: [07 SDK, "Session server"](./xxx-notes-011-v5-impl-07-provider-sdk.md).
+6. **`platform-mesh-operator` makes a first Control Call and writes the `ProviderEndpoint`** into the Provider Workspace through the Connection Export: [03 Operator, "First Control Call and ProviderEndpoint" and "Writing ProviderEndpoints"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md); type and policy: [02 APIs, "ProviderEndpoint" and "Connection Export"](./xxx-notes-011-v5-impl-02-apis.md).
+7. **Connectors discover the `ProviderEndpoint` and open Sessions** where needed: [05 Connector, "Discovery" and "Which Sessions"](./xxx-notes-011-v5-impl-05-connector.md); the Session handshake: [01 Protocol, "Sessions"](./xxx-notes-011-v5-impl-01-protocol.md); the Provider's side: [07 SDK, "Session server"](./xxx-notes-011-v5-impl-07-provider-sdk.md).
 8. **The Provider's controllers reconcile through the Sessions**: transport and client configs in [07 SDK, "Transport" and "Connections for multicluster-runtime"](./xxx-notes-011-v5-impl-07-provider-sdk.md); the proxy on PM's side in [05 Connector, "Request pipeline"](./xxx-notes-011-v5-impl-05-connector.md); the reference wiring in [08 Quickstart](./xxx-notes-011-v5-impl-08-provider-quickstart.md).
 9. **`platform-mesh-operator` confirms readiness** from the Provider-side's per-host status, and the `Provider` becomes `Ready`: [03 Operator, "Health"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md); [01 Protocol, "Status"](./xxx-notes-011-v5-impl-01-protocol.md).
 10. **Steady state**: `platform-mesh-operator` polls health and changes the Connection Secret when needed, through the `ProviderEndpoint`; cert-manager renews Connector Certificates and, once a year, the Connector CA, which `platform-mesh-operator` pushes before Connectors switch ([04 Connector CA, "Rollover"](./xxx-notes-011-v5-impl-04-connector-ca.md)); Connectors refresh SA tokens: [03 Operator, "Secret Changes"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md), [01 Protocol, "Changing the Connection Secret"](./xxx-notes-011-v5-impl-01-protocol.md), [07 SDK, "The Connection's ProviderEndpoint"](./xxx-notes-011-v5-impl-07-provider-sdk.md), [04 Connector CA, "Connector Certificates"](./xxx-notes-011-v5-impl-04-connector-ca.md), [05 Connector, "Identity towards kcp"](./xxx-notes-011-v5-impl-05-connector.md).
 11. **Rare operations**: Connection Secret repair and Onboarding a `Provider` again ([01 Protocol, "Recovery"](./xxx-notes-011-v5-impl-01-protocol.md), [03 Operator, "Recovery"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)); out-of-band administration ([07 SDK, "Administration"](./xxx-notes-011-v5-impl-07-provider-sdk.md)); Server Key rotation ([07 SDK, "Server Keys"](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
-12. **Offboarding**: one finalizer deletes the `ProviderEndpoint` (Sessions close), calls `DELETE`, deletes the `ProviderEndpointRegistration` and its `Secret`, then tears down the Connector RBAC, binding, SA and workspace: [03 Operator, "Deletion"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md), [03 Operator, "Deletion"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md).
+12. **Offboarding**: one finalizer deletes the `ProviderEndpoint` (Sessions close), calls `DELETE`, deletes the `ProviderEndpointRegistration` and its `Secret`, then tears down the Connector RBAC, binding, SA and workspace: [03 Operator, "Deletion"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md).
 
 Deployment of all PM-side pieces: [09 Deployment](./xxx-notes-011-v5-impl-09-deployment.md). How each step is tested: [10 Testing](./xxx-notes-011-v5-impl-10-testing.md).
 
@@ -121,7 +122,7 @@ Every component follows these; the component documents refer back here instead o
 
 ## Who writes what
 
-Clear ownership avoids two controllers fighting over the same fields. "`platform-mesh-operator`" below is `platform-mesh-operator`.
+Clear ownership avoids two controllers fighting over the same fields.
 
 | Object or field | Written by | Read by |
 |---|---|---|
@@ -148,8 +149,8 @@ Single delivery, but the pieces depend on each other. Suggested order, with what
 2. **SDK core** ([07](./xxx-notes-011-v5-impl-07-provider-sdk.md)): Connection API, its resources and controllers, Session server, transport. Can be tested against a fake PM-side.
 3. **Connector CA** ([04](./xxx-notes-011-v5-impl-04-connector-ca.md)) and **kcp bootstrap** of the Connection Export ([09](./xxx-notes-011-v5-impl-09-deployment.md)).
 4. **`platform-mesh-operator`** ([03](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)) and **Connector** ([05](./xxx-notes-011-v5-impl-05-connector.md)), in parallel; they meet only at the `ProviderEndpoint` and the protocol.
-6. **Quickstart** ([08](./xxx-notes-011-v5-impl-08-provider-quickstart.md)).
-7. **Deployment** ([09](./xxx-notes-011-v5-impl-09-deployment.md)) and **e2e and security tests** ([10](./xxx-notes-011-v5-impl-10-testing.md)).
+5. **Quickstart** ([08](./xxx-notes-011-v5-impl-08-provider-quickstart.md)).
+6. **Deployment** ([09](./xxx-notes-011-v5-impl-09-deployment.md)) and **e2e and security tests** ([10](./xxx-notes-011-v5-impl-10-testing.md)).
 
 ## Deployment target
 
