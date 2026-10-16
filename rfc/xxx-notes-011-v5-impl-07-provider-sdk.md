@@ -14,13 +14,14 @@ What a Provider still does itself: its portal and user accounts, its operator co
 
 ## Principles
 
-- **No kcp knowledge on the Provider-side.** No tokens, kubeconfigs or kcp CA bundles; requests carry no credentials ([01 Protocol](./xxx-notes-011-v5-impl-01-protocol.md)).
+- **No kcp knowledge on the Provider-side.** No tokens, kubeconfigs or kcp CA bundles, and no kcp hostname it would have to keep: the front-proxy has no name on the Provider-side, and requests carry no credentials ([01 Protocol](./xxx-notes-011-v5-impl-01-protocol.md)).
 - **Everything security-relevant is in the SDK**, written once and tested with the protocol's test vectors, so Providers can't get it subtly wrong.
 - **The Kubernetes API is the only source of truth** for the SDK's state. The SDK keeps caches and live Sessions in memory, never a second copy of state; everything that has to survive a restart is in the resources.
 - **State belongs to its Connection** (`connectionID`), never inherited by another Connection. Consumer data has to be keyed with the `connectionID` too, not only with the consumer's logical cluster and the object's UID: anyone with a portal account can register a Connection with a Connector CA of their own and serve made-up objects that reuse a real consumer's cluster and UID (see "Requirements on Providers").
 - **`connectionID`s are stable.** A Connection keeps its ID through Secret Changes and recovery, so state keyed by it stays valid.
 - **`connectionID`s are random and unguessable** (e.g. 128 random bits), so probing the Session and control paths can't find valid ones. They aren't secret, and nothing relies on them being so.
 - **Only PM changes a Connection Secret**, through the Connection's `ProviderEndpoint` ([01 Protocol, "Changing the Connection Secret"](./xxx-notes-011-v5-impl-01-protocol.md)).
+- **A failed authentication changes nothing.** It's logged and counted, never written to a resource or an Event: `lastSeen` and every other field only move on authenticated Control Calls and verified Sessions.
 - **Secret values are stored hashed**; comparisons are constant-time; nothing secret is logged.
 
 ## API resources
@@ -40,7 +41,7 @@ spec:
   registration:                                # immutable as a whole
     owner: alice@example.com                   # selectable field
     clusterName: 2x8k9abc
-    frontProxyURL: https://pm.example.com
+    unusedExpiresAt: "2026-10-23T10:00:00Z"    # removed if never reached by then; empty on imports
   pinnedBundle: |                              # the Pinned Bundle, PEM; PM push or administrator re-pin
     -----BEGIN CERTIFICATE-----
     ...
@@ -50,19 +51,20 @@ status:
       status: "True"
       reason: AsExpected
       observedGeneration: 4
-  lastSeen: "2026-10-15T10:00:00Z"             # hourly; empty: never used
+  lastSeen: "2026-10-15T10:00:00Z"             # first contact at once, then hourly; empty: never used
   listedServerKeys: [sk-2026-04, sk-2026-10]
   secretHash: "sha256:..."                     # current connection secret's hash; only the SDK writes it
 ```
 
 - **Created at Registration** by the SDK. `spec.registration` is immutable (CEL: `self == oldSelf`); `spec.registration.owner` is a selectable field, so a portal lists one Owner's Connections with a field selector.
+- **`spec.registration.unusedExpiresAt`**: fixed at Registration, the end of the retry window, and returned to PM in the Registration response (see "Connection API").
 - **`spec.pinnedBundle`** is what Sessions are verified against. A PM push writes it ([01 Protocol, "Pinned Bundle"](./xxx-notes-011-v5-impl-01-protocol.md)), and so does an administrator re-pinning; either change makes the SDK re-check open Sessions (see "Session server").
-- **`Ready`** says whether every host the Provider's clients use has a Session and reaches kcp. It reports `NoSessions` or `KcpUnreachable` only after the state has lasted a few minutes (e.g. 5), so a failover, when a new leader briefly sees no Sessions, doesn't flip every Connection. Per-host detail stays in memory, where `GET` reads it, and in metrics.
-- **`lastSeen`**: the last Control Call or Session, written at most once an hour. Empty means never used, which is what orphan expiry looks for; an old value marks a Connection whose PM Instance went away without `DELETE`.
+- **`Ready`** says whether the Provider Workspace and every virtual-workspace host the Provider's clients use have a Session and reach kcp. It reports `NoSessions` or `KcpUnreachable` only after the state has lasted a few minutes (e.g. 5), so a failover, when a new leader briefly sees no Sessions, doesn't flip every Connection. The detail stays in memory, where `GET` reads it, and in metrics.
+- **`lastSeen`**: the last authenticated Control Call or verified Session. The first one is written at once; after that, at most once an hour. Empty means never used, which is what orphan expiry looks for; an old value marks a Connection whose PM Instance went away without `DELETE`.
 - **`listedServerKeys`**: the `ServerKey`s PM's `ProviderEndpoint` last listed. Set at Registration to the keys returned, then updated whenever the SDK reads the `ProviderEndpoint`. The Inner TLS handshake picks the key from it before any Session exists (see "Server Keys").
 - **`secretHash`**: the current Connection Secret's SHA-256. In status because only the SDK writes it; it isn't in a `Secret` because a hash of a 256-bit random Connection Secret reveals nothing, and the same kind of hash is already public in the `ProviderEndpoint`. If it's lost (e.g. a restore without status), PM's next Control Call fails and PM repairs the Connection Secret ([03 Operator, "Secret Changes"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
 - **Deleting the object is the delete**, whoever does it: a portal, an administrator with `kubectl`, the SDK on PM's `DELETE` call, or orphan expiry. The finalizer closes the Connection's Sessions and Control Sessions, takes it out of the registry, emits `Removed` and lets the object go. Deleting is final.
-- **Events**: `Registered`, `SecretChanged`, `PinnedBundleChanged` (with the number of Sessions closed), `Removed` (with the reason) and `AdministrativeChange`. A Provider that tells its customers about changes watches `Connection`s and their Events, like any other resource. The SDK also logs every event, never with secrets.
+- **Events**: `Registered`, `SecretChanged`, `PinnedBundleChanged` (with the number of Sessions closed), `Removed` (with the reason) and `AdministrativeChange`. A Provider that tells its customers about changes watches `Connection`s and their Events, like any other resource. Failed authentications aren't Events: they go to logs and metrics only. The SDK also logs every event, never with secrets.
 
 ### OnboardingToken
 
@@ -76,6 +78,7 @@ spec:                                          # immutable as a whole
   owner: alice@example.com                     # selectable field
   expiresAt: "2026-10-15T09:30:00Z"
   tokenHash: "sha256:..."
+  serverKey: sk-2026-10                        # the ServerKey whose key-sha256 is in the token
 status:
   registration:                                # present: spent
     connectionID: c-7f3k9q2mx8w4
@@ -83,8 +86,9 @@ status:
     at: "2026-10-15T09:12:00Z"
 ```
 
-- **Issued by the Provider's portal** with `NewOnboardingToken(baseURL, owner, ttl)`, which returns the token string `pm1.<base URL>.<id>.<secret>`, shown once, and the object, which the portal creates. The plaintext token is never stored.
-- **Spent** when `status.registration` is set, by compare-and-swap, so a token can't be spent twice. Registration retries with the same `idempotencyKey` and the hash the `Connection` holds get the same answer, for 7 days by default.
+- **Issued by the Provider's portal** with `NewOnboardingToken(baseURL, owner, ttl)`, which picks the newest `ServerKey` that is `Ready` and has no `retireAt`, and returns the token string `pm1.<base URL>.<keyfp>.<id>.<secret>`, shown once, and the object, which the portal creates. `keyfp` is that key's `key-sha256` ([01 Protocol, "Onboarding Token"](./xxx-notes-011-v5-impl-01-protocol.md)). The plaintext token is never stored.
+- **Usable only while its `ServerKey` is**: present, `Ready`, and without `retireAt`. Setting `retireAt` on a key refuses the unspent tokens issued over it; their Owners ask the portal for new ones.
+- **Spent** when `status.registration` is set, by compare-and-swap, so a token can't be spent twice. Registration retries that match get the same answer, for 7 days by default (see "Connection API").
 - **Garbage-collected by the SDK**: unspent tokens at `expiresAt`, spent ones once the retry window has passed since `registration.at`.
 
 ### ServerKey
@@ -107,6 +111,7 @@ status:
       reason: AsExpected
       observedGeneration: 2
   publicKey: "<PEM SPKI>"
+  fingerprint: key-sha256:...                  # SHA-256 of the SPKI (DER); printer column
 ```
 
 Without `signerRef`, the private key is in a `Secret` of the same name, with an owner reference to the `ServerKey`, readable only by the SDK's identity. With it, the private key stays in the KMS or HSM. See "Server Keys".
@@ -118,7 +123,7 @@ RBAC in the SDK's namespace:
 | Identity | `Connection` | `OnboardingToken` | `ServerKey` | `Secret`s |
 |---|---|---|---|---|
 | SDK | all, including status | all, including status | all, including status | private keys only |
-| Portal | `get`, `list`, `delete` | `create`, `get`, `list` | — | none |
+| Portal | `get`, `list`, `delete` | `create`, `get`, `list` | `get`, `list` (to pick the key) | none |
 | Provider Administrators | all except status | `get`, `list`, `delete` | all except status | none |
 | Provider's controllers | `get`, `list`, `watch` | — | — | — |
 
@@ -128,66 +133,79 @@ RBAC in the SDK's namespace:
 
 ### Connection API
 
-The handler for the one plain-HTTPS endpoint:
-- **Registration**: verify the token against its `OnboardingToken`, spend it, apply the idempotency rules, create the `Connection` (Owner, `clusterName`, front-proxy URL, Connection Secret hash, the Pinned Bundle, the Server Keys returned), return `connectionID` and Server Keys.
-- **Orphan expiry**: a `Connection` with an empty `lastSeen` at the end of the retry window is deleted; it's a Registration whose result PM never stored. A Connection that was used once is never expired for being idle, however long its Provider or PM is away.
+Serves the three endpoints under the Base URL. It **routes by the path below `/v1/connections/`** and isn't bound to one host or path prefix, so a Provider can move its Base URL, or serve it under several names during a move, without code changes.
+
+**Registration** (`/v1/connections/register/{tokenID}`):
+1. **Before the upgrade**, look up the `OnboardingToken`: it must exist, be unexpired and unspent, and its `ServerKey` must be present, `Ready` and without `retireAt`. Otherwise refuse with a stable status, which PM reports as `TokenRefused`. The handshake limits apply.
+2. **Accept the WebSocket** and run the Inner TLS server with the token's `ServerKey`, ALPN `pm-register/1`.
+3. **Verify `tokenSecret`** against `tokenHash`, constant-time.
+4. **Apply the idempotency rules**: a retry with the same idempotency key, `secretHash` and `clusterName` gets the stored answer; a different one is refused; a changed Connector CA Set on a retry is ignored ([01 Protocol, "Registration"](./xxx-notes-011-v5-impl-01-protocol.md)).
+5. **Spend the token and create the `Connection`** (Owner, `clusterName`, `unusedExpiresAt`, Connection Secret hash, the Pinned Bundle, the Server Keys returned), then return `connectionID`, Server Keys and `unusedExpiresAt`.
+
+**Orphan expiry**: a `Connection` with an empty `lastSeen` at its `unusedExpiresAt` is deleted, after a fresh, uncached read confirms `lastSeen` is still empty. It's meant for a Registration whose result PM never stored; it also removes a Connection PM stored but never reached within the window, which loses nothing, since it never had a Session. A Connection that was used once is never expired for being idle, however long its Provider or PM is away. An imported `Connection`, without `unusedExpiresAt`, is never expired.
 
 ### Control Sessions
 
-- **WebSocket upgrade, then the Inner TLS server** with the Connection's Server Key (see "Server Keys"), speaking HTTP/1.1 with keep-alive. The version is negotiated through ALPN ([01 Protocol, "Versioning"](./xxx-notes-011-v5-impl-01-protocol.md)).
+- **Accept the upgrade**, for known IDs within the per-Connection and total limits, and for unknown IDs within their own small total limit ([01 Protocol, "Endpoints at a glance"](./xxx-notes-011-v5-impl-01-protocol.md)); beyond them, `503` with `Retry-After`. Slots are released when the handshake ends.
+- **Run the Inner TLS server** with the Server Key named in the `PM-Server-Key` header if the SDK has it, otherwise the Connection's (see "Server Keys"), speaking HTTP/1.1 with keep-alive. The version is negotiated through ALPN ([01 Protocol, "Versioning"](./xxx-notes-011-v5-impl-01-protocol.md)).
+- **Bound to the path's `{id}`**: an inner request for another Connection gets `ConnectionMismatch` and closes the Control Session. It isn't counted as an authentication failure.
+- **Unknown Connections are answered inside the Inner TLS**, with the stable "unknown" status, so PM can trust it. Before answering, the SDK reads the `Connection` uncached; if its cache isn't synced or the Kubernetes API can't be reached, it answers `503` instead. Standbys answer `503` before the upgrade (see "Replicas").
 - **Bearer check** on each request, against `secretHash` only. **The first failed check closes the Control Session**, so every guess costs a new WebSocket and handshake.
 - **Handlers**: status, Pinned Bundle replacement, delete ([01 Protocol, "Control Sessions"](./xxx-notes-011-v5-impl-01-protocol.md)). None changes the Connection Secret. Delete deletes the `Connection`.
-- **Pinned Bundle**: a PEM bundle, parsed strictly (only `CERTIFICATE` blocks, no PEM headers, only whitespace around blocks, no duplicates, every certificate a CA, bounded size); Go's `AppendCertsFromPEM` isn't used, since it skips what it can't parse. Replacement is compare-and-swap on the Pinned Bundle's `etag`, a hash over its certificates' fingerprints, computed from `spec.pinnedBundle`: a missing or stale `If-Match` is refused with `412`, the same set of certificates is a no-op ([01 Protocol, "Pinned Bundle"](./xxx-notes-011-v5-impl-01-protocol.md)). The `etag` and fingerprints are reported in `GET`. The bundle is only ever accepted on the control channel or at Registration, never from a Session. A push is accepted even if every pinned CA has expired: it's authenticated by the Connection Secret, not by the pinned CAs.
+- **Pinned Bundle**: a PEM bundle, parsed strictly (only `CERTIFICATE` blocks, no PEM headers, only whitespace around blocks, no duplicates, every certificate a CA, at least one certificate and at least one unexpired, bounded size); Go's `AppendCertsFromPEM` isn't used, since it skips what it can't parse. The same rules apply at Registration and to administrators' re-pins. Replacement is compare-and-swap on the Pinned Bundle's `etag`, a hash over its certificates' `cert-sha256` fingerprints, computed from `spec.pinnedBundle`: a missing or stale `If-Match` is refused with `412`, the same set of certificates is a no-op ([01 Protocol, "Pinned Bundle"](./xxx-notes-011-v5-impl-01-protocol.md)). The `etag` and fingerprints are reported in `GET`. The bundle is only ever accepted on the control channel or at Registration, never from a Session. A push is accepted even if every pinned CA has expired: it's authenticated by the Connection Secret, not by the pinned CAs.
 
 ### The Connection's ProviderEndpoint
 
-For each Connection, the SDK watches its `ProviderEndpoint` (`default`, cluster-scoped, in the Connection's Provider Workspace, through the front-proxy) over the Connection's own Sessions. Two things come from it:
+For each Connection, the SDK watches its `ProviderEndpoint` (`default`, cluster-scoped, in the Connection's Provider Workspace, through the front-proxy) over the Connection's own Sessions. It's applied only if its `connectionID` is the Connection's; otherwise it's ignored and logged. Two things come from it:
 - **`pendingSecretHash`**: when set and different from `secretHash`, it becomes the `Connection`'s `secretHash` and the old Connection Secret stops working ([01 Protocol, "Changing the Connection Secret"](./xxx-notes-011-v5-impl-01-protocol.md)). This is the only way the hash changes after Registration.
 - **`serverKeys`**: which Server Keys the PM-side has pinned, kept as `listedServerKeys` (see "Server Keys").
 
-The `ProviderEndpoint` is trusted because of how it arrives: over a Session whose Connector Certificate verified against the Connection's Pinned Bundle and whose Hello named the Connection's `clusterName`, from an object only PM can write.
+The `ProviderEndpoint` is trusted because of how it arrives: over a Session whose Connector Certificate verified against the Connection's Pinned Bundle and whose Hello named the Connection's `connectionID` and `clusterName`, from an object only PM can write, naming this Connection.
 
 ### Session server
 
 1. **Refuse unknown or deleted Connection IDs before the upgrade**, and callers beyond the handshake limits with `503` ([01 Protocol, "Endpoints at a glance"](./xxx-notes-011-v5-impl-01-protocol.md)).
 2. **Accept the WebSocket** and run the **Inner TLS server**, requiring a client certificate issued directly by a CA in the Connection's Pinned Bundle, with the `clientAuth` EKU ([01 Protocol, "Inner layer"](./xxx-notes-011-v5-impl-01-protocol.md)). A short timeout covers the whole handshake.
-3. **Read the Hello**; close the Session if its `clusterName` isn't the Connection's.
-4. **Start yamux**; register the Session under its Connection, with the hosts it serves (from the Hello's `hosts`) plus the front-proxy.
+3. **Read the Hello**; close the Session unless its `connectionID` is the path's `{id}` and its `clusterName` is the Connection's. This check is essential, not defense in depth: one Connector Certificate serves every Connection of a PM Instance ([01 Protocol, "Hello"](./xxx-notes-011-v5-impl-01-protocol.md)).
+4. **Start yamux**; register the Session under its Connection, with the virtual-workspace hosts it serves (from the Hello's `hosts`). Every Session also serves the Provider Workspace.
 5. **Honour go-away**: stop opening Streams on a Session the Connector is replacing.
 6. **Close all Sessions** of a Connection that's deleted.
 7. **Re-check open Sessions when the Pinned Bundle changes** (a push or a re-pin): a Session whose client certificate, kept from its handshake, no longer chains to a CA in the new bundle gets go-away, a short grace period for in-flight requests (e.g. 30 seconds, configurable), then is closed. Only the issuer counts, not the certificate's expiry. This ends Sessions opened with a leaked CA or Connector Certificate key once PM drops it; why it matters, and its limits, are in [01 Protocol, "Pinned Bundle"](./xxx-notes-011-v5-impl-01-protocol.md).
 
 ### Transport
 
-- **A per-Connection `http.Transport`** whose dial hook opens a yamux Stream on a Session that serves the target host and returns it. The target address only chooses the Session; the request goes as plain HTTP/1.1 on the Stream, with the real kcp URL and `Host`, which the Connector checks.
-- **Session choice**: any Session for the front-proxy; that shard's Sessions for a virtual-workspace host; spread across several Sessions serving the same host.
+- **A per-Connection `http.Transport`** whose dial hook opens a yamux Stream on a Session that serves the target and returns it. The target address only chooses the Session; the request goes as plain HTTP/1.1 on the Stream, and the Connector routes and checks it by its path ([05 Connector, "Request pipeline"](./xxx-notes-011-v5-impl-05-connector.md)).
+- **The Provider Workspace has no real host on the Provider-side**: its requests use a fixed placeholder host, internal to the SDK, which never resolves (e.g. `front-proxy.pm.invalid`). Virtual-workspace URLs come from endpoint slices, as kcp writes them.
+- **Session choice**: any Session for the Provider Workspace; that shard's Sessions for a virtual-workspace host; spread across several Sessions serving the same host.
 - **No TLS settings on the client config**: confidentiality comes from the Inner TLS, and client-go refuses both a custom transport and TLS options.
-- **Per-host bookkeeping** of request outcomes, in memory, which feeds status and `Ready`.
+- **Bookkeeping** of request outcomes for the Provider Workspace and per virtual-workspace host, in memory, which feeds status and `Ready`.
 
 ### Connections for multicluster-runtime
 
-- **A registry of Connections**, built from `Connection`s, with events (added, removed) and, per Connection, a client config: front-proxy URL as host plus the transport.
+- **A registry of Connections**, built from `Connection`s, with events (added, removed) and, per Connection, a client config: the placeholder host plus the transport. The Provider's code takes the config and never sees a URL.
 - **A helper** that, for each Connection, creates a multicluster-runtime endpoint-slice provider per endpoint slice the Provider names, and composes them with cluster names prefixed by `connectionID`.
 - **Connections keep their `connectionID`** through Secret Changes, repairs and administrator imports, so nothing changes for the Provider's controllers.
 
 ### Status
 
-Answers `GET` from memory with, per host the Provider's clients actually use: live Sessions, whether recent requests reached kcp, and the last error, without sensitive detail ([01 Protocol, "Status"](./xxx-notes-011-v5-impl-01-protocol.md)).
+Answers `GET` from memory with what the Provider's clients actually use: `workspace` (the Provider Workspace, served by every Session) and `virtualWorkspaces` (per host); for each, live Sessions, whether recent requests reached kcp, and the last error, without sensitive detail ([01 Protocol, "Status"](./xxx-notes-011-v5-impl-01-protocol.md)).
 
 ### Server Keys
 
-- **Generated by the SDK**: on first start, with no `ServerKey`, it creates one; for every `ServerKey` without `signerRef` and with an empty `status.publicKey`, it generates the key pair into the `Secret` and sets `publicKey`. It never generates a new key under an existing name, since Connections have pinned the old one: a missing `Secret` is `Ready=False` with `KeyMissing`, and the fix is a rotation.
+- **Generated by the SDK**: on first start, with no `ServerKey`, it creates one; for every `ServerKey` without `signerRef` and with an empty `status.publicKey`, it generates the key pair into the `Secret` and sets `publicKey` and `fingerprint`. It never generates a new key under an existing name, since Connections have pinned the old one: a missing `Secret` is `Ready=False` with `KeyMissing`, and the fix is a rotation.
 - **KMS or HSM keys** through `signerRef`. The Provider registers a signer factory in its binary, `sdk.RegisterSigner("gcp-kms", func(ctx, key string) (crypto.Signer, error) {…})`, with any `crypto.Signer` implementation (sigstore's KMS packages and `crypto11` for PKCS#11 are examples); the SDK ships no KMS clients. The SDK reads the public key through `Public()`, checks that the Inner TLS accepts its algorithm (e.g. ECDSA P-256 or P-384), and sets `publicKey`. Access to the KMS comes from the Provider's pod identity. Failures are `SignerUnavailable`. On every start the SDK compares `Public()` with `publicKey` and refuses a key it can't prove: `KeyMismatch`.
-- **Which key a Connection presents**: every `ServerKey` not past `retireAt` is announced in `GET`; each Connection presents the newest announced key in its `listedServerKeys`.
+- **Which key a Connection presents**: every `ServerKey` not past `retireAt` is announced in `GET`; on Sessions, each Connection presents the newest announced key in its `listedServerKeys`; on Control Sessions, the key PM names in `PM-Server-Key`, if the SDK has it; at Registration, the token's key.
+- **Tokens are issued and used only over keys without `retireAt`**, so a rotation never leaves PM pinning a key the Provider is about to drop.
 - **Rotation only on demand** (see "Administration"), for example after a suspected key compromise. Nothing rotates on a schedule. There's no plain-HTTPS key endpoint ([01 Protocol, "Server Keys"](./xxx-notes-011-v5-impl-01-protocol.md)).
 
 ### Metrics
 
 Prometheus collectors, which the Provider adds to the registry it already serves (controller-runtime's, for most):
-- authentication failures on Control Sessions and Sessions;
+- authentication failures on Control Sessions and Sessions, and `ConnectionMismatch`;
+- Registrations refused, by reason (token unknown, expired, spent, key unusable);
 - pushed Pinned Bundles refused, by reason;
 - Sessions by state, and Sessions closed, by reason (go-away, Edge cut, bundle re-check, Connection removed);
-- handshakes refused before or during the upgrade, by reason (unknown ID, limits, timeout);
+- handshakes refused before or during the upgrade, by reason (unknown ID, limits for known IDs, the limit for unknown IDs, timeout);
 - Connections;
 - `providersdk_server_key_connections{key, listed}`: how many `Connection`s list each `ServerKey`, from the SDK's cache. A documented alert rule fires when a key with `retireAt` set is still missing from Connections seen in the last day, within a day of `retireAt`.
 
@@ -195,13 +213,14 @@ Prometheus collectors, which the Provider adds to the registry it already serves
 
 ### WebSocket framing
 
-The SDK enforces the protocol's framing on every Session and Control Session ([01 Protocol, "WebSocket framing"](./xxx-notes-011-v5-impl-01-protocol.md)): binary messages only, at most 32 KB each, outer pings at the protocol's interval. Providers can't configure it away.
+The SDK enforces the protocol's framing on every Registration, Session and Control Session ([01 Protocol, "WebSocket framing"](./xxx-notes-011-v5-impl-01-protocol.md)): binary messages only, at most 32 KB each, outer pings at the protocol's interval. Providers can't configure it away.
 
 ### Administration
 
 Runbooks for Provider Administrators, for cases no protocol call can fix safely. Everything is `kubectl` on the resources; the SDK's controllers react. Inputs are exchanged out-of-band with the PM Administrators.
 - **Re-pin a Connection's Pinned Bundle**, when no Session verifies (for example, a bundle that missed a whole Rollover while the Connection also lost its Connection Secret): edit `spec.pinnedBundle`. Once Sessions work again, PM repairs the Connection Secret through the `ProviderEndpoint`.
-- **Import a Connection** after the Provider-side lost its state: apply a `Connection` with its `connectionID`, Owner, `clusterName`, front-proxy URL and the Pinned Bundle. No Connection Secret hash: `platform-mesh-operator` notices the failed authentication and changes the Connection Secret through the `ProviderEndpoint`. New Server Keys go to PM Administrators, since PM never fetches them over plain HTTPS.
+- **Import a Connection** after the Provider-side lost its state: apply a `Connection` with its `connectionID`, Owner, `clusterName` and the Pinned Bundle. No Connection Secret hash: `platform-mesh-operator` notices the failed authentication and changes the Connection Secret through the `ProviderEndpoint`. New Server Keys go to PM Administrators, since PM never fetches them over plain HTTPS.
+- **Move to a new Base URL**: serve the Connection API under the new URL as well, then ask the PM Administrators to change each Connection's Base URL ([03 Operator, "Writing ProviderEndpoints"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)); if the new hostname's certificate comes from a different private CA, tell Owners to add it to their `caBundle` first. Stop serving the old URL once no Session arrives there.
 - **Rotate the Server Key**:
   1. create a new `ServerKey`: without a KMS, a manifest with just `generateName: sk-` (`kubectl create`); with one, create the key in the KMS first and name its version in `signerRef`;
   2. the SDK announces it; `platform-mesh-operator` adds it to each Connection's `ProviderEndpoint` on its next poll ([03 Operator, "Writing ProviderEndpoints"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)), and each Connection moves to it;
@@ -211,7 +230,7 @@ Runbooks for Provider Administrators, for cases no protocol call can fix safely.
        | select(.status.listedServerKeys | index("sk-2026-10") | not)
        | [.metadata.name, .spec.registration.owner, .status.lastSeen] | @tsv'
      ```
-  4. set `retireAt` on the old key: soon for a planned rotation, a short deadline after a suspected compromise, accepting that Connections not reached by then lose their Sessions until a PM Administrator supplies the new key (`status.publicKey`);
+  4. set `retireAt` on the old key: soon for a planned rotation, a short deadline after a suspected compromise, accepting that Connections not reached by then lose their Sessions until a PM Administrator supplies the new key (`status.publicKey`). From then on, new tokens use the new key, and unspent tokens issued over the old one are refused;
   5. delete the old `ServerKey` once retired, never before; its `Secret` follows.
 
 ## Replicas
@@ -221,7 +240,7 @@ Sessions for different shards can land on different replicas behind the Provider
 ### This delivery: one active replica
 
 - **Leader election** picks the active replica; the vendor's controllers are leader-elected the usual controller-runtime way, with their reconcile logic unchanged. The SDK's controllers run on the leader.
-- **Standby replicas answer Session and Control Session upgrades with `503` and `Retry-After: 5`.** Connectors use the value as the lower bound for their normal reconnect backoff, which grows on repeated failures, so a Provider with a longer leader-election Lease just sees a few more `503`s during a failover ([01 Protocol, "Errors and retries"](./xxx-notes-011-v5-impl-01-protocol.md)); with two or three replicas, Sessions are back within roughly 10–20 seconds after a failover, and watches relist as after any restart.
+- **Standby replicas answer Registration, Session and Control Session upgrades with `503` and `Retry-After: 5`.** Connectors use the value as the lower bound for their normal reconnect backoff, which grows on repeated failures, so a Provider with a longer leader-election Lease just sees a few more `503`s during a failover ([01 Protocol, "Errors and retries"](./xxx-notes-011-v5-impl-01-protocol.md)); with two or three replicas, Sessions are back within roughly 10–20 seconds after a failover, and watches relist as after any restart.
 - **Constraints on the vendor**: nothing beyond leader election (Lease RBAC, which leader-elected operators already have) and an Edge that meets the quickstart's checklist ([08 Quickstart, "Connection API server"](./xxx-notes-011-v5-impl-08-provider-quickstart.md)). No extra Services, routes or permissions.
 - **What vendors accept**: vertical scaling only (one process holds every Connection's caches and traffic), and a reconnect lottery plus relists after a failover.
 
@@ -233,6 +252,9 @@ An opt-in mode for vendors who need more than one active replica is a [follow-up
 
 Documented for Provider authors ([08 Quickstart, "Documentation for Provider authors"](./xxx-notes-011-v5-impl-08-provider-quickstart.md)):
 - **Service endpoint slices live in the Provider Workspace**, for exports in that workspace. Connectors open Sessions on a shard only if such a slice lists it ([05 Connector, "Which Sessions"](./xxx-notes-011-v5-impl-05-connector.md)).
+- **Only the Provider Workspace and the APIExport virtual workspace are reachable**, with logical cluster names, never workspace paths; other kcp virtual workspaces aren't available to Remote Providers ([05 Connector, "Authorization and policy"](./xxx-notes-011-v5-impl-05-connector.md)).
+- **RBAC in the Provider Workspace is restricted**: role bindings may name only ServiceAccounts in the workspace and kcp's `apis.kcp.io:binding:` subjects, and `Secret`s of type `kubernetes.io/service-account-token` are refused. To let consumers bind its APIExports, a Provider binds the ClusterRole `providers.platform-mesh.io:apiexport-bind` to them ([02 APIs, "Policies in Provider Workspaces"](./xxx-notes-011-v5-impl-02-apis.md)).
+- **A Provider's own admission policies on its exported resources apply in consumers' workspaces too**: kcp applies an export's `ValidatingAdmissionPolicy`s to the bound resources wherever they're bound.
 - **The Edge meets the quickstart's checklist** ([08 Quickstart, "Connection API server"](./xxx-notes-011-v5-impl-08-provider-quickstart.md)); `platform-mesh-operator` reports violations it sees on the `Provider` with a labelled message.
 - **One active replica** of the Connection API server and its controllers, by leader election (see "Replicas").
 - **Rate limits** on Registration per Owner: SDK defaults, adjustable.
@@ -252,12 +274,12 @@ Documented for Provider authors ([08 Quickstart, "Documentation for Provider aut
 
 1. Module scaffold, protocol types, test vectors.
 2. The CRDs (`Connection`, `OnboardingToken`, `ServerKey`) with their CEL rules, selectable fields and printer columns.
-3. The token helper; metrics.
-4. Connection API handlers.
-5. Control Sessions (Inner TLS server, bearer check, compare-and-swap on the bundle).
-6. Session server (handshake limits, inner mutual TLS, Hello, yamux, registry, re-checking Sessions on a bundle change).
-7. Transport and Connection registry; multicluster-runtime helper.
-8. The SDK's controllers: `Connection` (finalizer, `Ready`, `lastSeen`, orphan expiry, Events), `OnboardingToken` (garbage collection), `ServerKey` (generation, signers, checks); the `ProviderEndpoint` watch (`pendingSecretHash`, `serverKeys`); status.
+3. The token helper, with the key choice; metrics.
+4. Connection API: routing under `/v1/connections/`; Registration (token checks before the upgrade, Inner TLS with the token's key, idempotency); orphan expiry.
+5. Control Sessions (handshake limits including unknown IDs, Inner TLS server with the requested key, binding to the path's ID, "unknown" inside the Inner TLS after an uncached read, bearer check, compare-and-swap on the bundle).
+6. Session server (handshake limits, inner mutual TLS, Hello with `connectionID` and `clusterName`, yamux, registry, re-checking Sessions on a bundle change).
+7. Transport with the placeholder host and Connection registry; multicluster-runtime helper.
+8. The SDK's controllers: `Connection` (finalizer, `Ready`, `lastSeen`, orphan expiry, Events), `OnboardingToken` (garbage collection), `ServerKey` (generation, signers, checks); the `ProviderEndpoint` watch (`connectionID` check, `pendingSecretHash`, `serverKeys`); status.
 9. Framing enforcement.
 10. Fake PM-side and test server.
 11. Unit tests for the rules above, with envtest and the protocol's test vectors.
@@ -276,10 +298,12 @@ Documented for Provider authors ([08 Quickstart, "Documentation for Provider aut
 
 - **One active replica** (leader election, standbys answer `503` with `Retry-After: 5`); horizontal scale is a follow-up needing no PM-side work.
 - **Kubernetes-API-first**: the SDK's state is `Connection`, `OnboardingToken` and `ServerKey` in `provider-sdk.platform-mesh.io/v1alpha1`, the only source of truth; deleting a `Connection` is the delete; the only `Secret`s hold private keys.
-- **Events, not hooks**: Providers watch `Connection`s and their Events. Operational signals are metrics, without `connectionID` labels.
+- **Events, not hooks**: Providers watch `Connection`s and their Events. Operational signals are metrics, without `connectionID` labels. Failed authentications change nothing and aren't Events.
+- **Onboarding Tokens name their Server Key**; Registration runs inside Inner TLS with it.
 - **Server Keys**: generated by the SDK or behind a registered `crypto.Signer`; rotated only on demand, with `kubectl` and `retireAt`.
+- **No front-proxy URL**: the Provider Workspace is reached through a placeholder host internal to the SDK.
 - **Administration** is `kubectl` on the resources, documented as runbooks.
 - **Go only.** The protocol specification and test vectors exist, but third-party implementations aren't a supported target.
-- **Pinned Bundle**: PEM, parsed strictly.
+- **Pinned Bundle**: PEM, parsed strictly, never empty.
 - **Recovery**: Connection Secrets change only through the `ProviderEndpoint`; recovery beyond that is out-of-band, through the runbooks.
 - **Module**: `go.platform-mesh.io/provider-sdk`; independent semver; upgrade signals as above.
