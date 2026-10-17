@@ -57,7 +57,9 @@ Why this is safe:
 - **Only PM can write the `ProviderEndpoint`**: the Connection Export's maximal permission policy refuses writes even to the Provider Workspace's admins ([02 APIs, "Connection Export"](./xxx-notes-011-v5-impl-02-apis.md)).
 - **The Provider-side reads it only over a valid Session**: one whose Connector Certificate verified against the Connection's Pinned Bundle, and whose Hello named the Connection's `connectionID` and `clusterName` (see "Sessions").
 - **The Provider-side applies it only to its own Connection**: a `ProviderEndpoint` whose `connectionID` isn't the Connection's is ignored.
-- **So nobody but PM can change the Connection Secret.** Holding the current Connection Secret, an Onboarding Token or a portal account doesn't help, which also means a thief can't lock PM out.
+- **So no call, Onboarding Token or portal account can change the Connection Secret.**
+
+**One exception: a leaked Connection Secret.** It only exists on the PM-side, so whoever holds one got it from a PM-side leak. With it they can push a Pinned Bundle with a CA of their own (see "Pinned Bundle"), and through a Session under that CA change the Connection Secret, which locks PM out of that one Connection. It gives no kcp access. If `platform-mesh-operator`'s tamper check gets there first, it restores the bundle and changes the Connection Secret; otherwise the `Provider` shows `SecretRejected`, and recovery is out-of-band: the Provider Administrators re-pin the bundle and `platform-mesh-operator` repairs the Connection Secret, or the Owner abandons the Connection and onboards again. It's handled like any other PM-side secret leak: find the leak and rotate PM's credentials ([03 Operator, "Secret Changes"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
 
 It needs a working Session. Without one, the change waits; the Provider-side keeps the current hash meanwhile.
 
