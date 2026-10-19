@@ -4,7 +4,7 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Ho
 
 ## Principles
 
-- **The protocol has one set of test vectors**, used by both the SDK and the PM-side ([01 Protocol, "Deliverables"](./xxx-notes-011-v5-impl-01-protocol.md)).
+- **The protocol has one set of test vectors**, used by both the SDK (`provider-gateway`) and the PM-side ([01 Protocol, "Deliverables"](./xxx-notes-011-v5-impl-01-protocol.md)).
 - **Security guarantees are tested as negative cases**: what must be refused is enumerated and checked, for every verb and both kcp path shapes.
 - **E2E runs with a real network boundary**: PM can't reach the Provider except through its Base URL, and the Provider can't reach PM at all.
 - **Every row of v5's failure table has a test**, at the level that fits: a unit test for a component's own reaction, an E2E scenario when components or the network are involved, a security test for an attack.
@@ -21,7 +21,7 @@ How kcp-multicluster-provider engages clusters, including when a logical cluster
 
 ## E2E (kind, multi-shard)
 
-**Environment**, extending `platform-mesh-operator`'s kind e2e setup (`operators/platform-mesh-operator/test/e2e/kind`; see also [09 Deployment, "Local development"](./xxx-notes-011-v5-impl-09-deployment.md)): kcp with at least two shards and a front-proxy, cert-manager, `platform-mesh-operator`, a Connector per shard, and the [quickstart](./xxx-notes-011-v5-impl-08-provider-quickstart.md) Provider in a separate network reachable only through an ingress at its Base URL. A test ingress that terminates TLS stands in for the Provider's Edge. The Provider's address is private (the docker network), which needs no configuration: only loopback, link-local, unspecified and multicast addresses are refused.
+**Environment**, extending `platform-mesh-operator`'s kind e2e setup (`operators/platform-mesh-operator/test/e2e/kind`; see also [09 Deployment, "Local development"](./xxx-notes-011-v5-impl-09-deployment.md)): kcp with at least two shards and a front-proxy, cert-manager, `platform-mesh-operator`, a Connector per shard, and the [quickstart](./xxx-notes-011-v5-impl-08-provider-quickstart.md) Provider, its operator next to `provider-gateway` from PM's chart, in a separate network reachable only through an ingress at its Base URL. A test ingress that terminates TLS stands in for the Provider's Edge. The Provider's address is private (the docker network), which needs no configuration: only loopback, link-local, unspecified and multicast addresses are refused.
 
 ### Onboarding
 
@@ -47,7 +47,8 @@ How kcp-multicluster-provider engages clusters, including when a logical cluster
 | Connector Replica killed | Every replica of the shard holds a Session per Connection: killing one cuts only the Streams on its own Sessions, which client-go reopens on the others' Sessions at once |
 | A shard's Connector or virtual workspace down | Only that shard's endpoint traffic stops; with its virtual workspace down, Connectors keep the last known `ProviderEndpoint`s and slices |
 | Host rename | A shard's virtual-workspace host changes: the Connector lists old and new hosts in its Hellos, endpoint slices switch, then the old host is dropped; no Session gap in either order of changes, no certificate reissuance. The front-proxy's host changes in the Connectors' configuration only: Providers notice nothing |
-| Provider standby replicas | Two quickstart replicas behind the test ingress: upgrades reaching the standby get `503` with `Retry-After: 5`, Connectors land on the leader within a few attempts, never retrying sooner; killing the leader moves all Sessions to the new leader |
+| Provider standby replicas | Two `provider-gateway` replicas behind the test ingress: upgrades reaching the standby get `503` with `Retry-After: 5`, Connectors land on the leader within a few attempts, never retrying sooner; the operator's proxy Service reaches only the leader; killing the leader moves all Sessions to the new leader, the operator's tunnels reconnect, and its kubeconfig `Secret`s stay unchanged |
+| Operator through the gateway | The quickstart's operator, unchanged kcp-multicluster-provider code with the kubeconfig `Secret`s, reconciles consumers on two shards; `CONNECT`s with a wrong credential or for a host no Session serves are refused; a reconcile burst across many consumer clusters stays within `provider-gateway`'s tunnel limit per Connection (refusals beyond it retried by client-go), and with the shared transport opens only about as many tunnels as requests in flight; restarting the operator leaves Sessions untouched |
 
 ### PM-side restarts
 

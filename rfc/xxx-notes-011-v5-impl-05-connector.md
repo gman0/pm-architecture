@@ -113,7 +113,7 @@ Plain `http.Handler` wrappers, in order, the way kcp's front-proxy builds its ha
 2. **Limits** (see "Limits").
 3. **Require a canonical path** (see "Path parsing").
 4. **Parse the path and choose the upstream** (see "Path parsing"). The path's shape is the only target selection; the Stream carries no separate target, and the upstreams come only from the Connector's deployment configuration:
-   - `/clusters/<cluster>/…` goes to the **front-proxy**, whatever the request's `Host`. The Provider-side has no name for the front-proxy; it sends a placeholder that only exists inside the SDK ([01 Protocol, "Hosts a Session serves"](./xxx-notes-011-v5-impl-01-protocol.md));
+   - `/clusters/<cluster>/…` goes to the **front-proxy**, whatever the request's `Host`. The Provider-side has no name for the front-proxy; its kubeconfigs carry a placeholder host that's never resolved ([01 Protocol, "Hosts a Session serves"](./xxx-notes-011-v5-impl-01-protocol.md));
    - `/services/apiexport/…` goes to **this shard's virtual workspace**, and only if `Host` is this shard's virtual-workspace host. That name is real (it comes from kcp's endpoint slices) and selects the shard: a request for another shard that reached this Connector is refused, not forwarded to the wrong virtual workspace;
    - anything else is refused.
 5. **Authorize** (see "Authorization and policy").

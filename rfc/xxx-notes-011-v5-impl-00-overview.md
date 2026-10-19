@@ -33,7 +33,7 @@ Start here, then follow the walkthrough below, or jump to a component.
 | Connection Export home | **`:root:providers:system`**. |
 | Multiplexer | **yamux** over the WebSocket. |
 | Connector CA | **Managed by cert-manager and rolled over automatically**: 1 year, renewed 90 days before expiry, self-signed by default or from an `issuerRef`. `platform-mesh-operator` pushes each new CA to every Provider before Connectors use it; the **`ConnectorCASet`** reports progress in its status, and PM Administrators distrust a compromised CA by its key in its spec, gated until PM's own Connectors have switched ([04](./xxx-notes-011-v5-impl-04-connector-ca.md)). |
-| Provider-side state | **Custom resources in the Provider's cluster** (`Connection`, `OnboardingToken`, `ServerKey` in `provider-sdk.platform-mesh.io`), the only source of truth; the only `Secret`s hold private keys, unless they're in a KMS or HSM. |
+| Provider-side state | **Custom resources in the Provider's cluster** (`Connection`, `OnboardingToken`, `ServerKey` in `provider-sdk.platform-mesh.io`), the only source of truth; the only `Secret`s hold private keys, `provider-gateway`'s CA, and the kubeconfigs for the operator. |
 | Portal | **The Kubernetes API on the SDK's resources**, plus a token helper; the quickstart has its own small portal. |
 | E2E | **kind, multi-shard**, with the Provider behind a network boundary, extending `platform-mesh-operator`'s `test/e2e/kind`. |
 | Naming | `xxx-notes-011-v5-impl-*.md` in `rfc/`. |
@@ -52,7 +52,7 @@ Start here, then follow the walkthrough below, or jump to a component.
 | Migration | None: no Remote Providers exist yet ([03](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)). |
 | Protocol | Current and previous version supported; Registration inside Inner TLS, pinned to the Server Key named in the Onboarding Token; Sessions authenticated by the inner mutual TLS alone, with a Hello naming `connectionID` and `clusterName`; Control Sessions bound to their path's Connection, and "unknown" trusted only inside Inner TLS; Streams carry HTTP from the first byte; Control Calls over HTTP/1.1; no front-proxy URL on the Provider-side ([01](./xxx-notes-011-v5-impl-01-protocol.md)). |
 | Connector | Every replica serves every Connection its shard needs; routes by path to its two upstreams, canonical paths and logical cluster names only; no request timeouts of its own, limits per Connection; child workspaces denied; one identity group for all shards ([05](./xxx-notes-011-v5-impl-05-connector.md)). |
-| SDK | One active replica by leader election (standbys answer `503` with `Retry-After: 5`), horizontal scale as a later opt-in; Kubernetes-API-first resources, Events instead of hooks, metrics for operators; Server Keys rotated only on demand, through `kubectl`; Go only; Pinned Bundles in PEM ([07](./xxx-notes-011-v5-impl-07-provider-sdk.md)). |
+| SDK | **Delivered as a component, `provider-gateway`** (image and chart from PM), installed next to the Provider's unchanged operator, which reaches kcp through it with one kubeconfig `Secret` per Connection (`proxy-url`, `tls-server-name`) and standard client-go, multicluster-runtime and kcp-multicluster-provider; one active `provider-gateway` replica by leader election (standbys answer `503` with `Retry-After: 5`), horizontal scale as a later opt-in; Kubernetes-API-first resources, Events instead of hooks, metrics for operators; Server Keys in `Secret`s, rotated only on demand, through `kubectl`, KMS keys later; operators in any language; Pinned Bundles in PEM ([07](./xxx-notes-011-v5-impl-07-provider-sdk.md)). |
 | Quickstart | Keeps kubeconfig mode alongside Connection mode ([08](./xxx-notes-011-v5-impl-08-provider-quickstart.md)). |
 | API groups | **Two**: `providers.platform-mesh.io` for every PM-side kind (in kcp, through the Providers Export and the Connection Export; in PM's runtime cluster, as CRDs), and `provider-sdk.platform-mesh.io` for the SDK's kinds; `v1alpha1` ([02](./xxx-notes-011-v5-impl-02-apis.md)). |
 
@@ -82,9 +82,10 @@ Start here, then follow the walkthrough below, or jump to a component.
  │ SA (admin), policies (PM-written)        │
  │ Provider's own exports/slices            │              ┌──────────────────────────────────────────────┐
  └──────────────────────────────────────────┘              │ Provider runtime                             │
-                                                           │   the SDK (doc 07): connection API,          │
-                                                           │   session server, transport, its CRDs        │
-                                                           │   Provider controllers + portal (doc 08)     │
+                                                           │   provider-gateway, the SDK (doc 07):        │
+                                                           │   connection API, sessions, operator proxy,  │
+                                                           │   its CRDs, a kubeconfig Secret per conn.    │
+                                                           │   Provider operator (kubeconfigs) + portal   │
                                                            └──────────────────────────────────────────────┘
 ```
 
@@ -99,7 +100,7 @@ Each step names the document and section that owns it; read them in this order t
 5. **The request registers the Connection** with the Provider-side, inside Inner TLS pinned to the token's Server Key: generates the Connection Secret, sends its hash and the Connector CA certificates, receives the `connectionID`, Server Keys and `unusedExpiresAt`, and is done (`Registered`): [03 Operator, "Registration"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md); the Provider's side: [07 SDK, "Connection API"](./xxx-notes-011-v5-impl-07-provider-sdk.md); the CA certificates it sends: [04 Connector CA, "ConnectorCASet"](./xxx-notes-011-v5-impl-04-connector-ca.md).
 6. **`platform-mesh-operator` makes a first Control Call**, pushing the current Connector CA Set if it changed, **and writes the `ProviderEndpoint`** into the Provider Workspace through the Connection Export: [03 Operator, "First Control Call and ProviderEndpoint" and "Writing ProviderEndpoints"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md); type and policy: [02 APIs, "ProviderEndpoint" and "Connection Export"](./xxx-notes-011-v5-impl-02-apis.md).
 7. **Connectors discover the `ProviderEndpoint` and open Sessions** where needed: [05 Connector, "Discovery" and "Which Sessions"](./xxx-notes-011-v5-impl-05-connector.md); the Session handshake: [01 Protocol, "Sessions"](./xxx-notes-011-v5-impl-01-protocol.md); the Provider's side: [07 SDK, "Session server"](./xxx-notes-011-v5-impl-07-provider-sdk.md).
-8. **The Provider's controllers reconcile through the Sessions**: transport and client configs in [07 SDK, "Transport" and "Connections for multicluster-runtime"](./xxx-notes-011-v5-impl-07-provider-sdk.md); the proxy on PM's side in [05 Connector, "Request pipeline"](./xxx-notes-011-v5-impl-05-connector.md); the reference wiring in [08 Quickstart](./xxx-notes-011-v5-impl-08-provider-quickstart.md).
+8. **The Provider's controllers reconcile through the Sessions**, with one kubeconfig per Connection through `provider-gateway`'s operator proxy: [07 SDK, "Kubeconfig per Connection" and "Operator proxy"](./xxx-notes-011-v5-impl-07-provider-sdk.md); the proxy on PM's side in [05 Connector, "Request pipeline"](./xxx-notes-011-v5-impl-05-connector.md); the reference wiring in [08 Quickstart](./xxx-notes-011-v5-impl-08-provider-quickstart.md).
 9. **`platform-mesh-operator` confirms readiness** from the Provider-side's status for its workspace and virtual-workspace hosts, and the `Provider` becomes `Ready`: [03 Operator, "Health"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md); [01 Protocol, "Status"](./xxx-notes-011-v5-impl-01-protocol.md).
 10. **Steady state**: `platform-mesh-operator` polls health and changes the Connection Secret when needed, through the `ProviderEndpoint`; cert-manager renews Connector Certificates and, once a year, the Connector CA, which `platform-mesh-operator` pushes before Connectors switch ([04 Connector CA, "Rollover"](./xxx-notes-011-v5-impl-04-connector-ca.md)); Connectors refresh SA tokens: [03 Operator, "Secret Changes"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md), [01 Protocol, "Changing the Connection Secret"](./xxx-notes-011-v5-impl-01-protocol.md), [07 SDK, "The Connection's ProviderEndpoint"](./xxx-notes-011-v5-impl-07-provider-sdk.md), [04 Connector CA, "Connector Certificates"](./xxx-notes-011-v5-impl-04-connector-ca.md), [05 Connector, "Identity towards kcp"](./xxx-notes-011-v5-impl-05-connector.md).
 11. **Rare operations**: Connection Secret repair, Onboarding a `Provider` again, abandoning a Connection and changing a Base URL ([01 Protocol, "Recovery"](./xxx-notes-011-v5-impl-01-protocol.md), [03 Operator, "Recovery"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)); out-of-band administration ([07 SDK, "Administration"](./xxx-notes-011-v5-impl-07-provider-sdk.md)); Server Key rotation ([07 SDK, "Server Keys"](./xxx-notes-011-v5-impl-07-provider-sdk.md)); distrusting a compromised Connector CA ([04 Connector CA, "Compromise response"](./xxx-notes-011-v5-impl-04-connector-ca.md)).
@@ -143,7 +144,8 @@ Clear ownership avoids two controllers fighting over the same fields.
 | Connector CA Set, `ConnectorCASet` status | `platform-mesh-operator` | Connectors (switch rule), PM Administrators |
 | `ConnectorCASet.spec.distrust` | PM Administrators | `platform-mesh-operator` |
 | SA tokens | Connectors (TokenRequest) | Connectors only |
-| a Connection's Provider-side state | the SDK | the SDK, portal |
+| a Connection's Provider-side state | `provider-gateway` | `provider-gateway`, portal |
+| a Connection's kubeconfig `Secret` (the operator's namespace) | `provider-gateway` | the Provider's operator |
 
 
 ## Build order
@@ -151,7 +153,7 @@ Clear ownership avoids two controllers fighting over the same fields.
 Single delivery, but the pieces depend on each other. Suggested order, with what each step unblocks:
 
 1. **Protocol and APIs** ([01](./xxx-notes-011-v5-impl-01-protocol.md), [02](./xxx-notes-011-v5-impl-02-apis.md)): the contract everyone builds against. Includes protocol test vectors.
-2. **SDK core** ([07](./xxx-notes-011-v5-impl-07-provider-sdk.md)): Connection API, its resources and controllers, Session server, transport. Can be tested against a fake PM-side.
+2. **SDK core** ([07](./xxx-notes-011-v5-impl-07-provider-sdk.md)): `provider-gateway`'s Connection API, its resources and controllers, Session server, operator proxy and kubeconfigs, and its chart. Can be tested against a fake PM-side.
 3. **Connector CA** ([04](./xxx-notes-011-v5-impl-04-connector-ca.md)) and **kcp bootstrap** of the Connection Export ([09](./xxx-notes-011-v5-impl-09-deployment.md)).
 4. **`platform-mesh-operator`** ([03](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)) and **Connector** ([05](./xxx-notes-011-v5-impl-05-connector.md)), in parallel; they meet only at the `ProviderEndpoint` and the protocol.
 5. **Quickstart** ([08](./xxx-notes-011-v5-impl-08-provider-quickstart.md)).

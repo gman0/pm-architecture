@@ -103,7 +103,7 @@ Upgrades follow the same path. Connectors and `platform-mesh-operator` tolerate 
 
 ## Local development
 
-A kind setup with a multi-shard kcp, cert-manager, `platform-mesh-operator`, Connectors, and the quickstart Provider in a separate network ([10 Testing, "E2E (kind, multi-shard)"](./xxx-notes-011-v5-impl-10-testing.md)). The same setup serves developers and CI.
+A kind setup with a multi-shard kcp, cert-manager, `platform-mesh-operator`, Connectors, and the quickstart Provider with `provider-gateway`, installed from its chart, in a separate network ([10 Testing, "E2E (kind, multi-shard)"](./xxx-notes-011-v5-impl-10-testing.md)). The same setup serves developers and CI.
 
 ## Decided
 

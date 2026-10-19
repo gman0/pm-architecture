@@ -149,7 +149,7 @@ A **Session** is a long-lived tunnel between PM and a Provider; **Streams** are 
 | | Session | Stream |
 |---|---|---|
 | **What it is** | One WebSocket, with Inner TLS and the yamux multiplexer inside | One logical connection inside a Session, created by yamux |
-| **Who opens it** | PM: a Connector Replica dials the Provider | The Provider-side: the SDK opens one whenever client-go wants a new connection to kcp |
+| **Who opens it** | PM: a Connector Replica dials the Provider | The Provider-side: `provider-gateway` opens one whenever the operator's client-go opens a new connection to kcp through it |
 | **For what** | One Connection (one Provider Workspace), on one shard | One HTTP connection from client-go: requests one after another, or one long watch |
 | **Authentication** | Once, when it opens: the Inner TLS handshake, then the Hello | None of its own: it inherits the Session's. The Connector authorizes each request on it |
 | **Cost to open** | A WebSocket upgrade through the Provider's Edge, plus a TLS handshake | A yamux frame |
@@ -160,7 +160,7 @@ A **Session** is a long-lived tunnel between PM and a Provider; **Streams** are 
 
 It's like an HTTP/2 connection and its streams, with one difference in direction: PM sets up the Session, because the Provider can't reach PM, but the Provider opens the Streams, because it's the client talking to kcp.
 
-**How they fit together in practice.** The Provider's controller wants to watch `cowboys` on shard B. client-go asks the SDK for a connection to shard B's virtual-workspace host. The SDK picks one of the Sessions serving that host and opens a Stream on it. client-go sends `GET …/cowboys?watch=true` over that Stream; the Connector authorizes it, adds the SA token and forwards it to kcp; the watch events stream back on the same Stream for hours. Other watches and requests on shard B get their own Streams, on the same Session or another one serving that host.
+**How they fit together in practice.** The Provider's controller wants to watch `cowboys` on shard B. client-go asks `provider-gateway`, its proxy, for a connection to shard B's virtual-workspace host. `provider-gateway` picks one of the Sessions serving that host and opens a Stream on it. client-go sends `GET …/cowboys?watch=true` through that tunnel and Stream; the Connector authorizes it, adds the SA token and forwards it to kcp; the watch events stream back on the same Stream for hours. Other watches and requests on shard B get their own Streams, on the same Session or another one serving that host.
 
 ### Upgrade
 
@@ -199,10 +199,10 @@ It's protected by the Inner TLS, so it needs no signature. The Provider-side che
 
 ### Hosts a Session serves
 
-- **The Provider Workspace, on every Session.** Its requests (`/clusters/<clusterName>/…`) go to the front-proxy, which any Connector reaches, so any Session of the Connection serves them. The Provider-side has no name for the front-proxy: its client config uses a placeholder host that only exists inside the SDK, and the Connector ignores the `Host` of these requests ([05 Connector, "Request pipeline"](./xxx-notes-011-v5-impl-05-connector.md)).
+- **The Provider Workspace, on every Session.** Its requests (`/clusters/<clusterName>/…`) go to the front-proxy, which any Connector reaches, so any Session of the Connection serves them. The Provider-side has no name for the front-proxy: the kubeconfigs its operator uses carry a placeholder host that's never resolved, and the Connector ignores the `Host` of these requests ([05 Connector, "Request pipeline"](./xxx-notes-011-v5-impl-05-connector.md)).
 - **The hosts in the Hello's `hosts`**: the shard's virtual-workspace host, taken from the Connector's configuration and sent at the start of every new Session. These are real kcp hostnames, from endpoint slices; they select the shard.
 
-The hosts are **routing information, not authority**. The Provider-side never resolves them (its dial hook opens Streams on Sessions), so they're labels it can't verify independently, and it doesn't need to: a Session that passed the Inner TLS and the Hello's checks already belongs to PM's Connector for this Connection, and which host it serves only decides where Streams go. Keeping hosts out of the Connector Certificate means a hostname change on PM's side never waits for certificates to be reissued: during a rename of a virtual-workspace host, Connectors list both the old and the new host until endpoint slices have switched, so the order of DNS, configuration and endpoint-slice changes doesn't matter. A rename of the front-proxy is a PM-side configuration change only.
+The hosts are **routing information, not authority**. The Provider-side never resolves them (it opens Streams on Sessions for them), so they're labels it can't verify independently, and it doesn't need to: a Session that passed the Inner TLS and the Hello's checks already belongs to PM's Connector for this Connection, and which host it serves only decides where Streams go. Keeping hosts out of the Connector Certificate means a hostname change on PM's side never waits for certificates to be reissued: during a rename of a virtual-workspace host, Connectors list both the old and the new host until endpoint slices have switched, so the order of DNS, configuration and endpoint-slice changes doesn't matter. A rename of the front-proxy is a PM-side configuration change only.
 
 ### What binds a Session to its PM Instance
 
