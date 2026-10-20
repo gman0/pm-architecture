@@ -19,7 +19,7 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). `p
 
 ### Connection API server
 
-- `provider-gateway`, installed from PM's chart into the quickstart's namespace, with the Base URL path the token names (e.g. `https://wildwest.example.com/pm`) routed to its Service.
+- `provider-gateway`, installed from PM's chart into the quickstart's namespace, with the Base URL path the token names (e.g. `https://wildwest.example.com/pm`) routed to its Service. The kind setup includes cert-manager, the chart's default for the serving certificate; the README also shows the value for running without it.
 - Behind an ingress that allows WebSocket upgrades with suitable idle timeouts and maximum connection age. The manifests ship a tested **Gateway API `HTTPRoute` on traefik**, the setup PM itself uses and the e2e runs, plus a **generic checklist** for any other ingress, cloud load balancer, CDN or WAF:
   - **WebSocket upgrades allowed** on the Base URL's `/v1/connections/register/*`, `/v1/connections/*/session` and `/v1/connections/*/control` paths;
   - **no bot protection on those paths**: the Connectors and `platform-mesh-operator` aren't browsers, so JavaScript challenges and CAPTCHAs (e.g. a CDN's bot mode) block them. Exempt all three;
@@ -35,7 +35,7 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). `p
 
   This checklist is the one list of Edge requirements; the SDK's requirements and the v5 notes refer to it. The quickstart's README walks through checking each point on the deployed Base URL; `platform-mesh-operator` reports violations it sees on the `Provider` with a labelled message ([03 Operator, "Edge diagnosis"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
 - Replicas: `provider-gateway` with **leader election**, one active replica; standbys answer upgrades with `503` and `Retry-After: 5` ([07 SDK, "Replicas"](./xxx-notes-011-v5-impl-07-provider-sdk.md)). The Gateway API example routes the `…/register/…`, `…/session` and `…/control` paths without affinity. The operator runs and scales separately.
-- State: the SDK's resources (`Connection`, `OnboardingToken`, `ServerKey`), in the quickstart's namespace; the kubeconfig `Secret`s, in the operator's.
+- State: the SDK's resources (`Connection`, `OnboardingToken`, `ServerKey`), and the kubeconfig `Secret`s, in the quickstart's namespace, which the operator reads through a Role the quickstart's manifests add.
 - Metrics: `provider-gateway`'s collectors, scraped by the `ServiceMonitor` in its chart.
 
 ### Bootstrap per Connection

@@ -7,7 +7,7 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Th
 - **`provider-gateway`**, installed from PM's chart:
   - **the Connection API server** under its Base URL: Registration, Control Sessions, Sessions;
   - **an in-cluster forward proxy** through which the Provider's operator reaches kcp over each Connection's Sessions;
-  - **one kubeconfig `Secret` per Connection**, in the operator's namespace (see "Kubeconfig per Connection");
+  - **one kubeconfig `Secret` per Connection**, in its own namespace (see "Kubeconfig per Connection");
   - **its state as Kubernetes resources**: `Connection`, `OnboardingToken` and `ServerKey` in the Provider's own cluster, with Events on each `Connection` (see "API resources"). The Provider's portal, administrators and controllers use them through the Kubernetes API like any other resource;
   - **metrics** for its operators.
 - **A token helper** for its portal, in the Go module.
@@ -19,7 +19,7 @@ What a Provider still does itself: its portal and user accounts, its operator (w
 - **No kcp knowledge on the Provider-side.** No kcp tokens, kcp kubeconfigs or kcp CA bundles, and no kcp hostname it would have to keep: the front-proxy has no name on the Provider-side, and requests carry no kcp credentials ([01 Protocol](./xxx-notes-011-v5-impl-01-protocol.md)). The kubeconfigs `provider-gateway` writes point at `provider-gateway`, never at kcp.
 - **Everything security-relevant is in `provider-gateway`**, written once by PM and tested with the protocol's test vectors, so Providers can't get it subtly wrong. Nothing protocol-related is compiled into the Provider's operator.
 - **The operator uses standard machinery only**: a kubeconfig per Connection, with nothing in it a stock client-go doesn't understand.
-- **The Kubernetes API is the only source of truth** for the SDK's state. `provider-gateway` keeps caches and live Sessions in memory, never a second copy of state; everything that has to survive a restart is in resources: its own CA, the Connections' proxy credentials (as hashes), and the resources below.
+- **The Kubernetes API is the only source of truth** for the SDK's state. `provider-gateway` keeps caches and live Sessions in memory, never a second copy of state; everything that has to survive a restart is in resources: its CA (see "Operator proxy"), the Connections' proxy credentials (as hashes), and the resources below.
 - **State belongs to its Connection** (`connectionID`), never inherited by another Connection. Consumer data has to be keyed with the `connectionID` too, not only with the consumer's logical cluster and the object's UID: anyone with a portal account can register a Connection with a Connector CA of their own and serve made-up objects that reuse a real consumer's cluster and UID (see "Requirements on Providers").
 - **`connectionID`s are stable.** A Connection keeps its ID through Secret Changes and recovery, so state keyed by it stays valid.
 - **`connectionID`s are random and unguessable** (e.g. 128 random bits), so probing the Session and control paths can't find valid ones. They aren't secret, and nothing relies on them being so.
@@ -120,20 +120,20 @@ The private key is in a `Secret` of the same name, with an owner reference to th
 
 ### Access
 
-RBAC in the SDK's namespace and the operator's:
+RBAC in the SDK's namespace:
 
 | Identity | `Connection` | `OnboardingToken` | `ServerKey` | `Secret`s |
 |---|---|---|---|---|
-| `provider-gateway` | all, including status | all, including status | all, including status | private keys and its CA (its namespace); kubeconfig `Secret`s (the operator's namespace) |
+| `provider-gateway` | all, including status | all, including status | all, including status | private keys, its CA and the kubeconfig `Secret`s (its namespace) |
 | Portal | `get`, `list`, `delete` | `create`, `get`, `list` | `get`, `list` (to pick the key) | none |
 | Provider Administrators | all except status | `get`, `list`, `delete` | all except status | none |
-| Provider's operator | `get`, `list`, `watch` | — | — | the kubeconfig `Secret`s, read-only |
+| Provider's operator | `get`, `list`, `watch` | — | — | the kubeconfig `Secret`s, read-only, through a Role the Provider adds in the SDK's namespace |
 
 **Keep these resources as durable as consumer data.** If they survive what consumer data survives, a rebuilt cluster only needs them back; otherwise the administrators import `Connection`s (see "Administration").
 
 ## Kubeconfig per Connection
 
-`provider-gateway` writes one kubeconfig `Secret` per Connection into the operator's namespace (configurable; it may be the SDK's own), labelled with the `connectionID`. It represents the Connection, not its Sessions: created with the `Connection` at Registration or import, deleted with it, unchanged while Sessions come and go. Whether Sessions are up is the `Connection`'s `Ready`.
+`provider-gateway` writes one kubeconfig `Secret` per Connection into its own namespace, the SDK's, labelled with the `connectionID`. `provider-gateway` writes `Secret`s nowhere else; the Provider's operator reads them through a Role the Provider adds there (`get`, `list`, `watch` on `secrets`). It represents the Connection, not its Sessions: created with the `Connection` at Registration or import, deleted with it, unchanged while Sessions come and go. Whether Sessions are up is the `Connection`'s `Ready`.
 
 ```yaml
 apiVersion: v1
@@ -141,7 +141,7 @@ kind: Secret
 type: Opaque
 metadata:
   name: connection-c-7f3k9q2mx8w4
-  namespace: wild-west-system                          # the operator's namespace
+  namespace: wild-west-system                          # the SDK's namespace
   labels:
     provider-sdk.platform-mesh.io/connection: c-7f3k9q2mx8w4
     app.kubernetes.io/managed-by: provider-gateway
@@ -157,7 +157,7 @@ stringData:
         server: https://front-proxy.pm.invalid/clusters/2x8k9abc     # placeholder for the Provider Workspace; never resolved
         proxy-url: https://c-7f3k9q2mx8w4:<credential>@provider-gateway.wild-west-system.svc:3128
         tls-server-name: provider-gateway.wild-west-system.svc       # every handshake verified against the gateway's name
-        certificate-authority-data: <provider-gateway's serving certificate>
+        certificate-authority-data: <provider-gateway's CA>
     users:
     - name: c-7f3k9q2mx8w4
       user: {}                                         # nothing: towards kcp, the Connector adds the SA token
@@ -170,7 +170,7 @@ stringData:
 - **Only the Provider Workspace's URL.** The virtual-workspace URLs come from the endpoint slices at runtime, as kcp writes them; client-go reaches them through the same proxy.
 - **A credential for `provider-gateway` only**, in the proxy URL: generated with the `Connection`, kept as a hash in its status, useless anywhere else, never sent to PM.
 - **No kcp credential, no kcp CA, no kcp hostname** other than the placeholder.
-- **Changes** only when the `Connection` is created or deleted, when `provider-gateway`'s serving certificate rotates (the new one added next to the old one, the old one removed once it's no longer served), or when the proxy credential is rotated.
+- **Changes** only when the `Connection` is created or deleted, when the proxy credential is rotated, or when the CA's trust bundle changes, which is a rare, deliberate operation (see "Operator proxy"). Renewing the serving certificate changes nothing.
 
 ## Components
 
@@ -225,8 +225,10 @@ How the Provider's operator reaches kcp: an in-cluster HTTPS forward proxy, `pro
 5. **Copy bytes** both ways between the tunnel and the Stream, without parsing HTTP. The Connector routes, authorizes and adds the SA token as for any Stream ([05 Connector, "Request pipeline"](./xxx-notes-011-v5-impl-05-connector.md)); its responses, refusals included, pass through unchanged.
 
 - **One tunnel is one Stream**: client-go's pooling, keep-alive and separate connections for upgrades work as against kube-apiserver.
-- **Limits per Connection**: `provider-gateway` caps concurrent tunnels per Connection below the Connector's per-Connection Stream limit, and answers `503` beyond it, so an operator can't exhaust the Connector's allowance (see "Requirements on Providers" for why that matters).
-- **The serving certificate** comes from `provider-gateway`'s own CA, kept in a `Secret` in its namespace that only it reads, generated at first start; it rotates with overlap through the kubeconfig `Secret`s (see "Kubeconfig per Connection"). No cert-manager dependency; a Provider that runs cert-manager may point `provider-gateway` at a `Secret` it manages.
+- **The serving certificate and its CA**, the standard way for in-cluster services: a long-lived CA that clients trust and that practically never changes, issuing short-lived serving certificates that renew on their own. Kubeconfigs carry the CA, so renewals need nothing from the operator.
+  - **With cert-manager** (the chart's default): a `SelfSigned` Issuer, a long-lived CA `Certificate`, a CA Issuer, and a serving `Certificate` for `provider-gateway`'s Service names. `provider-gateway` mounts the serving certificate's `Secret`, reloads it when cert-manager renews it, and takes the trust bundle from its `ca.crt`.
+  - **Without cert-manager** (a chart value): `provider-gateway` generates a CA once into a `Secret` in its namespace, in the same layout, without expiry, and issues serving certificates from it in memory.
+  - **Changing the CA** is a rare, deliberate operation, not a rotation the SDK performs. The overlap, the old and the new CA trusted side by side, is the ecosystem's job (e.g. trust-manager); `provider-gateway` rewrites the kubeconfig `Secret`s whenever the trust bundle changes.
 - **Bookkeeping** of request outcomes for the Provider Workspace and per virtual-workspace host, in memory, which feeds status and `Ready`. `provider-gateway` terminates the tunnel's TLS, so it can read the status line of each HTTP/1.1 response as it passes, without changing or buffering anything; the Connector's `502` and `504` mean kcp wasn't reached.
 
 ### Status
@@ -249,7 +251,7 @@ Prometheus collectors on `provider-gateway`'s metrics endpoint, with a `ServiceM
 - pushed Pinned Bundles refused, by reason;
 - Sessions by state, and Sessions closed, by reason (go-away, Edge cut, bundle re-check, Connection removed);
 - handshakes refused before or during the upgrade, by reason (unknown ID, limits for known IDs, the limit for unknown IDs, timeout);
-- operator tunnels open, and refused, by reason (credential, unknown host, no Session, tunnel limit);
+- operator tunnels open, and refused, by reason (credential, unknown host, no Session);
 - Connections;
 - `providersdk_server_key_connections{key, listed}`: how many `Connection`s list each `ServerKey`, from `provider-gateway`'s cache. A documented alert rule fires when a key with `retireAt` set is still missing from Connections seen in the last day, within a day of `retireAt`.
 
@@ -300,8 +302,8 @@ An opt-in mode for more than one active `provider-gateway` replica is a [follow-
 
 Documented for Provider authors ([08 Quickstart, "Documentation for Provider authors"](./xxx-notes-011-v5-impl-08-provider-quickstart.md)):
 - **Install `provider-gateway`** from PM's chart, and route the Base URL's connection paths to it.
-- **The operator uses the kubeconfig `Secret`s**: one per Connection, loaded with standard client-go (`clientcmd`), with kcp-multicluster-provider's APIExport provider per Connection, cluster names prefixed by the `connectionID` from the `Secret`'s label. Any language whose Kubernetes client supports `proxy-url` and `tls-server-name` works.
-- **Connection pooling.** client-go can't share transports between configs that use a proxy: it caches transports by TLS settings, and a proxy is a function it can't compare. So every client built from these kubeconfigs gets its own connection pool, and every new connection is a tunnel and a Stream. kcp-multicluster-provider builds clients per engaged consumer cluster, so after an operator restart or relist, a reconcile burst across many consumer clusters opens many tunnels at once. `provider-gateway`'s per-Connection tunnel limit then answers `503`, and client-go retries: correct, but slower. An operator with many consumer clusters can avoid it with one shared transport per Connection, built from the kubeconfig and set as `rest.Config.Transport` (a few lines, shown in the quickstart's README); it's an optimisation, not a requirement. The details are in the [Connection gateway notes](./xxx-notes-011-v5-connection-gateway.md).
+- **The operator uses the kubeconfig `Secret`s**: one per Connection, in the SDK's namespace, read through a Role the Provider adds there, loaded with standard client-go (`clientcmd`), with kcp-multicluster-provider's APIExport provider per Connection, cluster names prefixed by the `connectionID` from the `Secret`'s label. Any language whose Kubernetes client supports `proxy-url` and `tls-server-name` works.
+- **Connection pooling.** client-go can't share transports between configs that use a proxy: it caches transports by TLS settings, and a proxy is a function it can't compare. So every client built from these kubeconfigs gets its own connection pool, and every new connection is a tunnel and a Stream. kcp-multicluster-provider builds clients per engaged consumer cluster, so after an operator restart or relist, a reconcile burst across many consumer clusters opens many tunnels at once, each counting against the Connector's per-Connection Stream limit. An operator with many consumer clusters can avoid it with one shared transport per Connection, built from the kubeconfig and set as `rest.Config.Transport` (a few lines, shown in the quickstart's README); it's an optimisation, not a requirement. The details are in the [Connection gateway notes](./xxx-notes-011-v5-connection-gateway.md).
 - **Service endpoint slices live in the Provider Workspace**, for exports in that workspace. Connectors open Sessions on a shard only if such a slice lists it ([05 Connector, "Which Sessions"](./xxx-notes-011-v5-impl-05-connector.md)).
 - **Only the Provider Workspace and the APIExport virtual workspace are reachable**, with logical cluster names, never workspace paths; other kcp virtual workspaces aren't available to Remote Providers ([05 Connector, "Authorization and policy"](./xxx-notes-011-v5-impl-05-connector.md)).
 - **RBAC in the Provider Workspace is restricted**: role bindings may name only ServiceAccounts in the workspace and kcp's `apis.kcp.io:binding:` subjects, and `Secret`s of type `kubernetes.io/service-account-token` are refused. To let consumers bind its APIExports, a Provider binds the ClusterRole `providers.platform-mesh.io:apiexport-bind` to them ([02 APIs, "Policies in Provider Workspaces"](./xxx-notes-011-v5-impl-02-apis.md)).
@@ -329,7 +331,7 @@ In the Go module:
 4. Connection API: routing under `/v1/connections/`; Registration (token checks before the upgrade, Inner TLS with the token's key, idempotency); orphan expiry.
 5. Control Sessions (handshake limits including unknown IDs, Inner TLS server with the requested key, binding to the path's ID, "unknown" inside the Inner TLS after an uncached read, bearer check, compare-and-swap on the bundle).
 6. Session server (handshake limits, inner mutual TLS, Hello with `connectionID` and `clusterName`, yamux, registry, re-checking Sessions on a bundle change).
-7. Operator proxy: `CONNECT`, proxy credentials, Session choice, Streams, TLS with the serving certificate, tunnel limits; kubeconfig `Secret`s; `provider-gateway`'s CA and its rotation.
+7. Operator proxy: `CONNECT`, proxy credentials, Session choice, Streams, TLS with the serving certificate, kubeconfig `Secret`s; the serving certificate from cert-manager or a self-generated CA.
 8. `provider-gateway`'s controllers: `Connection` (finalizer, `Ready`, `lastSeen`, orphan expiry, kubeconfig `Secret`, Events), `OnboardingToken` (garbage collection), `ServerKey` (generation, checks); the `ProviderEndpoint` watch (`connectionID` check, `pendingSecretHash`, `serverKeys`); status.
 9. Framing enforcement.
 10. The image and the chart: leader election, readiness per port, Services for the Base URL and the operator proxy, RBAC, `ServiceMonitor`.
@@ -351,7 +353,7 @@ In the Go module:
 - **Delivery**: `provider-gateway`, an image and chart from PM, installed by the Provider next to its unchanged operator; the Go module holds the token helper and test support.
 - **Operator integration**: one kubeconfig `Secret` per Connection, with `proxy-url` (a credential per Connection) and `tls-server-name`; standard client-go, multicluster-runtime and kcp-multicluster-provider; a shared transport per Connection is an optional optimisation.
 - **One active `provider-gateway` replica** (leader election, standbys answer `503` with `Retry-After: 5` and aren't ready for the operator proxy); horizontal scale is a follow-up needing no PM-side work. The operator scales independently.
-- **Kubernetes-API-first**: the SDK's state is `Connection`, `OnboardingToken` and `ServerKey` in `provider-sdk.platform-mesh.io/v1alpha1`, the only source of truth; deleting a `Connection` is the delete; the only `Secret`s hold private keys, `provider-gateway`'s CA and the kubeconfigs.
+- **Kubernetes-API-first**: the SDK's state is `Connection`, `OnboardingToken` and `ServerKey` in `provider-sdk.platform-mesh.io/v1alpha1`, the only source of truth; deleting a `Connection` is the delete; the only `Secret`s hold private keys, the serving certificate or self-generated CA, and the kubeconfigs.
 - **Events, not hooks**: Providers watch `Connection`s and their Events. Operational signals are metrics, without `connectionID` labels. Failed authentications change nothing and aren't Events.
 - **Onboarding Tokens name their Server Key**; Registration runs inside Inner TLS with it.
 - **Server Keys**: generated by `provider-gateway` into `Secret`s, ECDSA P-256; KMS or HSM keys later, without breaking changes; rotated only on demand, with `kubectl` and `retireAt`.

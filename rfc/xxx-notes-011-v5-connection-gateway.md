@@ -2,7 +2,7 @@
 
 Working notes for [011](./011-provider-onboarding-flow-improvements.md), next to the [v5 notes](./xxx-notes-011-provider-onboarding-flow-improvements-v5.md) and the [implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Not the RFC itself. The question: can the SDK's server run as a separate Deployment, delivered by PM as a chart, so that the Provider's operator needs only the smallest changes and stays as close as possible to standard client-go and multicluster-runtime?
 
-**Decision**: variant A without the provider package. The SDK is delivered as `provider-gateway`, and the operator uses standard client-go, multicluster-runtime and kcp-multicluster-provider with a kubeconfig per Connection (`proxy-url` with a credential per Connection, `tls-server-name` with `provider-gateway`'s one certificate). Its known cost, a connection pool per client, is bounded by a tunnel limit per Connection in `provider-gateway`; a shared transport per Connection is documented as an optional optimisation. The plan describes it in [07 SDK](./xxx-notes-011-v5-impl-07-provider-sdk.md). The rest of these notes is the analysis behind it.
+**Decision**: variant A without the provider package. The SDK is delivered as `provider-gateway`, and the operator uses standard client-go, multicluster-runtime and kcp-multicluster-provider with a kubeconfig per Connection (`proxy-url` with a credential per Connection, `tls-server-name` with `provider-gateway`'s one certificate). Its known cost, a connection pool per client, is accepted, within the Connector's per-Connection limits; a shared transport per Connection is documented as an optional optimisation. The plan describes it in [07 SDK](./xxx-notes-011-v5-impl-07-provider-sdk.md). The rest of these notes is the analysis behind it.
 
 **Short answer**: yes. A **Connection gateway** takes over everything the SDK's Connection API server does, and the operator reaches kcp through it. Two variants were considered: the gateway as a forward proxy (`proxy-url` in kubeconfigs), or as a reverse proxy addressed by path. The reverse proxy keeps client-go's transport sharing and needs only a URL-mapping function in a public option of kcp-multicluster-provider, which a small multicluster-runtime provider package can hide entirely.
 
@@ -21,7 +21,7 @@ A Deployment in the Provider's cluster, from a chart PM delivers, running a PM-b
 - **Owns everything the SDK's server owns today**: the Connection API under the Base URL (Registration, Control Sessions, Sessions with Inner TLS, the Hello and yamux), Server Keys, the `Connection`, `OnboardingToken` and `ServerKey` resources and their controllers, health, metrics and Events. The protocol ([01 Protocol](./xxx-notes-011-v5-impl-01-protocol.md)) doesn't change; only where it runs does.
 - **Holds Sessions in memory**, in its active replica. PM's Connectors dial the Base URL as today and end at the gateway.
 - **Serves the operator in the cluster**: an in-cluster endpoint through which the operator's requests reach kcp over the Connection's Sessions (the two variants below differ here).
-- **Writes one kubeconfig `Secret` per Connection** into the operator's namespace, labelled with the `connectionID`. It represents the Connection, not its Sessions: created with the `Connection` at Registration, deleted with it, unchanged while Sessions come and go. Whether Sessions are up is the `Connection`'s `Ready`.
+- **Writes one kubeconfig `Secret` per Connection** into its own namespace, which the operator reads through a Role the Provider adds, labelled with the `connectionID`. It represents the Connection, not its Sessions: created with the `Connection` at Registration, deleted with it, unchanged while Sessions come and go. Whether Sessions are up is the `Connection`'s `Ready`.
 - **Stays inside the Provider's trust boundary**, like the SDK today; it sees the operator's traffic in the clear.
 
 ```
@@ -43,15 +43,16 @@ A Deployment in the Provider's cluster, from a chart PM delivers, running a PM-b
 
 - **A restart or failover of the active replica loses its Sessions**, as an SDK restart does today: PM's Connectors reconnect, get `503` with `Retry-After` from standbys, and land on the new leader within roughly 10–20 seconds. Standbys fail readiness on the in-cluster endpoint, so the operator's Service reaches only the leader.
 - **The operator's open requests and watches break** and client-go reconnects; informers resume their watches, or relist if kcp no longer has the resource version. The operator itself keeps running with warm caches, which is better than today, where it shares the SDK's process.
-- **The kubeconfig `Secret`s stay valid**: they name the gateway's Service, not a pod, and hold only persisted data. Every piece of state that must survive a restart lives in resources, never only in memory: the gateway's CA key, the Connections' credentials (their hashes, e.g. in the `Connection`'s status), and what the SDK keeps today. That's 07's existing principle ("The Kubernetes API is the only source of truth").
-- **The `Secret`s change only** when a `Connection` is created or deleted, when the gateway's CA rotates (the new CA added next to the old one, the old one removed after its certificates expire), and when a Connection's credential is rotated.
+- **The kubeconfig `Secret`s stay valid**: they name the gateway's Service, not a pod, and hold only persisted data. Every piece of state that must survive a restart lives in resources, never only in memory: the self-generated CA's key (without cert-manager), the Connections' credentials (their hashes, e.g. in the `Connection`'s status), and what the SDK keeps today. That's 07's existing principle ("The Kubernetes API is the only source of truth").
+- **The `Secret`s change only** when a `Connection` is created or deleted, when a Connection's credential is rotated, and when the CA's trust bundle changes, which is rare and deliberate.
 
 ### Certificates
 
-No cert-manager dependency; the Provider-side keeps none (v5, "Provider-side prerequisites"):
-- **The gateway's own CA**: a key pair generated at first start and kept in a `Secret` in the gateway's namespace that only the gateway reads, like Server Keys without `signerRef`. Its certificate goes into every kubeconfig `Secret`.
+The standard setup for in-cluster services: a long-lived CA that clients trust and that practically never changes, issuing short-lived serving certificates that renew on their own:
+- **With cert-manager**, the chart's default: a `SelfSigned` Issuer, a long-lived CA `Certificate`, a CA Issuer and a serving `Certificate` for the gateway's Service names. The gateway mounts the serving certificate and reloads it on renewal; its `ca.crt` goes into every kubeconfig `Secret`.
+- **Without cert-manager**, a chart value: the gateway generates a CA once, without expiry, into a `Secret` in its namespace, and issues serving certificates from it in memory.
+- **Changing the CA** is rare and deliberate; the overlap is the ecosystem's job (e.g. trust-manager), not something the gateway reimplements.
 - **One CA per gateway, not per Connection.** Per-Connection CAs would add little: every key would sit in the same process anyway, the kcp hostnames are the same for every Connection of a PM Instance, and each Connection's credential already binds requests to it.
-- **Optionally**, a Provider that runs cert-manager anyway can point the gateway at a CA `Secret` it manages.
 
 ## Variant A: forward proxy (`proxy-url`)
 
@@ -63,7 +64,7 @@ apiVersion: v1
 kind: Secret
 metadata:
   name: connection-c-7f3k9q2mx8w4
-  namespace: wild-west-system                  # the operator's namespace
+  namespace: wild-west-system                  # the gateway's namespace
   labels: { provider-sdk.platform-mesh.io/connection: c-7f3k9q2mx8w4 }
 stringData:
   kubeconfig: |
@@ -323,7 +324,7 @@ The same watch on shard `nereus`, for Connection `c-7f…`, in both variants:
 The analysis favoured variant B with the provider package: kubeconfigs, client-go's standard caching and multicluster-runtime's standard extension point, with no transport code in the operator. With the package, variant A is viable too and keeps kcp's real URLs in the operator; with `tls-server-name`, its gateway needs only one certificate too. What separates them is the shared transport in the package and `CONNECT` handling (variant A) against the URL mapping in the package and HTTP reverse-proxying (variant B, standard caching even without the package), and that operators without the package only need the URL mapping in variant B.
 
 **Chosen: variant A without the package**, for the most familiar experience for operator authors: their code is exactly what they'd write against kcp directly, with only a different kubeconfig. Accepted with it:
-- **a connection pool per client**: reconcile bursts across many consumer clusters open many tunnels; `provider-gateway` caps them per Connection below the Connector's Stream limit and answers `503` beyond it, which client-go retries;
+- **a connection pool per client**: reconcile bursts across many consumer clusters open many tunnels; each a Stream within the Connector's per-Connection limits;
 - **a shared transport per Connection as an optional optimisation**, documented with a few lines in the quickstart's README, for operators with many consumer clusters;
 - **a secret credential per Connection** in the proxy URL, since client-go sends credentials to a proxy only from the URL;
 - **errors before the tunnel** (unknown Connection, bad credential, no Session) reaching client-go as transport errors, retried with its normal backoff, not as API errors.

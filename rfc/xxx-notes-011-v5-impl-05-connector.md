@@ -143,7 +143,7 @@ The `/clusters/<cluster>` part is stripped by a copy of kcp's `ClusterPathFromAn
 
 For the request's Connection:
 - **Scope**: only its own Connection's paths, i.e. its Provider Workspace through the front-proxy (`/clusters/<its clusterName>/…`), and the APIExport virtual-workspace endpoints of exports in that workspace.
-- **Denylist** (v5, "Connector policy"):
+- **Denylist** (v5, "Connector policy: what an admin Provider can't do"):
   - `update`, `patch`, `delete` on the Connection Export's APIBinding;
   - writes to `apiexportendpointslices/status`;
   - `create` on `serviceaccounts/token`;

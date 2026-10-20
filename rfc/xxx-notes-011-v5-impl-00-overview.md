@@ -14,7 +14,7 @@ Start here, then follow the walkthrough below, or jump to a component.
 | [03 platform-mesh-operator](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md) | Reconciling local and remote `Provider`s and `ProviderOnboardingRequest`s; Registration, `ProviderEndpoint`s, health, Secret Changes, the Connector CA Set, deletion |
 | [04 Connector CA](./xxx-notes-011-v5-impl-04-connector-ca.md) | The Connector CA managed by cert-manager, Connector Certificates, the Connector CA Set that Providers pin, and the automatic Rollover |
 | [05 Connector](./xxx-notes-011-v5-impl-05-connector.md) | The per-shard Connector, a standalone proxy; Sessions, proxying, policy |
-| [07 SDK](./xxx-notes-011-v5-impl-07-provider-sdk.md) | The Provider-side library: Connection API, its resources (`Connection`, `OnboardingToken`, `ServerKey`), Session server, transport, lifecycle |
+| [07 SDK](./xxx-notes-011-v5-impl-07-provider-sdk.md) | The Provider-side, delivered as `provider-gateway` (image and chart): Connection API, its resources (`Connection`, `OnboardingToken`, `ServerKey`), Session server, the operator proxy with a kubeconfig `Secret` per Connection, lifecycle; the Go module with the token helper and test support |
 | [08 Provider quickstart](./xxx-notes-011-v5-impl-08-provider-quickstart.md) | The reference Provider in pm-provider-quickstart |
 | [09 Deployment](./xxx-notes-011-v5-impl-09-deployment.md) | Charts, kcp bootstrap manifests, kcp-operator and cert-manager resources, network, rollout |
 | [10 Testing](./xxx-notes-011-v5-impl-10-testing.md) | Unit tests per component, multi-shard kind e2e, security tests; load tests as a follow-up |
@@ -28,7 +28,7 @@ Start here, then follow the walkthrough below, or jump to a component.
 | Delivery | **Single delivery**: each document describes its full scope; "Build order" below orders the work. |
 | `platform-mesh-operator` | **`platform-mesh-operator`** owns each `Provider`, local or remote, end to end. It moves with the `Provider` part when that becomes its own operator; until then, internet-facing code in PM's most privileged component is an accepted interim risk ([03](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)). |
 | `providerconnections-connector` | A new service: **`services/providerconnections-connector`**, a **standalone proxy server modelled on kcp's front-proxy**, one per shard, deployed as a plain Deployment with its identity from a kcp-operator `Kubeconfig`. |
-| the SDK | **`platform-mesh/provider-sdk`**, module `go.platform-mesh.io/provider-sdk`, its own semver line released through `cmd/release` ([07](./xxx-notes-011-v5-impl-07-provider-sdk.md)). |
+| the SDK | **`platform-mesh/provider-sdk`**: `provider-gateway` (image and chart) built from the module `go.platform-mesh.io/provider-sdk`, both on one semver line released through `cmd/release` ([07](./xxx-notes-011-v5-impl-07-provider-sdk.md)). |
 | Connection object type | **`providers.platform-mesh.io/ProviderEndpoint`**, served only by the Connection Export. `ProviderConnection` is removed. |
 | Connection Export home | **`:root:providers:system`**. |
 | Multiplexer | **yamux** over the WebSocket. |
@@ -97,7 +97,7 @@ Each step names the document and section that owns it; read them in this order t
 2. **The Owner creates a remote `Provider` and a `ProviderOnboardingRequest`** referencing it and the token `Secret`, in either order: [02 APIs, "ProviderOnboardingRequest"](./xxx-notes-011-v5-impl-02-apis.md).
 3. **`platform-mesh-operator` reconciles the request under its `Provider`**, reporting `ProviderNotFound` until it exists: [03 Operator, "Reconciling Providers" and "Onboarding requests"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md).
 4. **`platform-mesh-operator` bootstraps the Provider Workspace** (workspace, SA, Connection Export binding, the policies, confirmed in force, then Connector RBAC), without a kubeconfig for Remote Providers: [03 Operator, "Reconciling Providers"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md); the policies: [02 APIs, "Policies in Provider Workspaces"](./xxx-notes-011-v5-impl-02-apis.md).
-5. **The request registers the Connection** with the Provider-side, inside Inner TLS pinned to the token's Server Key: generates the Connection Secret, sends its hash and the Connector CA certificates, receives the `connectionID`, Server Keys and `unusedExpiresAt`, and is done (`Registered`): [03 Operator, "Registration"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md); the Provider's side: [07 SDK, "Connection API"](./xxx-notes-011-v5-impl-07-provider-sdk.md); the CA certificates it sends: [04 Connector CA, "ConnectorCASet"](./xxx-notes-011-v5-impl-04-connector-ca.md).
+5. **The request registers the Connection** with the Provider-side, inside Inner TLS pinned to the token's Server Key: generates the Connection Secret, sends its hash and the Connector CA certificates, receives the `connectionID`, Server Keys and `unusedExpiresAt`, and is done (`Registered`): [03 Operator, "Registration"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md); the Provider's side: [07 SDK, "Connection API"](./xxx-notes-011-v5-impl-07-provider-sdk.md); the CA certificates it sends: [04 Connector CA, "The Connector CA Set"](./xxx-notes-011-v5-impl-04-connector-ca.md).
 6. **`platform-mesh-operator` makes a first Control Call**, pushing the current Connector CA Set if it changed, **and writes the `ProviderEndpoint`** into the Provider Workspace through the Connection Export: [03 Operator, "First Control Call and ProviderEndpoint" and "Writing ProviderEndpoints"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md); type and policy: [02 APIs, "ProviderEndpoint" and "Connection Export"](./xxx-notes-011-v5-impl-02-apis.md).
 7. **Connectors discover the `ProviderEndpoint` and open Sessions** where needed: [05 Connector, "Discovery" and "Which Sessions"](./xxx-notes-011-v5-impl-05-connector.md); the Session handshake: [01 Protocol, "Sessions"](./xxx-notes-011-v5-impl-01-protocol.md); the Provider's side: [07 SDK, "Session server"](./xxx-notes-011-v5-impl-07-provider-sdk.md).
 8. **The Provider's controllers reconcile through the Sessions**, with one kubeconfig per Connection through `provider-gateway`'s operator proxy: [07 SDK, "Kubeconfig per Connection" and "Operator proxy"](./xxx-notes-011-v5-impl-07-provider-sdk.md); the proxy on PM's side in [05 Connector, "Request pipeline"](./xxx-notes-011-v5-impl-05-connector.md); the reference wiring in [08 Quickstart](./xxx-notes-011-v5-impl-08-provider-quickstart.md).
@@ -125,6 +125,31 @@ Every component follows these; the component documents refer back here instead o
 11. **Signals go to the audience that can act on them.** Owners get conditions and events on their own objects; the PM Administrators get metrics, the `ConnectorCASet` status and documented alert rules; Providers get SDK notifications. PM has no alerting pipeline today, so the plan ships signals and documented rules, not alerts.
 12. **Secrets never appear in logs, events, metrics, conditions or audit bodies.** Prefixed formats (`pm1.`, `pmc1_`) make leaks detectable by scanners.
 
+## The Provider's Edge
+
+Whatever terminates the Base URL's TLS (an ingress, load balancer, CDN or WAF) is the Provider's **Edge**. The Provider may well trust it for its own traffic, as it does for its portal and its service, and v5 doesn't ask it to change that. Connections are end to end between PM's components and the Provider's runtime (the Inner TLS), so they don't need the Edge to be trustworthy: it carries them without being part of them, and its only job is to pass the three paths through as WebSockets. Providers aren't required to pass TLS through instead. The full reasoning is in v5, "The Provider's Edge: Inner TLS on Sessions"; the alternatives are sketched in the [Outer-TLS-only notes](./xxx-notes-011-v5-outer-tls-only.md) and the [transport notes](./xxx-notes-011-v5-transport-alternatives.md).
+
+### Why the Connection doesn't rely on the Edge
+
+- **PM and consumers rely on the Connection, and they can't judge the Edge.** The Provider chose its Edge and can assess it; PM, and the consumers whose objects cross a Session, can't see it. A guarantee PM gives can't rest on infrastructure only the Provider can check, nor on an assumption placed on every Provider that some couldn't meet and nobody could verify from outside.
+- **The Edge's role stays what it is today.** Under RFC 006 the Provider dials kcp outbound, so its inbound Edge carries web traffic, never the Provider's control plane. Reverse tunnels would put the control plane there for the first time; the end-to-end Connection keeps it off.
+- **What would cross it is unusual for an Edge.** Whoever holds the Provider's end of a Session in the clear acts as the Provider in kcp: admin in the Provider Workspace, and reads and writes on every consumer's bound and claimed resources, including whatever the export claims, such as consumers' `Secret`s. It could fake kcp's view, so the Provider's controllers change or delete real resources, and it would see the Connection Secret on every Control Call. It would also see the plain credentials the Provider's controllers write back (access keys, database passwords), for every consumer at once, even when the service's own traffic never passes that Edge; data-plane protocols keep their long-term secrets from TLS-terminating middleboxes anyway (S3's request signatures, Postgres' SCRAM, short-lived tokens).
+- **It costs the Provider nothing.** The protection is in `provider-gateway`, which PM ships; the Edge only has to let WebSockets through (the quickstart's checklist). A Provider whose Edge is entirely trustworthy loses nothing.
+- **It also covers Edges that aren't entirely the Provider's own**, which are common:
+  - a third-party CDN or WAF, or a platform team's shared ingress, whose controllers often hold cluster-wide `Secret` access and have had remote-code-execution bugs (ingress-nginx's "IngressNightmare", 2025);
+  - Edges that keep data without anyone being malicious: WAFs inspect bodies, CDNs sample and log requests, people capture traffic while debugging;
+  - compliance: some Providers must keep data encrypted end to end, or out of a third party's jurisdiction.
+- **The limit**: an Edge that is effectively part of the Provider's runtime (an in-cluster ingress controller that can read the cluster's `Secret`s, the Server Key's included) is a compromise of the Provider's runtime, which the Inner TLS doesn't claim to cover.
+
+### Why not require TLS passthrough instead
+
+Passing the Base URL's TLS through to `provider-gateway` (an L4 load balancer, or SNI routing on a dedicated hostname) would also make the Connection end to end, with a single TLS layer. v5 recommends it where it's easy, but doesn't require it:
+- **Many Edges can't do it.** CDNs, WAFs and managed L7 load balancers terminate TLS by design, and passthrough needs a separate L4 product, if there is one; PaaS and serverless platforms expose HTTP(S) only; a platform team's shared ingress often routes HTTP only.
+- **Where it's possible, it costs the Provider**: a security exception where perimeter termination is policy (for WAF, DLP or inspection), a dedicated load balancer, IP and hostname, running public TLS itself (issuance, renewal, hardening), and losing the Edge's protections for that hostname (L7 rate limiting, bot and abuse filtering, IP reputation, L7 DDoS absorption, request logs).
+- **It would still rest on web PKI.** Whoever can obtain a certificate for the Base URL could pose as the Provider-side: a mis-issuing CA, a DNS takeover, or the Provider's own CDN, which often obtains certificates for customer hostnames automatically once DNS points at it. Pinned keys would still be needed.
+- **PM can't verify it**, and a later change that puts the hostname behind the CDN silently undoes it while everything keeps working.
+- **The Inner TLS has none of these costs**: it works through any Edge that passes WebSockets, needs no configuration from Providers (it's in `provider-gateway`), doesn't depend on web PKI because Server Keys are pinned, and holds whatever the Edge is or later becomes.
+
 ## Who writes what
 
 Clear ownership avoids two controllers fighting over the same fields.
@@ -145,7 +170,7 @@ Clear ownership avoids two controllers fighting over the same fields.
 | `ConnectorCASet.spec.distrust` | PM Administrators | `platform-mesh-operator` |
 | SA tokens | Connectors (TokenRequest) | Connectors only |
 | a Connection's Provider-side state | `provider-gateway` | `provider-gateway`, portal |
-| a Connection's kubeconfig `Secret` (the operator's namespace) | `provider-gateway` | the Provider's operator |
+| a Connection's kubeconfig `Secret` (the SDK's namespace) | `provider-gateway` | the Provider's operator |
 
 
 ## Build order
@@ -173,6 +198,8 @@ The plan targets PM's current deployment: `platform-mesh-operator` rendering `pm
 | kcp: maximal permission policy on writes through the APIExport virtual workspace | `platform-mesh-operator` writing `ProviderEndpoint`s | Read from code, not tested (v5 observation 8); see [10 Testing](./xxx-notes-011-v5-impl-10-testing.md) |
 | kcp: `ValidatingAdmissionPolicy`s on RBAC and `Secret`s in a workspace, with `matchConditions` on the user | The policies in Provider Workspaces | To verify; kcp's conformance tests cover policies on custom resources, in a workspace and across an APIBinding ([02](./xxx-notes-011-v5-impl-02-apis.md)) |
 | kcp-operator: `Kubeconfig` client certificates for the front-proxy accepted by shards | Connectors reaching shards' virtual workspaces directly | Read from code; checked by the E2E ([09](./xxx-notes-011-v5-impl-09-deployment.md)) |
+| client-go: `proxy-url` with `CONNECT` and `tls-server-name` | The Provider's operator reaching the Provider Workspace and virtual-workspace URLs through `provider-gateway`, with the TLS inside each tunnel verified against the gateway's name; kcp-multicluster-provider's derived configs keeping the proxy | Read from code; checked by the E2E ([07](./xxx-notes-011-v5-impl-07-provider-sdk.md), [10](./xxx-notes-011-v5-impl-10-testing.md)) |
+| kcp-multicluster-provider: engaged clusters | Connectors finding the Hosting Shard from the engaged cluster's config `Host`, and a workspace moved between shards being engaged anew | Read from code (`NewScopedCluster`); not a documented contract; checked by the E2E; re-engagement on migration is kcp-multicluster-provider's to guarantee ([05](./xxx-notes-011-v5-impl-05-connector.md)) |
 | kcp-operator: `--service-account-lookup=false` | Not needed by v5 for Remote Providers | Unchanged |
 
 ## Open questions across documents
