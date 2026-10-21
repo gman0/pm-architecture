@@ -92,9 +92,9 @@ status:
 ```
 
 - **Issued by the Provider's portal** with the token helper, `NewOnboardingToken(baseURL, owner, ttl)` from the Go module, which picks the newest `ServerKey` that is `Ready` and has no `retireAt`, and returns the token string `pm1.<base URL>.<keyfp>.<id>.<secret>`, shown once, and the object, which the portal creates. `keyfp` is that key's `key-sha256` ([01 Protocol, "Onboarding Token"](./xxx-notes-011-v5-impl-01-protocol.md)). The plaintext token is never stored. A portal in another language reproduces the helper from the protocol specification: it's a random secret, its hash, and the token format.
-- **Usable only while its `ServerKey` is**: present, `Ready`, and without `retireAt`. Setting `retireAt` on a key refuses the unspent tokens issued over it; their Owners ask the portal for new ones.
-- **Spent** when `status.registration` is set, by compare-and-swap, so a token can't be spent twice. Registration retries that match get the same answer, for 7 days by default (see "Connection API").
-- **Garbage-collected by `provider-gateway`**: unspent tokens at `expiresAt`, spent ones once the retry window has passed since `registration.at`.
+- **Usable for new Registrations only while its `ServerKey` is**: present, `Ready`, and without `retireAt`. Setting `retireAt` on a key refuses the unspent tokens issued over it; their Owners ask the portal for new ones. A retry of the Registration that already spent the token only needs the key present and `Ready`.
+- **Spent** when `status.registration` is set, by compare-and-swap, so a token can't be spent twice. Registration retries that match get the same answer until the end of the **retry window**, `expiresAt` plus 7 days by default (see "Connection API").
+- **Garbage-collected by `provider-gateway`**: unspent tokens at `expiresAt`, spent ones at the end of the retry window.
 
 ### ServerKey
 
@@ -179,7 +179,7 @@ stringData:
 Serves the three endpoints under the Base URL. It **routes by the path below `/v1/connections/`** and isn't bound to one host or path prefix, so a Provider can move its Base URL, or serve it under several names during a move, without changes.
 
 **Registration** (`/v1/connections/register/{tokenID}`):
-1. **Before the upgrade**, look up the `OnboardingToken`: it must exist, be unexpired and unspent, and its `ServerKey` must be present, `Ready` and without `retireAt`. Otherwise refuse with a stable status, which PM reports as `TokenRefused`. The handshake limits apply.
+1. **Before the upgrade**, look up the `OnboardingToken`. It must exist; if unspent, be unexpired, with its `ServerKey` present, `Ready` and without `retireAt`; if spent, be within its retry window, with its `ServerKey` present and `Ready` (whether it's really a retry is checked in step 4). Otherwise refuse with a stable status, which PM reports as `TokenRefused`. The handshake limits apply.
 2. **Accept the WebSocket** and run the Inner TLS server with the token's `ServerKey`, ALPN `pm-register/1`.
 3. **Verify `tokenSecret`** against `tokenHash`, constant-time.
 4. **Apply the idempotency rules**: a retry with the same idempotency key, `secretHash` and `clusterName` gets the stored answer; a different one is refused; a changed Connector CA Set on a retry is ignored ([01 Protocol, "Registration"](./xxx-notes-011-v5-impl-01-protocol.md)).

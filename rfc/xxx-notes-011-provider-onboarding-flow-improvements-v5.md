@@ -371,19 +371,21 @@ TODAY: RFC 006 static kubeconfig (baseline)
 ```
 v5: inner TLS on sessions (the edge is outside the trust boundary)
 
-  PM                                        │ internet │   Provider
-                                            │          │                           ┌──── trust boundary ─────┐
-  kcp ◀── APIExport VW ◀══TLS══ connector ══╪═ outer TLS (WebSocket) ══▶ ingress/CDN ──▶ SDK ──▶ controllers │
-                              adds SA token │          │                outer TLS  │                         │
-                                            │          │                 ends here │                         │
-                                connector ══╪═ inner TLS 1.3 ════════════════════════▶ SDK                   │
-                                            │  client: connector certificate (from a pinned connector CA)    │
-                                            │  server: pinned server key                                     │
-                                            │    ╚═ multiplexer + plain HTTP, inside the inner TLS           │
-                                            │          │                           └─────────────────────────┘
+  PM                                           │ internet │   Provider
+                                               │          │                   ┌────────────── trust boundary ──────────────┐
+  kcp ◀══TLS══ connector ══════════════════════╪══════════╪═▶ ingress/CDN ──▶ provider-gateway ◀══ CONNECT ══ operator     │
+              adds SA token    outer TLS,      │          │   outer TLS       │                    tunnel, TLS to the      │
+                               WebSocket       │          │   ends here       │                    gateway's certificate   │
+              connector ════ inner TLS 1.3 ════╪══════════╪═════════════════════▶ provider-gateway                         │
+                                               │ client: connector certificate (from a pinned connector CA)                │
+                                               │ server: pinned server key                                                 │
+                                               │   ╚═ yamux streams, plain HTTP on each, inside the inner TLS              │
+                                               │          │                   └────────────────────────────────────────────┘
+
+  connector: routes each request by path to the front-proxy or its shard's VW, checks it, adds the SA token
 
   ingress/CDN sees:               opaque bytes
-  acts as the Provider in kcp:    the runtime only
+  acts as the Provider in kcp:    the Provider's runtime only (provider-gateway, and the operator through it)
   can fake kcp to the Provider:   nobody without a connector certificate (PM's side)
   sees the connection secret:     nobody (control calls run inside the inner TLS too)
 ```
@@ -875,7 +877,7 @@ spec:
 | Ingress drops a Session | The Connector reconnects. Pings keep idle timeouts from triggering, and the Connector replaces Sessions before the Edge's maximum connection age. On an abrupt cut, in-flight requests and watches on that Session fail and client-go retries and relists, as after any apiserver disconnect. |
 | PM rotates kcp's CA | Nothing to coordinate. Connectors use PM's own trust. |
 | Registration response lost, or `platform-mesh-operator` crashed before persisting it | Retry with the same token, idempotency key, `secretHash` and `clusterName`: same `connectionID`, Server Keys and `unusedExpiresAt`, for 7 days. A different hash is refused; a changed Connector CA Set is ignored, and the first Control Call pushes the current one. The result is persisted in one write; every later Onboarding step resumes from it. A Registration whose result is never stored leaves an orphan on the Provider-side, which expires because it never sees an authenticated Control Call or Session. |
-| Token refused (expired, spent, or its Server Key retired since it was issued) | Refused before the Registration upgrade; the request fails with `TokenRefused`, and the Owner asks the Provider's portal for a new token. |
+| Token refused (expired, spent by another Registration, or its Server Key retired since it was issued) | Refused before the Registration upgrade, or inside the Inner TLS for a token another Registration spent; the request fails with `TokenRefused`, and the Owner asks the Provider's portal for a new token. |
 | First contact blocked past `unusedExpiresAt` (control path blocked, `platform-mesh-operator` down) | The `Provider`'s message shows the deadline beforehand. After it, the Provider-side removes the never-used Connection, the next Control Call gets "unknown", and the Owner onboards again; nothing is lost, since the Connection never had a Session. |
 | First Control Call rejects the Connection Secret (the Provider-side lost or garbled its hash) | The control path works, so the `ProviderEndpoint` is written anyway, with a new `pendingSecretHash`, and the Connection Secret is repaired at once, outside the repair rate limit. |
 | kcp unreachable from a Connector | The Provider-side reports `kcpReachable=false` for that host; the `Provider` shows `Connected=False` with the `KcpUnreachable` label and the last error, without a timeout, and becomes `Ready` once the problem is fixed. |
@@ -964,6 +966,7 @@ Facts about kcp, kcp-operator and client-go the design relies on (2026-10-08 to 
 - **`/services/admin` for the Connector's upstreams and shard discovery.** Exposes the whole installation's shard layout to a component that only needs its own shard's host, which its deployment already knows.
 - **Discovery from Owners' `Provider` objects** (consuming the Providers Export, or a `ClusterCachedResource` per Owner's workspace). Owners can edit those objects, including the URL that Connectors would dial.
 - **`ProviderEndpoint`s in a PM-internal workspace**. Puts all `ProviderEndpoint`s on one shard, away from what they describe, needs a `clusterName` field and a separate lookup to find the Hosting Shard. The Connection Export carries both inherently.
+- **No `ProviderEndpoint`: Connectors read the `ProviderEndpointRegistration`s**, with the Connection Export reduced to its permission claim (engagement through the APIBinding still gives the Hosting Shard), `pendingSecretHash` in the Hello and the expected Server Key on the upgrade. It removes a kind, `platform-mesh-operator`'s writes through the virtual workspace and the export's maximal permission policy, and the trust argument doesn't change. But it makes PM's runtime cluster a hard dependency of the traffic path: a Connector that restarts while that cluster is unreachable opens no Sessions, and once Connectors run in each shard's own cluster (platform-mesh-deployer's per-shard placement), the runtime cluster may be far from them. `ProviderEndpoint`s keep everything a Connector needs in kcp, next to its shard. It would also lose the automatic rebuild of a lost `ProviderEndpointRegistration`, and make every Secret Change replace Sessions.
 - **`ProviderEndpoint`s replicated through the cache** (a `ClusterCachedResource` with a shared identity, observation 6). Needs a `ClusterCachedResource` and a shared identity key per Provider Workspace, and cache-server access for Connectors, which in kcp-operator deployments means credentials far broader than they need (observation 7).
 - **Annotations on the Provider Workspace's `Workspace` object in `:root:providers`.** No new API, but untyped, all on one shard, and finding the Hosting Shard needs a separate lookup.
 - **Immutable, long-lived CA generations with a manual Rollover.** Providers would pin a generation that never changes for 10 years, and people would roll over to the next one in gated steps: a CRD with lifecycle states, conditions to wait for, an override for Connections whose control path is broken, a runbook and alerts. It avoids ever pushing a new CA automatically, but the push to every Provider is needed for a Rollover anyway, and a 10-year key is exposed for 10 years.

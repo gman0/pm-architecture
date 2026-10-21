@@ -22,7 +22,7 @@ All paths are relative to the Provider's **Base URL** from the Onboarding Token.
 Every connection to the Base URL has an outer TLS, verified strictly with web PKI, or with the `Provider`'s `spec.remote.caBundle` when set; Connectors get it from the `ProviderEndpoint`. The outer TLS isn't the trust anchor: it's terminated by the Provider's Edge, and what protects Registration, Control Calls and Sessions is the Inner TLS. But it has to succeed for anything to connect. **The Inner TLS checks no hostnames, on either side**: Server Keys, the Connector CA and Connector Certificates are independent of any URL, so neither a PM-side rename nor a change of a Provider's Base URL touches them.
 
 The three WebSocket endpoints accept the upgrade before the caller is authenticated; authentication happens in the Inner TLS (Sessions) or on each request inside it (Registration, Control Sessions). Before the upgrade, the Provider-side refuses:
-- **on `register`**: an unknown, expired or spent token, or one whose Server Key is missing, not Ready or has `retireAt` set (see "Registration");
+- **on `register`**: an unknown token; an unspent one that's expired or whose Server Key is missing, not Ready or has `retireAt` set; a spent one whose retry window is over (see "Registration");
 - **on `session`**: unknown or deleted Connection IDs;
 - **on all three**: callers beyond the handshake limits, with `503` and `Retry-After`.
 
@@ -36,7 +36,7 @@ The three WebSocket endpoints accept the upgrade before the caller is authentica
 - **Bound to one Server Key**, chosen when the token is issued. Tokens are issued and used only over Server Keys without `retireAt`, so a Server Key rotation refuses tokens issued before it: the Owner asks the Provider's portal for a new one.
 - **Single-use and short-lived**; the Provider-side stores only a hash of `tokenSecret`.
 - **Bound to the issuing Owner account** on the Provider-side, which owns the Connection it registers (portal listing, billing).
-- **Spent on first successful Registration**, but a retry with the same idempotency key and Connection Secret hash within a window (7 days by default) returns the same result (see "Registration").
+- **Spent on first successful Registration**, but a retry of that Registration (same idempotency key, Connection Secret hash and `clusterName`) returns the same result until the end of the **retry window**: the token's expiry plus 7 days by default (see "Registration").
 - **Its delivery path must be trusted.** The token reaches `platform-mesh-operator` through the Provider's portal and the Owner. Whoever reads it there before PM uses it can register in the Owner's name; PM's own Registration then fails as spent, and the Owner deletes that Connection in the portal and asks for a new token.
 
 ## Connection Secret
@@ -71,7 +71,11 @@ A WebSocket upgrade on `/v1/connections/register/{tokenID}`, then a TLS 1.3 hand
 - **ALPN**: `pm-register/1`.
 - **Inside**: one HTTP/1.1 request, then the Registration Session closes.
 
-Before the upgrade, the Provider-side checks the token by `tokenID`: it must be known, unexpired and unspent, and its Server Key present, Ready and without `retireAt`. Otherwise the upgrade is refused with a stable status, which `platform-mesh-operator` reports as `TokenRefused`. Since the key is checked before the upgrade, a refused token is never confused with a handshake failure.
+Before the upgrade, the Provider-side checks the token by `tokenID`. It must be known, and:
+- **unspent**: unexpired, with its Server Key present, Ready and without `retireAt`;
+- **spent**: within its retry window, with its Server Key present and Ready. `retireAt` doesn't matter here: retiring a key stops new Registrations, not the retry of one that already succeeded.
+
+Otherwise the upgrade is refused with a stable status, which `platform-mesh-operator` reports as `TokenRefused`. Since the key is checked before the upgrade, a refused token is never confused with a handshake failure. Whether a spent token's request is a retry of the Registration that spent it can only be decided inside the Inner TLS, where the idempotency key, hash and `clusterName` arrive (see "Idempotency" below).
 
 Request: idempotency key (the `ProviderOnboardingRequest` UID), `clusterName` (the logical cluster name of the Provider Workspace, as kcp assigns it), the Connection Secret's hash, and the Connector CA Set, which becomes the Connection's Pinned Bundle (see "Pinned Bundle"). Its version is the path's (`/v1`).
 
@@ -79,7 +83,7 @@ Response: `connectionID`, the Provider-side's **Server Keys** (public keys, a li
 
 Rules:
 - **Only new Connections.** Registration never changes an existing Connection.
-- **Idempotency**: a retry matches on `tokenID`, idempotency key, `secretHash` and `clusterName`, and gets the same response (`connectionID`, Server Keys and `unusedExpiresAt`); anything else is refused. A changed Connector CA Set on a retry is ignored: the first Control Call pushes the current set anyway ([03 Operator, "First Control Call and ProviderEndpoint"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)). After the token's expiry, a retry is still honoured for a **generous window, 7 days by default**, so an operator that crashed between the call and persisting its result can always recover it.
+- **Idempotency**: a retry matches on `tokenID`, idempotency key, `secretHash` and `clusterName`, and gets the same response (`connectionID`, Server Keys and `unusedExpiresAt`); on a spent token, the same idempotency key with another `secretHash` or `clusterName` is refused as `IdempotencyConflict`, and any other idempotency key (another Registration spent the token) with the stable "spent" status, reported as `TokenRefused`. A changed Connector CA Set on a retry is ignored: the first Control Call pushes the current set anyway ([03 Operator, "First Control Call and ProviderEndpoint"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)). Retries are honoured until the end of the **retry window, the token's expiry plus a generous 7 days by default**, so an operator that crashed between the call and persisting its result can always recover it.
 - **Orphans expire**: a Connection that has seen neither an authenticated Control Call nor a verified Session by the end of that window is removed by the Provider-side. It's meant for a Registration whose result PM never stored. The same happens when PM stored the result but couldn't reach the Provider for the whole window (its control path blocked, or `platform-mesh-operator` down); nothing is lost, since the Connection never had a Session, and the Owner onboards again once the path works ([03 Operator, "Health"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)). The deadline, `unusedExpiresAt`, is fixed by the Provider-side when it creates the Connection and returned with it, so `platform-mesh-operator` can warn the Owner. A Connection that was used once is never expired for being idle.
 - **Addressing is immutable**: `clusterName` is fixed for the Connection's life.
 - **Trust in the response** comes from the Inner TLS pinned to the token's `keyfp`; it's what makes the returned Server Keys safe to pin. The Provider's Edge sees neither `tokenSecret`, the Connection Secret's hash nor the Connector CA Set, and can't change the response.
@@ -246,7 +250,7 @@ For each: the number of live Sessions, whether its last requests reached kcp, an
 - **Authentication failures** reveal no detail: a failed Session handshake ends with a standard TLS alert (e.g. `unknown_ca` when the Connector's CA isn't pinned, which the Connector reports in its metrics), and a failed Control Call gets a uniform response, then the Control Session closes. The Provider-side records the reason for its own audit, in logs and metrics; a failed authentication changes nothing on the Provider-side.
 - **Rate limits** return `429` with `Retry-After`; the PM-side honours it with jitter.
 - **Transient failures** (`5xx`, connection errors) are retried with backoff; Registration retries reuse the same idempotency key and hash.
-- **A refused token** (unknown, expired, spent, or its Server Key unusable) is refused before the Registration upgrade with a stable status, reported as `TokenRefused`.
+- **A refused token** (unknown; unspent but expired or its Server Key unusable; spent and past its retry window) is refused before the Registration upgrade with a stable status, reported as `TokenRefused`. A spent token whose request isn't a retry of the Registration that spent it is refused inside the Inner TLS: with the same status for another Registration's request, and with `IdempotencyConflict` for the same idempotency key with another `secretHash` or `clusterName`.
 - **An unknown or deleted Connection** refuses everything with a stable, distinguishable status, so the PM-side can report it instead of retrying forever. Only the answer given **inside the Inner TLS on `control`**, verified against the pinned Server Key, counts as "unknown"; a refusal of a Session upgrade, or anything the Edge could have sent, doesn't. Before answering "unknown", the Provider-side reads the `Connection` uncached; if its cache isn't synced or its API can't be reached, it answers `503` instead, and so do standbys. "Unknown" is also what lets an Owner onboard the same `Provider` again (see "Recovery").
 
 ## Versioning
