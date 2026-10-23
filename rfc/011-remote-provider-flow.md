@@ -190,7 +190,7 @@ Some things exist before any Owner does anything.
 
 - **one Connector Deployment per shard**, configured with its own shard's virtual-workspace host and the front-proxy's host, plus an in-cluster address for each,
 - **a kcp identity for each shard's Connector**,
-- **the Connector CA** and **one Connector Certificate per shard**, both cert-manager resources (explained in step 7, where they're first used).
+- **the Connector CA** and **one Connector Certificate per shard**, both cert-manager resources (explained in Step 7, where they're first used).
 
 `platform-mesh-operator` also applies the kcp setup:
 
@@ -227,7 +227,7 @@ Some things exist before any Owner does anything.
 > # HMS/KMS is also an option and can be a follow-up later.
 > ```
 
-**Who: the Provider's operator** is deployed and waiting. It will find Connections as kubeconfig `Secret`s that `provider-gateway` writes (step 4).
+**Who: the Provider's operator** is deployed and waiting. It will find Connections as kubeconfig `Secret`s that `provider-gateway` writes (Step 4).
 
 You might be wondering: how does the Provider Administrator know they configured this PM-facing setup correctly? See [Provider's self-check]() in Follow-up Items.
 
@@ -255,7 +255,7 @@ pm1.<base64url(https://wildwest.example.com/pm)>.<key-sha256 of the Server Key>.
 > **Concept: Onboarding Token.** A single-use, short-lived string that lets the PM-side register one new Connection with this Provider, in the Owner's name. Each part has a job:
 > - `pm1.` marks the format, so secret scanners can recognise leaked tokens;
 > - the **Base URL** says where to register, so the token is not sent somewhere else by accident (the Owner copy-pasted some other URL);
-> - the **Server Key fingerprint** (`keyfp`) says which key the Provider-side must prove it holds during Registration (step 4);
+> - the **Server Key fingerprint** (`keyfp`) says which key the Provider-side must prove it holds during Registration (Step 4);
 > - the **token ID** names the token, in URLs and logs; it isn't secret;
 > - the **token secret** is the actual credential.
 
@@ -312,11 +312,11 @@ status:
 
 **Who: `platform-mesh-operator`.** It reconciles each `Provider` in a fixed sequence of steps, each reported as a condition on the `Provider`: `Workspace`, `ConnectorAccess`, `Registered`, `Connected` (yes, these are different from what we have today - this will be a breaking change, don't care ¯\(ツ)/¯).
 
-**3a. Create the Provider Workspace** `:root:providers:wildwest-<Alice's lc name>`, and in it a ServiceAccount `default/provider` with admin rights there (condition `Workspace`). That SA is the identity the Provider will act as in kcp, but the Provider never gets a credential for it: the Connectors will use it on the Provider's behalf (step 9). The `providerendpoints.platform-mesh.io` is default-bound by the WorkspaceType (an alternative: the pm-operator could create the binding conditionally if that's cleaner).
+**3a. Create the Provider Workspace** `:root:providers:wildwest-<Alice's lc name>`, and in it a ServiceAccount `default/provider` with admin rights there (condition `Workspace`). That SA is the identity the Provider will act as in kcp, but the Provider never gets a credential for it: the Connectors will use it on the Provider's behalf (Step 9). The `providerendpoints.platform-mesh.io` is default-bound by the WorkspaceType (an alternative: the pm-operator could create the binding conditionally if that's cleaner).
 
 **3b. Lock down the workspace, then grant the Connectors access** (condition `ConnectorAccess`).
 
-As mentioned, Connectors will be minting tokens for the Connection, to impersonate the Provider's SA. We'll discuss what's what in later sections (step 9). For now, `platform-mesh-operator` grants the Connectors' system group `system:platform-mesh:providers-connectors` two rights in the workspace: `access` to it, and `create` on `serviceaccounts/token` for `default/provider` only.
+As mentioned, Connectors will be minting tokens for the Connection, to impersonate the Provider's SA. We'll discuss what's what in later sections (Step 9). For now, `platform-mesh-operator` grants the Connectors' system group `system:platform-mesh:providers-connectors` two rights in the workspace: `access` to it, and `create` on `serviceaccounts/token` for `default/provider` only.
 
 It also creates two `ValidatingAdmissionPolicies` in the Provider Workspace:
 
@@ -325,7 +325,7 @@ It also creates two `ValidatingAdmissionPolicies` in the Provider Workspace:
 
 kcp starts enforcing new policies with a delay, so `platform-mesh-operator` **checks** that they are enforced: it tries a dry-run write the policy must refuse, impersonating the Provider's SA. Until it's refused, it stops here with `PolicyNotEnforced`.
 
-**3c. Check the `ProviderOnboardingRequest`** (condition `Registered`). the `Provider` exists (otherwise `ProviderNotFound`, until the Owner creates it); it's remote and not yet registered; the token `Secret` exists, parses, and its ID equals `spec.tokenID`; the Base URL passes the egress rules (step 4). The token `Secret` is read by name, never cached: `platform-mesh-operator` keeps no copies of other people's `Secret`s in memory.
+**3c. Check the `ProviderOnboardingRequest`** (condition `Registered`). the `Provider` exists (otherwise `ProviderNotFound`, until the Owner creates it); it's remote and not yet registered; the token `Secret` exists, parses, and its ID equals `spec.tokenID`; the Base URL passes the egress rules (Step 4). The token `Secret` is read by name, never cached: `platform-mesh-operator` keeps no copies of other people's `Secret`s in memory.
 
 And that's all we (the Platform Mesh) need to do in the Provider Workspace. Nothing has been sent to the Provider just yet!
 
@@ -352,11 +352,11 @@ sequenceDiagram
     Note over O: R7: persist, delete token data,<br/>request → Registered
 ```
 
-##### Registration: step 1/4: `platform-mesh-operator` notes down the ongoing registration
+##### R1: `platform-mesh-operator` notes down the ongoing registration
 
 **Who: `platform-mesh-operator`.** It creates a `ProviderEndpointRegistration` named `3y9j0def` in its own namespace, locally, in PM's runtime cluster. It also generates the **Connection Secret** into a `Secret` next to it. `ProviderOnboardingRequest`'s phase becomes `Registering`.
 
-> **Concept: Connection Secret.** The bearer credential with which `platform-mesh-operator` authenticates its later calls to the Provider-side (Control Calls, step 5). A prefix plus 256 random bits, `pmc1_<base64url>`; the prefix lets secret scanners spot leaks. PM generates it, keeps it only in its runtime cluster (never in kcp, never in the Owner's workspace), and only ever sends its **hash**. Only PM can change it (step 10).
+> **Concept: Connection Secret.** The bearer credential with which `platform-mesh-operator` authenticates its later calls to the Provider-side (Control Calls, step 5). A prefix plus 256 random bits, `pmc1_<base64url>`; the prefix lets secret scanners spot leaks. PM generates it, keeps it only in its runtime cluster (never in kcp, never in the Owner's workspace), and only ever sends its **hash**. Only PM can change it (Step 10).
 
 ```yaml
 apiVersion: providers.platform-mesh.io/v1alpha1
@@ -367,25 +367,146 @@ metadata:
 spec:
   connectionID: c-7f3k9q2mx8w4h6j1n5p3r7t9vb
   url: https://wildwest.example.com/pm
-  serverKeys: ["-----BEGIN PUBLIC KEY-----…"]   # pinned
-  unusedExpiresAt: "2026-10-29T09:30:00Z"       # removed by the Provider-side if never reached
+  serverKeys: ["-----BEGIN PUBLIC KEY-----..."]   # pinned
+  unusedExpiresAt: "2026-10-29T09:30:00Z"       # If, by this time, there was no response (e.g. Provider down), this ProviderEndpointRegistration is automatically garbage-collected.
 ---
 apiVersion: v1
-kind: Secret                          # PM's runtime cluster, never in kcp
+kind: Secret                          # The Connection Secret. Stored in PM's runtime cluster.
 metadata:
   name: 3y9j0def-secret
   namespace: platform-mesh-system
 stringData:
-  secret: pmc1_…                      # the Connection Secret; only its hash leaves the PM-side
+  secret: pmc1_...                    # the Connection Secret; only its hash leaves the PM-side
   pendingSecret: ""                   # only while it changes
 ```
 
-##### Registration: step 2/4: `platform-mesh-operator` dials the Provider
+##### R2: `platform-mesh-operator` dials the Provider
 
 **Who: `platform-mesh-operator`**, in order:
 
+1. **Egress checks** on the Base URL: `https` only; resolve the name once, check every address, then connect to exactly those; refuse loopback, link-local (which includes cloud metadata addresses such as `169.254.169.254`), unspecified and multicast; follow no redirects; ignore proxy settings from the environment.
+
+   > **Concept: why "resolve once".** An Owner chooses the Base URL, so it could try to make PM connect where it shouldn't, such as the pod's own loopback or the cloud metadata service. Checking the address isn't enough if the name is looked up again to connect: a hostile DNS server could answer differently the second time (**DNS rebinding**). Resolving once and dialling the checked addresses closes that. Private addresses stay allowed, so on-prem Providers work; which of them PM may reach is up to the deployment's network policy.
+
+2. **Open a TCP connection and the outer TLS** to `wildwest.example.com`. We default to Web PKI. The owner could have set up `Provider.spec.caBundle` in which case we'd use that one (rotation of that CA bundle is up to the Owner, by the Owner).
+
+3. **Send a WebSocket upgrade**: `GET /v1/connections/register/t-q8m2...`. It carries no credential: the token secret travels later, inside the Inner TLS.
+
+```http
+GET /pm/v1/connections/register/t-q8m2vxk3j7p4w9n2c5h8r6t1aa HTTP/1.1
+Host: wildwest.example.com
+Upgrade: websocket
+                                      # no credentials; an unusable token is refused here
+```
+
+**Who: the Provider's Edge** terminates the outer TLS and forwards the upgrade to `provider-gateway`.
+
+##### R3: `provider-gateway` checks the token, then accepts the upgrade
+
+**Who: `provider-gateway`.** Before switching to a WebSocket, it looks up the `OnboardingToken` by the ID in the path: it must exist, be unexpired and unspent, and its `ServerKey` must exist, be ready and not being retired. One exception: a token that's already spent is let through while its **retry window** is open (the token's expiry plus 7 days). That's the case where PM retries a Registration whose answer it lost (see "idempotency" in R6); whether it really is that retry can only be checked inside the Inner TLS. It also caps how many handshakes may be in progress. If anything fails, it refuses with a stable status, and `platform-mesh-operator` fails the request with `TokenRefused` (in which case the Owner needs to go get a new token).
+
+Otherwise it answers `101` and the WebSocket is open.
+
+Inner TLS (ALPN `pm-register/1`), accepting only the Server Key whose fingerprint is the token's `keyfp`; inside it:
+
+##### R4: Both sides run the Inner TLS, pinned to the token's Server Key
+
+**Who: `platform-mesh-operator` (client) and `provider-gateway` (server).** Inside the WebSocket, they run a **second, complete TLS 1.3 handshake** (the Inner-TLS), end to end between the two programs.
+
+```
+platform-mesh-operator ══ outer TLS (web PKI) ══▶ Edge ── WebSocket ──▶ provider-gateway
+                       ╚═ WebSocket: /v1/connections/register/{tokenID} ═══════╝
+                            ╚═ Inner-TLS 1.3: pinned Server Key ═══════════════╝
+                                 ╚═ one HTTP request: the Registration ════════╝
+```
+
+**`provider-gateway`** presents a **self-signed certificate** for the token's Server Key.
+
+**`platform-mesh-operator`** computes the fingerprint of the key in the certificate and accepts the handshake only if it equals `keyfp` from the token.
+
+Both sides also agree on the protocol through **ALPN**: `pm-register/1`. In case we ever need to change this flow, it's all versioned (this RFC defines three ALPNs `pm-register/1`, `pm-control/1`, `pm-session/1`).
+
+##### R5: `platform-mesh-operator` sends the Registration
+
+**Who: `platform-mesh-operator`**, one HTTP request inside the Inner-TLS:
+
+```
+POST /pm/v1/connections HTTP/1.1
+Authorization: Bearer <tokenSecret>
+{
+  "idempotencyKey": "<ProviderOnboardingRequest.UID>",
+  "clusterName":    "3y9j0def",
+  "secretHash":     "sha256:<hash of the Connection Secret>",
+  "connectorCASet": "<PEM: the Connector CA certificates>"
+}
+```
+
+- the **token secret** proves the Owner's right to register;
+- **`clusterName`** tells the Provider-side which Provider Workspace this Connection is for;
+- **`secretHash`** lets the Provider-side check the Connection Secret later, without ever receiving it;
+- **`connectorCASet`** tells the Provider-side whom to trust for Sessions (step 7). It becomes the Connection's **Pinned Bundle**.
+
+##### R6: `provider-gateway` creates the Connection
+
+**Who: `provider-gateway`.**
+1. Hashes the token secret and compares it with the stored hash (in constant time, so timing reveals nothing).
+2. Applies a rate limit per Owner, and the idempotency rule (below).
+3. Parses the Connector CA Set strictly: only CA certificates, at least one unexpired, nothing else.
+4. Marks the token **spent**, atomically, so it can't be used twice.
+5. Creates the `Connection` object: `connectionID`, the Owner's account, `clusterName`, the Pinned Bundle, the Connection Secret's hash, the Server Keys it hands out, and `unusedExpiresAt` (the end of the token's retry window, its expiry plus 7 days: if nothing ever reaches this Connection by then, it's removed, see step 5).
+6. Creates a **kubeconfig `Secret`** for the Connection, for the Provider's operator (step 9), and emits a `Registered` Event, so the Provider can tell its customer.
+7. Answers:
+   ```http
+    HTTP/1.1 201 Created
+
+    {
+      "connectionID":    "c-7f3k9q2mx8w4h6j1n5p3r7t9vb",
+      "serverKeys":      [ { "publicKey": "-----BEGIN PUBLIC KEY-----..." } ],
+      "unusedExpiresAt": "2026-10-29T09:30:00Z"
+    }
+   ```
+
+On idempotency: If the response gets lost, `platform-mesh-operator` can't tell whether the Registration happened. So it retries with the same **idempotency key** (the `ProviderOnboardingRequest.UID`), hash and `clusterName`, and the Provider-side, recognising them, returns the stored answer instead of creating a second Connection. It honours such retries until the token's retry window ends. A retry with a different hash is refused, so someone replaying a logged request gains nothing.
+
+Apart from the token secret, which is now spent, nothing in the request or the response is a usable secret: a hash, public CA certificates, public keys and IDs.
+
+##### R7: `platform-mesh-operator` persists the result
+
+**Who: `platform-mesh-operator`.**
+1. Writes `connectionID`, the Base URL, the returned Server Keys and `unusedExpiresAt` into the `ProviderEndpointRegistration`, in one write. From now on this object, not the token, is PM's source of truth for the Connection. The Server Keys in it are now PM's pins for every later call.
+2. Records the `connectionID` on the request, and copies URL and `connectionID` into the `Provider`'s status, for the Owner's information only (the Owner can edit that status, so PM never relies on it).
+3. Deletes the token data from Alice's `Secret`: a spent token shouldn't linger in backups or Git.
+4. Marks the request `Registered`. The request is done; everything after is reported on the `Provider`.
+
+**Who: the Provider's operator** notices the new kubeconfig `Secret`, but can't do anything useful with it yet: no Session exists yet.
+
+And just like that, we've convinced both sides to trust each other, in *seven* easy steps!
+
+#### 5. The first Control Call
+
+Before telling the Connectors (remember, that's the PM-side) about the Connection (Provider-side), `platform-mesh-operator` makes sure it can actually talk to the Provider-side for its upkeep. That path is the **Control Session**.
+
+> **Concept: Control Session and Control Call.** A Control Session is a WebSocket from `platform-mesh-operator` to `.../v1/connections/{id}/control`, with Inner-TLS against a pinned Server Key, carrying ordinary HTTP/1.1 requests: the **Control Calls**.
+>
+> There are kinds of these calls: `GET` (status), `PUT .../connector-ca-set` (update the Pinned Connector CA Bundle) and `DELETE`. Each carries the Connection Secret as a bearer credential, inside the Inner-TLS, so the Edge never sees it. None of them can change the Connection Secret.
+
+##### Control: step 1/3: `platform-mesh-operator` opens a Control Session
+
+**Who: `platform-mesh-operator`.** Dials as in R2, sends the upgrade to `/pm/v1/connections/c-7f3k9q2mx8w4.../control` with a header naming the Server Key it expects (`PM-Server-Key: key-sha256:3f9a...` - this needs to match `ServerKey.status.fingerprint` on Provider-side in the next step).
+
+```http
+GET /pm/v1/connections/c-7f3k9q2mx8w4h6j1n5p3r7t9vb/control HTTP/1.1
+Host: wildwest.example.com
+Upgrade: websocket
+PM-Server-Key: key-sha256:3f9a...       # which pinned key the Provider-side should present
+```
+
+**Who: `provider-gateway`.** Accepts the upgrade. Inside it, `platform-mesh-operator` starts a second TLS handshake (ALPN `pm-control/1`), and the gateway presents the Server Key whose fingerprint came in the request's `PM-Server-Key` header.
+
+**Who: `platform-mesh-operator`.** Continuing with the TLS handshake, it checks that key against the ones in its `ProviderEndpointRegistration.spec.serverKeys`. If it isn't one of them, PM aborts the handshake; otherwise the handshake completes, and PM knows it's talking to the real Provider-side.
 
 
+---------
 
 ```yaml
 apiVersion: apis.kcp.io/v1alpha2
@@ -404,121 +525,6 @@ spec:
 ```
 
 The `providerendpoints.providers.platform-mesh.io` serves one kind, `ProviderEndpoint` (step 6), and lets Connectors read the workspace's endpoint slices, to see which shards the Provider has consumers on (step 7). Its maximal permission policy keeps `ProviderEndpoint`s written only by PM, the Provider gets no RBAC for that.
-
-Now, w
-
-#### 4. Registration
-
-**`platform-mesh-operator`** first generates the Connection Secret and stores it, so a crash can never lose it. Then it opens a WebSocket to the token's Base URL and, inside it, runs the Inner TLS, accepting only the Server Key the token names. From here on the Provider's Edge sees only encrypted bytes. Inside, it presents the token's secret, the hash of the Connection Secret, and the Connector CA the Provider-side should trust for Sessions.
-
-**`provider-gateway`** checks and spends the token, creates the Connection, and returns its ID and its Server Keys, which PM pins. No usable secret crosses the wire: only a spent token, a hash and public keys. A lost response is safe to retry: the same request gets the same answer.
-
-```yaml
-apiVersion: providers.platform-mesh.io/v1alpha1
-kind: ProviderEndpointRegistration    # PM's runtime cluster; authoritative record of one Connection
-metadata:
-  name: 2x8k9abc                      # the Provider Workspace's logical cluster
-  namespace: platform-mesh-system
-spec:
-  connectionID: c-7f3k9q2mx8w4h6j1n5p3r7t9vb
-  url: https://wildwest.example.com/pm
-  serverKeys: ["-----BEGIN PUBLIC KEY-----…"]   # pinned
-  unusedExpiresAt: "2026-10-29T09:30:00Z"       # removed by the Provider-side if never reached
----
-apiVersion: v1
-kind: Secret                          # PM's runtime cluster, never in kcp
-metadata:
-  name: 2x8k9abc-secret
-  namespace: platform-mesh-system
-stringData:
-  secret: pmc1_…                      # the Connection Secret; only its hash leaves the PM-side
-  pendingSecret: ""                   # only while it changes
-```
-
-```http
-GET /pm/v1/connections/register/t-q8m2vxk3j7p4w9n2c5h8r6t1aa HTTP/1.1
-Host: wildwest.example.com
-Upgrade: websocket
-                                      # no credentials; an unusable token is refused here
-```
-
-Inner TLS (ALPN `pm-register/1`), accepting only the Server Key whose fingerprint is the token's `keyfp`; inside it:
-
-```http
-POST /v1/connections HTTP/1.1
-Authorization: Bearer <tokenSecret>
-
-{
-  "idempotencyKey": "<the request's UID>",
-  "clusterName":    "2x8k9abc",
-  "secretHash":     "sha256:<hash of the Connection Secret>",
-  "connectorCASet": "-----BEGIN CERTIFICATE-----…"
-}
-```
-
-```http
-HTTP/1.1 201 Created
-
-{
-  "connectionID":    "c-7f3k9q2mx8w4h6j1n5p3r7t9vb",
-  "serverKeys":      [ { "publicKey": "-----BEGIN PUBLIC KEY-----…" } ],
-  "unusedExpiresAt": "2026-10-29T09:30:00Z"
-}
-```
-
-On the Provider-side, the Connection and a kubeconfig for the Provider's operator:
-
-```yaml
-apiVersion: provider-sdk.platform-mesh.io/v1alpha1
-kind: Connection                      # Provider's cluster; written by provider-gateway
-metadata:
-  name: c-7f3k9q2mx8w4h6j1n5p3r7t9vb # the connectionID; consumer data is keyed by it
-  namespace: wild-west-system
-spec:
-  registration:                       # immutable
-    owner: alice@example.com
-    clusterName: 2x8k9abc
-    unusedExpiresAt: "2026-10-29T09:30:00Z"
-  pinnedBundle: |                     # the Connector CA(s) Sessions are verified against
-    -----BEGIN CERTIFICATE-----
-    …
-status:
-  conditions:
-    - type: Ready                     # the workspace and every host the operator uses
-      status: "True"                  #   are reachable over Sessions
-  lastSeen: "2026-10-22T09:13:00Z"
-  secretHash: sha256:…                # only the hash of the Connection Secret
----
-apiVersion: v1
-kind: Secret                          # Provider's cluster; read by the Provider's operator
-metadata:
-  name: connection-c-7f3k9q2mx8w4h6j1n5p3r7t9vb
-  namespace: wild-west-system
-  labels:
-    provider-sdk.platform-mesh.io/connection: c-7f3k9q2mx8w4h6j1n5p3r7t9vb
-stringData:
-  kubeconfig: |
-    apiVersion: v1
-    kind: Config
-    clusters:
-    - name: c-7f3k9q2mx8w4h6j1n5p3r7t9vb
-      cluster:
-        server: https://front-proxy.pm.invalid/clusters/2x8k9abc   # placeholder, never resolved
-        proxy-url: https://c-7f3k9q2mx8w4h6j1n5p3r7t9vb:<credential>@provider-gateway.wild-west-system.svc:3128
-        tls-server-name: provider-gateway.wild-west-system.svc     # TLS to the gateway, not to kcp
-        certificate-authority-data: <provider-gateway's CA>
-    users:
-    - name: c-7f3k9q2mx8w4h6j1n5p3r7t9vb
-      user: {}                        # no kcp credential
-    contexts:
-    - name: c-7f3k9q2mx8w4h6j1n5p3r7t9vb
-      context: { cluster: c-7f3k9q2mx8w4h6j1n5p3r7t9vb, user: c-7f3k9q2mx8w4h6j1n5p3r7t9vb }
-    current-context: c-7f3k9q2mx8w4h6j1n5p3r7t9vb
-```
-
-`platform-mesh-operator` then stores the result, deletes the spent token from the Owner's `Secret`, and marks the request `Registered`.
-
----
 
 
 The Connection Export serves one kind, `ProviderEndpoint` (step 6), and lets Connectors read the workspace's endpoint slices, to see which shards the Provider has consumers on (step 7). Its maximal permission policy keeps `ProviderEndpoint`s written only by PM, whatever the Provider's rights in its workspace.
