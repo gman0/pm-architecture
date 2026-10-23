@@ -210,7 +210,7 @@ sequenceDiagram
 
 **Who: `platform-mesh-operator`.** It creates a `ProviderEndpointRegistration` named `2x8k9abc` in its own namespace in PM's runtime cluster, and generates the **Connection Secret** into a `Secret` next to it. The request's phase becomes `Registering`.
 
-> **Concept: Connection Secret.** The bearer credential with which `platform-mesh-operator` authenticates its later calls to the Provider-side (Control Calls, step 5). A prefix plus 256 random bits, `pmc1_<base64url>`; the prefix lets secret scanners spot leaks. PM generates it, keeps it only in its runtime cluster (never in kcp, never in the Owner's workspace), and only ever sends its **hash**. Only PM can change it (step 10).
+> **Concept: Connection Secret.** The bearer credential with which `platform-mesh-operator` authenticates its later calls to the Provider-side (Control Calls, step 5). A prefix plus 256 random bits, `pmc1_<base64url>`; the prefix lets secret scanners spot leaks. PM generates it, keeps it only in its runtime cluster (never in kcp, never in the Owner's workspace). At Registration it sends only the **hash**, which is all the Provider-side stores; afterwards it presents the secret itself on each Control Call, inside the Inner TLS. Only PM can change it (step 10).
 
 > **Concept: write before send.** Any secret PM generates is stored before it's sent anywhere. If `platform-mesh-operator` crashes mid-call, it restarts with the same secret and can retry; nothing is ever "sent but forgotten".
 

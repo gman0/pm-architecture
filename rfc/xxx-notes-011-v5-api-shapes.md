@@ -178,7 +178,7 @@ metadata:
   name: 2x8k9abc-secret
   namespace: platform-mesh-system
 stringData:
-  secret: pmc1_…                      # the Connection Secret; only its hash leaves the PM-side
+  secret: pmc1_…                      # the Connection Secret; the Provider-side stores only its hash
   pendingSecret: ""                   # only while it changes
 ```
 
