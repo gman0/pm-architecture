@@ -356,7 +356,9 @@ sequenceDiagram
 
 **Who: `platform-mesh-operator`.** It creates a `ProviderEndpointRegistration` named `3y9j0def` in its own namespace, locally, in PM's runtime cluster. It also generates the **Connection Secret** into a `Secret` next to it. `ProviderOnboardingRequest`'s phase becomes `Registering`.
 
-> **Concept: Connection Secret.** The bearer credential with which `platform-mesh-operator` authenticates its later calls to the Provider-side (Control Calls, step 5). A prefix plus 256 random bits, `pmc1_<base64url>`; the prefix lets secret scanners spot leaks. PM generates it, keeps it only in its runtime cluster (never in kcp, never in the Owner's workspace), and only ever sends its **hash**. Only PM can change it (Step 10).
+> **Concept: Connection Secret.** The bearer credential with which `platform-mesh-operator` authenticates its later calls to the Provider-side (Control Calls, step 5). A prefix plus 256 random bits, `pmc1_<base64url>`. PM generates it and keeps it only in its runtime cluster. Here, during Registration, it sends only the **hash**. Afterwards it presents the secret itself on each Control Call - but then it's already inside the Inner-TLS, so that is safe because only the party that holds the pinned Server Key sees it.
+
+> **Concept: Connection Secret.** The bearer credential with which `platform-mesh-operator` authenticates its later calls to the Provider-side (Control Calls, step 5). A prefix plus 256 random bits, `pmc1_<base64url>`. PM generates it and keeps it only in its runtime cluster. Here, during Registration, it sends only the **hash:** that's all the Provider-side needs to check the secret later, so the plaintext is never stored there. Afterwards PM presents the secret itself on each Control Call, inside the Inner-TLS verified in C1, so the Edge never sees it.
 
 ```yaml
 apiVersion: providers.platform-mesh.io/v1alpha1
@@ -376,7 +378,7 @@ metadata:
   name: 3y9j0def-secret
   namespace: platform-mesh-system
 stringData:
-  secret: pmc1_...                    # the Connection Secret; only its hash leaves the PM-side
+  secret: pmc1_...                    # the Connection Secret; the Provider-side stores only its hash
   pendingSecret: ""                   # only while it changes
 ```
 
@@ -490,7 +492,7 @@ Before telling the Connectors (remember, that's the PM-side) about the Connectio
 >
 > There are kinds of these calls: `GET` (status), `PUT .../connector-ca-set` (update the Pinned Connector CA Bundle) and `DELETE`. Each carries the Connection Secret as a bearer credential, inside the Inner-TLS, so the Edge never sees it. None of them can change the Connection Secret.
 
-##### Control: step 1/3: `platform-mesh-operator` opens a Control Session
+##### C1: `platform-mesh-operator` opens a Control Session
 
 **Who: `platform-mesh-operator`.** Dials as in R2, sends the upgrade to `/pm/v1/connections/c-7f3k9q2mx8w4.../control` with a header naming the Server Key it expects (`PM-Server-Key: key-sha256:3f9a...` - this needs to match `ServerKey.status.fingerprint` on Provider-side in the next step).
 
@@ -504,6 +506,33 @@ PM-Server-Key: key-sha256:3f9a...       # which pinned key the Provider-side sho
 **Who: `provider-gateway`.** Accepts the upgrade. Inside it, `platform-mesh-operator` starts a second TLS handshake (ALPN `pm-control/1`), and the gateway presents the Server Key whose fingerprint came in the request's `PM-Server-Key` header.
 
 **Who: `platform-mesh-operator`.** Continuing with the TLS handshake, it checks that key against the ones in its `ProviderEndpointRegistration.spec.serverKeys`. If it isn't one of them, PM aborts the handshake; otherwise the handshake completes, and PM knows it's talking to the real Provider-side.
+
+##### C2: `platform-mesh-operator` asks for status
+
+**Who: `platform-mesh-operator`** sends `GET /pm/v1/connections/c-7f3k9q2mx8w4` with `Authorization: Bearer pmc1_...`.
+
+```http
+GET /pm/v1/connections/c-7f3k9q2mx8w4h6j1n5p3r7t9vb HTTP/1.1
+Host: wildwest.example.com
+Authorization: Bearer pmc1_...          # the first failed check closes the Control Session
+```
+
+**Who: `provider-gateway`:**
+1. checks the request is for the same Connection as the WebSocket's path. If an Edge rewrote one Connection's path to another's, it answers `ConnectionMismatch`, which PM reports as `EdgePathRewritten`, never as a bad secret;
+2. looks up the `Connection`. If it doesn't exist, it answers "unknown" from inside the Inner TLS, where PM can trust the answer (the Edge can't forge it);
+3. hashes the bearer and compares it with the stored hash. The first failure closes the Control Session, so guessing costs a full handshake each time;
+4. records `lastSeen`: the Connection has been reached, so it's no longer at risk of the 7-day removal;
+5. answers with the status (no Sessions yet), its current Server Keys, and the Pinned Bundle's fingerprints and `etag`:
+
+```http
+HTTP/1.1 200 OK
+
+{
+  "workspace":         { "sessions": 0, "kcpReachable": false },
+  "serverKeys":        [ { "publicKey": "-----BEGIN PUBLIC KEY-----…" } ],
+  "pinnedBundle":      { "etag": "9a07…", "fingerprints": [ "cert-sha256:9a07…" ] }
+}
+```
 
 
 ---------
