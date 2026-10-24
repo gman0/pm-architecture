@@ -517,12 +517,11 @@ Host: wildwest.example.com
 Authorization: Bearer pmc1_...          # the first failed check closes the Control Session
 ```
 
-**Who: `provider-gateway`:**
-1. checks the request is for the same Connection as the WebSocket's path. If an Edge rewrote one Connection's path to another's, it answers `ConnectionMismatch`, which PM reports as `EdgePathRewritten`, never as a bad secret;
-2. looks up the `Connection`. If it doesn't exist, it answers "unknown" from inside the Inner TLS, where PM can trust the answer (the Edge can't forge it);
-3. hashes the bearer and compares it with the stored hash. The first failure closes the Control Session, so guessing costs a full handshake each time;
-4. records `lastSeen`: the Connection has been reached, so it's no longer at risk of the 7-day removal;
-5. answers with the status (no Sessions yet), its current Server Keys, and the Pinned Bundle's fingerprints and `etag`:
+Who: `provider-gateway`:
+1. looks up the `Connection`. If it doesn't exist, it answers "unknown" from inside the Inner-TLS, where PM can trust the answer;
+2. hashes the bearer and compares it with the stored hash;
+3. records `lastSeen`;
+4. answers with the status, its current Server Keys, and the Pinned Bundle's fingerprints, and `etag`:
 
 ```http
 HTTP/1.1 200 OK
@@ -534,29 +533,12 @@ HTTP/1.1 200 OK
 }
 ```
 
+#### C3. `platform-mesh-operator` acts on the answer
+
+
+
 
 ---------
-
-```yaml
-apiVersion: apis.kcp.io/v1alpha2
-kind: APIBinding                      # In Provider Workspace
-metadata:
-  name: providerendpoints.providers.platform-mesh.io
-spec:
-  reference:
-    export: { path: root:platform-mesh-system, name: providerendpoints.providers.platform-mesh.io }
-  permissionClaims:
-    - group: apis.kcp.io
-      resource: apiexportendpointslices
-      verbs: [get, list, watch]
-      selector: { matchAll: true }
-      state: Accepted
-```
-
-The `providerendpoints.providers.platform-mesh.io` serves one kind, `ProviderEndpoint` (step 6), and lets Connectors read the workspace's endpoint slices, to see which shards the Provider has consumers on (step 7). Its maximal permission policy keeps `ProviderEndpoint`s written only by PM, the Provider gets no RBAC for that.
-
-
-The Connection Export serves one kind, `ProviderEndpoint` (step 6), and lets Connectors read the workspace's endpoint slices, to see which shards the Provider has consumers on (step 7). Its maximal permission policy keeps `ProviderEndpoint`s written only by PM, whatever the Provider's rights in its workspace.
 
 
 
@@ -593,3 +575,15 @@ The Connection Export serves one kind, `ProviderEndpoint` (step 6), and lets Con
 > happens" will run into recovery quickly. Decide which of those answers live here and which in
 > RFC 012, so the appendix doesn't become RFC 012 by accident. The follow-ups already promised in
 > the text (the multicluster provider, automatic rotation) belong in this list too.
+
+Q: What stops someone from guessing the Connection Secret?
+
+Two things. The secret is 256 random bits, and the first failed check closes the Control Session. So each new guess needs a new WebSocket and a new Inner-TLS handshake, and provider-gateway's limits on handshakes slow that down. platform-mesh-operator never fails a check on purpose, so a failed check is a signal worth alerting on.
+
+Q: What happens to a Connection that PM registers but never uses?
+
+The Provider-side removes it. Say the Registration succeeded but PM crashed before storing the result, or PM can't reach the Provider afterwards. The Provider-side would be left with a Connection
+nobody will ever use. Such a Connection gets a deadline, unusedExpiresAt: by default the token's expiry plus 7 days. If by then it has seen neither an authenticated Control Call nor a verified
+Session, the Provider-side removes it.
+
+PM gets the deadline in the Registration response and shows it on the Provider, so the Owner knows how long the Provider-side will keep the Connection. Nothing is lost, since the Connection never had a Session; the Owner onboards again once the path works. A Connection that was used even once never expires for being idle.
