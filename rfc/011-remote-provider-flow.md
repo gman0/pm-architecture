@@ -951,32 +951,111 @@ serves every PM Instance without extra wiring.
 
 ## Appendix
 
->  Smaller points to make in the flow itself (the walkthrough already covers most of them)
->  - Sessions follow traffic per shard. This is step 7f in the walkthrough; make sure it survives the
->    trimming, because it's the scaling answer.
->  - Availability: what keeps working when PM's runtime cluster or platform-mesh-operator is down.
->    Connectors keep their Sessions from the ProviderEndpoint. This is a short "what if" for the
->    appendix, and it's the reason ProviderEndpoint exists, so it matters.
->  - What the Owner sees: conditions on the Provider and the request. One line at the relevant step.
+### What if...
 
-> Follow-ups and open questions, recovery. "What do I do if X
-> happens" will run into recovery quickly.The follow-ups already promised in
-> the text (the multicluster provider, automatic rotation) belong in this list too.
+#### What stops someone from guessing the Connection Secret?
 
-Q: What stops someone from guessing the Connection Secret?
+Its size, and the cost of each guess. The secret is 256 random bits. A wrong guess closes the Control Session, so every new guess needs a new WebSocket and a new Inner-TLS handshake, and `provider-gateway` limits those. PM itself never sends a wrong secret, so any failed check is worth an alert.
 
-Two things. The secret is 256 random bits, and the first failed check closes the Control Session. So each new guess needs a new WebSocket and a new Inner-TLS handshake, and provider-gateway's limits on handshakes slow that down. platform-mesh-operator never fails a check on purpose, so a failed check is a signal worth alerting on.
+#### What happens when `platform-mesh-operator` goes down?
 
-Q: What happens to a Connection that PM registers but never uses?
+Traffic keeps flowing. Connectors don't depend on `platform-mesh-operator`: they read the `ProviderEndpoint`s in kcp, mint their own SA tokens, and get their certificates from cert-manager.
 
-The Provider-side removes it. Say the Registration succeeded but PM crashed before storing the result, or PM can't reach the Provider afterwards. The Provider-side would be left with a Connection
-nobody will ever use. Such a Connection gets a deadline, unusedExpiresAt: by default the token's expiry plus 7 days. If by then it has seen neither an authenticated Control Call nor a verified
-Session, the Provider-side removes it.
+What waits until it's back:
+- Onboarding and Offboarding;
+- status updates on the `Provider`;
+- upkeep: Secret Changes, new Server Keys, Connector CA pushes.
 
-PM gets the deadline in the Registration response and shows it on the Provider, so the Owner knows how long the Provider-side will keep the Connection. Nothing is lost, since the Connection never had a Session; the Owner onboards again once the path works. A Connection that was used even once never expires for being idle.
+Traffic is only at risk if `platform-mesh-operator` stays down for many hours during a Rollover. Then new Sessions can fail at Providers that haven't received the new Connector CA yet. Open Sessions keep running, and the first push afterwards fixes it.
 
-Q: What happens when platform-mesh-operator goes down?
+#### What happens when a Connector goes down?
 
-Q: What happens when a Connector goes down?
+Its Sessions close, and client-go retries on the Connection's other Sessions:
+- requests to the Provider Workspace can use any Session;
+- requests to that shard's virtual workspace need another replica of the same Connector. With a single replica, they wait until it's back.
 
-Q: What happens when a provider-gateway goes down?
+Connectors keep no state. A restarted one reopens its Sessions on its own. If a Connection has no Sessions for longer than a short grace period, the `Provider` object shows `NoSessions`.
+
+#### What happens when `provider-gateway` goes down?
+
+The Provider's operator can't reach kcp until a standby replica takes over, usually within seconds. All of `provider-gateway`'s state is in Kubernetes resources (`Connection`s, `ServerKey`s and their `Secret`s), so nothing is lost, and Connectors and `platform-mesh-operator` reconnect on their own.
+
+A longer outage shows as `Connected=False` on the `Provider` object, and nothing else happens: the Connection doesn't expire, and anything the Provider missed, such as a Rollover, is caught up on PM's next successful Control Call.
+
+#### What if the Provider's Edge breaks the connection?
+
+The Owner sees `Connected=False` on the `Provider` object, with an `Edge…` reason naming the likely cause: for example `EdgeBotChallenge` for bot protection, or `EdgePayloadBlocked` for a WAF. The Provider fixes its Edge; see [What the Provider's Edge must allow](#what-the-providers-edge-must-allow) below.
+
+#### What if a Connection Secret leaks?
+
+The thief can lock PM out of that one Connection, but gains no access to kcp. The secret only exists on the PM-side, so it must have leaked from there.
+
+With the secret, someone could pin a CA of their own at the Provider, open a Session under it, and change the Connection Secret. PM checks the Pinned Bundle on every poll:
+- **if PM notices first**, it restores the bundle, which closes the thief's Sessions, and changes the Connection Secret;
+- **otherwise** the `Provider` object shows `SecretRejected`. The Provider Administrators then re-pin the bundle so PM can repair the secret, or the Owner abandons the Connection and onboards again.
+
+#### What if the Connector CA's key leaks?
+
+PM replaces the CA, and Providers stop trusting the old one within minutes.
+1. PM Administrators renew the Connector CA and the Connectors' certificates, and mark the old CA as distrusted.
+2. Once PM's own Connectors use the new CA, `platform-mesh-operator` removes the old one from every Connection, and the Provider-side closes every Session opened under it.
+
+Providers that PM can't reach at the time keep trusting the old CA until PM gets through to them. Until then, their `Provider` objects show a `TrustOutdated` warning.
+
+#### What if a Server Key is leaked or lost?
+
+The Provider rotates it. A leaked Server Key, together with control of the Provider's Edge or DNS, would let someone pose as the Provider-side to PM.
+1. The Provider Administrators create a new `ServerKey`.
+2. PM learns it on the next Control Call and pins it.
+3. `provider-gateway` switches each Connection to the new key once that Connection's `ProviderEndpoint` lists it.
+4. The old key is retired.
+
+If a key is lost before PM pinned its successor, PM can't learn the new one this way: the Provider Administrators hand it to the PM Administrators out-of-band. PM never fetches keys over plain HTTPS, where the Edge could swap them.
+
+#### What if an unspent Onboarding Token is stolen?
+
+The thief can register one Connection in the Owner's name, nothing more. The Owner's own request then fails with `TokenRefused`, and existing Connections aren't affected. Tokens are single-use and short-lived, and the Provider can delete a Connection it doesn't recognise.
+
+#### What if one side is compromised?
+
+The same as today, minus the leftover credentials:
+- **A compromised Provider-side** can read and write consumers' data within its claims. It never holds a kcp credential, so once PM closes its Sessions, it has nothing left.
+- **A compromised PM Instance** can pose as kcp to its Providers, create consumers, and delete its Connections. It can't reach into a Provider's cluster: on a Session, only the Provider's operator sends requests. The Provider can stop issuing tokens, delete `Connection`s, retire Server Keys, or stop `provider-gateway`.
+
+#### What if the Provider moves to a new Base URL?
+
+The Provider serves both URLs for a while, and asks the PM Administrators of each PM Instance it serves to change the Base URL in its Connections' `ProviderEndpointRegistration`s. Everything on the PM-side then switches over on its own, without re-onboarding.
+
+#### What if shards change?
+
+Sessions follow on their own. A new shard gets its own Connector, which opens Sessions once consumers on that shard bind a Provider's exports. If a Provider Workspace is migrated to another shard, its Sessions follow. Nothing is registered again.
+
+#### What if PM and the Provider run different versions?
+
+They still work together. Each channel negotiates its protocol version, and both sides support the current and the previous one, so PM and `provider-gateway` can be upgraded independently. While a Provider runs the older version, its `Provider` object shows `ProtocolOutdated`.
+
+#### What stops one Provider from starving others?
+
+All Providers share PM's Connectors, so each Connection has its own limits there: on Streams, request rate and requests in flight. No single Provider can exhaust a Connector for the others.
+
+### Recovery
+
+**Moving a side to a new cluster.** Each side's state is in ordinary Kubernetes resources, so a move is a backup and restore, as long as the keys come along:
+- **the Provider** moves its `Connection`s, `ServerKey`s and their `Secret`s with `provider-gateway`;
+- **PM** moves the Connector CA's `Secret` and the `ProviderEndpointRegistration`s with their `Secret`s.
+
+**A Connection deleted by mistake** on the Provider-side shows as `ConnectionUnknown`. The Provider Administrators re-create it with its old `connectionID`, so the consumers' data stays linked to it.
+
+**A `Provider` deleted by mistake** can't be recovered: its workspace and the APIExport's identity go with it, and kcp can't re-pair existing bindings. Deletion protection is a follow-up.
+
+**A side lost without a backup** is a manual effort across organisations. If PM loses the Connector CA's key, every Provider has to re-pin PM's new CA, Connection by Connection. If a Provider loses its Server Keys, it has to hand new ones to the PM Administrators of every PM Instance it serves. Both sides should back up their keys like any other critical credential store.
+
+Step-by-step procedures are follow-up runbooks.
+
+### What the Provider's Edge must allow
+
+On the paths under `<Base URL>/v1/connections/`:
+- **WebSocket upgrades**, over HTTP/1.1;
+- **binary messages up to 32 KB, unchanged**: no payload inspection, no bot challenges;
+- **long-lived connections**: idle timeouts above 30 seconds, and a maximum connection age of an hour or more;
+- **several connections from the same PM address**: a few per Connection.
