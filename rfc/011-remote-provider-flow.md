@@ -227,7 +227,7 @@ Some things exist before any Owner does anything.
 
 **Who: the Provider's operator** is deployed and waiting. Later, it will find Connections as kubeconfig `Secret`s that `provider-gateway` writes (once Sessions are up, in Step 7e).
 
-You might be wondering: how does the Provider Administrator know they configured this PM-facing setup correctly? See [Provider's self-check]() in Follow-up Items.
+You might be wondering: how does the Provider Administrator know they configured this PM-facing setup correctly? See Provider's self-check in [Follow-ups](#follow-ups).
 
 #### 1. The Owner gets an Onboarding Token
 
@@ -799,7 +799,7 @@ The Provider's operator reconciles a `Cowboy` that a consumer on `nereus` create
 
 Now we are getting into Day-2 operations. Nothing here needs re-onboarding or the other side's people. Most of it runs on its own.
 
-We can work on a "runbook" type of document to work out all the actions needed - see Follow-up items.
+We can work on a "runbook" type of document to work out all the actions needed - see Follow-ups.
 
 ##### Changing the Connection Secret
 
@@ -857,9 +857,99 @@ Two related cases:
 - **Abandoning a Connection** (`providers.platform-mesh.io/abandon-connection=<connectionID>` on the `Provider`, for a Provider-side that's gone for good) runs steps 1–3 but keeps the workspace and the consumers' bindings, so the Owner can onboard the same `Provider` again, against a new Provider-side.
 - **Deleting the Connection on the Provider-side** (in the portal) makes every later call answer "unknown"; the `Provider` shows `ConnectionUnknown`, and the Owner can onboard again.
 
----------
+#### Putting it together
 
+```mermaid
+sequenceDiagram
+    participant Ow as Owner
+    participant Po as Provider portal
+    participant Op as platform-mesh-operator
+    participant C as Connector (root)
+    participant G as provider-gateway
+    participant P as Provider's operator
 
+    Po->>Ow: 1. Onboarding Token (Base URL, keyfp, ID, secret)
+    Ow->>Op: 2. token Secret, Provider, request
+    Note over Op: 3. Provider Workspace, providerendpoints binding,<br/>policies (confirmed), Connector RBAC
+    Op->>G: 4. Registration (Inner-TLS pinned to keyfp)
+    G-->>Op: connectionID, Server Keys
+    Op->>G: 5. first Control Call (Inner-TLS, Connection Secret)
+    Note over Op: 6. write ProviderEndpoint
+    C->>G: 7. Session (mTLS: Connector Certificate ⇄ Server Key, Hello)
+    G->>P: kubeconfig Secret
+    Op->>G: 8. GET status → Connected, Ready
+    P->>G: 9. CONNECT, Stream
+    G->>C: request over the Session
+    C->>C: check, add SA token, forward to kcp
+    Note over Op,G: 10. Secret Changes via ProviderEndpoint,<br/>certificate renewals, yearly Rollover
+    Ow->>Op: 11. delete Provider
+    Op->>Op: delete ProviderEndpoint → Sessions close
+    Op->>G: DELETE
+    Note over Op,G: all PM → Provider arrows pass the Edge: Outer-TLS + Inner-TLS
+```
+
+### Coexistence with "manual flow"
+
+Everything works out of the box. This RFC adds `Provider.spec.remote`, so objects without that defined are not affected by these changes in any way.
+
+## Alternatives considered
+
+The alternatives below are whole approaches, not variations of this design. Each one fails at least one of this RFC's goals or principles for Remote Providers: Providers don't care about one specific PM Instance, PM Instances can be private, kcp credentials stay on the PM-side, and the Provider runs its own, unchanged operator.
+
+**The Provider dials in to PM.** This is today's direction, and the model of Konnectivity-style reverse tunnels: the Provider's operator, or an agent, connects to an endpoint PM exposes, either kcp's front-proxy or a tunnel endpoint in front of it. It needs no inbound endpoint on the Provider-side, and it's what Providers already do. But every PM Instance would have to be reachable from every Provider it uses. That rules out private PM Instances, and brings back the "network team opens a tunnel" step from the Motivation. It also leaves a kcp credential on the Provider-side.
+
+**PM dials out, but hands the Provider kcp credentials.** PM opens the connection, as in this RFC, but delivers a kcp ServiceAccount token over it. The Provider-side then talks to kcp directly, end to end, through a dial proxy. That spares PM the authorizing proxy. But every Provider has to receive, refresh and protect kcp credentials and trust kcp's CA. A compromised Provider-side keeps a usable kcp token until it expires. And revocation depends on rotating tokens, not on closing connections.
+
+**Syncing objects instead of proxying access.** An agent copies consumers' objects between kcp and the Provider's cluster, and the Provider's operator reconciles local copies. That suits operators that aren't multi-cluster. The problem is where the agent sits:
+- **on the PM-side, as in kube-bind:** PM holds a kubeconfig into the Provider's cluster, so the Provider must expose its own Kubernetes API to every PM Instance it serves and mint a credential for each, and a compromised PM-side can write into the Provider's cluster;
+- **on the Provider-side, as kcp's api-syncagent runs today:** the agent needs a kcp credential, which brings back the first alternative.
+
+Either way, the credentials and the exposure stay, only in a different place. (Running a sync agent *on top of* this RFC, with the kubeconfig `provider-gateway` writes, avoids both; see Follow-ups.)
+
+**Running the Provider's operator on the PM-side** (RFC 006's ManagedProvider). The Provider packages its operator, PM runs it next to kcp, and the operator calls out to the Provider to provision resources. No tunnel is needed, and no kcp credential leaves PM. But:
+- **the Provider needs a public provisioning API.** Its operator now runs on someone else's infrastructure, so everything it does, such as creating databases, clusters or accounts, has to be reachable over the network, authenticated and multi-tenant. Many Providers' operators act directly on infrastructure inside their own clusters, and have no such API to offer;
+- **PM runs third-party code next to kcp,** with access to it;
+- **the Provider gives up control of its own control plane:** its operator runs in many versions, on every PM Instance, upgraded and debugged by other people.
+
+This model stays supported; it's complementary. This RFC is for Providers that run their operator themselves, once, for every PM Instance.
+
+**Trusting the Provider's Edge** (Outer-TLS only, mTLS at the Edge, or TLS passthrough). Without the Inner-TLS, there's one standard TLS layer and much less protocol. But then whatever terminates TLS at the Provider holds the Provider's end of every connection: it could act as the Provider in kcp and read consumers' data, and it's often a third-party CDN or WAF. Requiring TLS passthrough or a client-certificate-verifying ingress instead assumes more about the Provider's infrastructure than this RFC wants to.
+
+**Other transports and custom cryptography.** Several were considered:
+- **Ready-made tunnels and networks:** mesh VPNs need a coordination server both sides trust, and managed tunnels make the vendor's edge trusted.
+- **Newer HTTP tunnelling** (MASQUE, WebTransport, HTTP `CONNECT`): Edges don't reliably pass them.
+- **Application-level signatures:** these would be custom cryptography in place of standard TLS.
+- **SSH over WebSocket:** one audited protocol instead of the Inner-TLS and the multiplexer. But WAFs commonly block SSH as a tunnelling protocol, which conflicts with the goal that any WebSocket-capable Edge must do; and SSH certificates would take the Connector CA out of cert-manager's automatic lifecycle.
+
+None of these provides the identity lifecycle, meaning Onboarding, rotation and the authorizing proxy, which is where most of this design's complexity lies. TLS inside a WebSocket, with yamux, is built from standard parts and looks like any other encrypted WebSocket traffic to the Edge.
+
+## Follow-ups
+
+None of these change the design; each builds on it.
+
+**General**
+- **Discovering Connections in the Provider's operator.** A multicluster-runtime provider that finds the kubeconfig `Secret`s `provider-gateway` writes, one cluster per Connection, so one operator
+serves every PM Instance without extra wiring.
+- **Sync agents on top of this RFC.** kcp's api-syncagent, using the kubeconfig `provider-gateway` writes instead of a kcp credential of its own, for Providers whose operators work on local objects.
+- **Automatic rotation where it's manual today**: Server Keys on a schedule, and the Connection Secret on a schedule, for Providers or PM Instances whose compliance rules require it. Neither is needed for security.
+- **Server Keys in a KMS or HSM**, for Providers that need non-exportable keys.
+- **A self-check for Providers**: a way for Provider Administrators to test, from outside their network, that their Edge passes what `provider-gateway` needs (WebSocket upgrades, binary messages, long-lived connections).
+- **Runbooks** for the recoveries in the Appendix and the other manual actions this RFC mentions: Connector CA compromise, a leaked Connection Secret, importing or re-pinning Connections, changing a Base URL, abandoning a Connection.
+
+**Provider-side**
+- **Horizontal scale for `provider-gateway`.** One active replica for now, with standbys.
+- **Suspending a Connection without deleting it**, if Providers need it.
+- **In-band changes announced by the Provider-side**: a new Base URL, or a new private CA for the Outer-TLS, verified by PM through the Inner-TLS. Today both are out-of-band.
+
+**PM-side**
+- **The `Provider` part of `platform-mesh-operator` as its own operator.** Until then, code that talks to Providers on the internet runs in PM's most privileged component.
+- **Deletion protection for `Provider`s with consumer bindings.** Deleting a `Provider` deletes its APIExport's identity, which kcp can't re-pair with existing bindings.
+- **Egress through an HTTP proxy**, for PM Instances whose networks require one.
+- **Edge diagnosis for Sessions**, not just for Control Calls, so Owners learn when the Provider's Edge breaks Sessions.
+- **Per-replica Connector Certificates** from an external issuer, so no private key is mounted into Connectors.
+- **Load tests of the Connector**, the extra hop in front of kcp's virtual workspaces.
+
+## Appendix
 
 >  Smaller points to make in the flow itself (the walkthrough already covers most of them)
 >  - Sessions follow traffic per shard. This is step 7f in the walkthrough; make sure it survives the
@@ -869,30 +959,8 @@ Two related cases:
 >    appendix, and it's the reason ProviderEndpoint exists, so it matters.
 >  - What the Owner sees: conditions on the Provider and the request. One line at the relevant step.
 
-### Coexistence with "manual flow"
-
-> It's a goal (L37), but nothing says how it's met yet: a
-> Provider without spec.remote behaves exactly as today. One sentence, but reviewers will check
-> it.
-
-## Alternatives considered
-
-> Alternatives considered. This is the critical one. The first question will be "why not have the
-> Provider dial out, like today or like kube-bind and konnectivity-style reverse tunnels?" The
-> "general idea" paragraph gives the reason only in passing. The v5 notes have a whole "Rejected
-> alternatives" section to draw from. Pick the 3–4 big ones:
->
-> - the Provider dialing in;
-> - exposing kcp directly;
-> - mTLS at the Edge or TLS passthrough;
-> - no ProviderEndpoint, with Connectors reading the PERs (the availability and distance
->   reasoning you settled on).
-
-## Appendix
-
-> Follow-ups and open questions, with a pointer to RFC 012 for recovery. "What do I do if X
-> happens" will run into recovery quickly. Decide which of those answers live here and which in
-> RFC 012, so the appendix doesn't become RFC 012 by accident. The follow-ups already promised in
+> Follow-ups and open questions, recovery. "What do I do if X
+> happens" will run into recovery quickly.The follow-ups already promised in
 > the text (the multicluster provider, automatic rotation) belong in this list too.
 
 Q: What stops someone from guessing the Connection Secret?
