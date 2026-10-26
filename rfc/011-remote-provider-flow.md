@@ -140,8 +140,7 @@ The whole API and protocol design would be impossible to digest in one go. So in
 | **Connectors** | PM-side | One small proxy Deployment per kcp shard (`providerconnections-connector`). They open Sessions to the Provider and carry all traffic between it and kcp. Stateless. |
 | **PM Administrators / Provider Administrators** | either | People running each side. Only needed for rare tasks (e.g. recovery, responding to a leak). |
 
-A **Connection** is one `Provider` on one PM Instance, paired with one Provider-side. Everything below belongs to exactly one Connection, which is what lets one Provider serve many PM Instances and
-Owners without mixing them up.
+A **Connection** is one `Provider` on one PM Instance, paired with one Provider-side. Everything below belongs to exactly one Connection, which is what lets one Provider serve many PM Instances and Owners without mixing them up.
 
 The PM-side talks to the Provider-side's `provider-gateway`, at the Provider's **Base URL**, over three channels. Each is a WebSocket with Inner-TLS inside:
 
@@ -165,8 +164,7 @@ The objects, and who writes them:
 
 Two placements matter for what follows:
 - **The Connection Secret never leaves PM's runtime cluster**; the Provider-side keeps only its hash, and the Owner's workspace never holds it.
-- **The `ProviderEndpoint` sits in kcp, next to the shards that use it**, so Connectors keep their Sessions even while PM's runtime cluster or `platform-mesh-operator` is down: outages there delay
-onboarding and changes, not traffic.
+- **The `ProviderEndpoint` sits in kcp, next to the shards that use it**, so Connectors keep their Sessions even while PM's runtime cluster or `platform-mesh-operator` is down: outages there delay onboarding and changes, not traffic.
 
 You don't have to remember all of this, the following sections go through each concept again in bit more detail.
 
@@ -799,22 +797,26 @@ The Provider's operator reconciles a `Cowboy` that a consumer on `nereus` create
 
 #### 10. Changing credentials later
 
-Now we are getting into Day2 ops. Nothing here needs re-onboarding or the other side's people. Most of it runs on its own.
+Now we are getting into Day-2 operations. Nothing here needs re-onboarding or the other side's people. Most of it runs on its own.
 
-We can work on a "runbook" type of document to work out all the actions needed as a follow-up.
+We can work on a "runbook" type of document to work out all the actions needed - see Follow-up items.
 
 ##### Changing the Connection Secret
 
-Triggered on demand (an annotation on the `Provider`), after tampering is detected, or to repair a secret one side lost. **Only through the `ProviderEndpoint`**, never by a call:
+The Connection Secret is only ever changed through the `ProviderEndpoint`, never by a call. That happens:
+- on demand (`providers.platform-mesh.io/rotate-connection-secret` annotation on the `Provider` object),
+- when tampering is detected (PM finds an unexpired pinned certificate that isn't one of its own CAs, which only someone holding the Connection Secret could have pushed),
+- or to repair a secret that one side lost.
 
-1. **`platform-mesh-operator`** generates a new Connection Secret and stores it as `pendingSecret` inside `ProviderEndpointRegistration`'s `Secret`.
-2. **`platform-mesh-operator`** writes its hash into the `ProviderEndpoint.spec.pendingSecretHash`.
+The flow is then:
+1. **`platform-mesh-operator`** generates a new Connection Secret and stores it as `pendingSecret` inside the `ProviderEndpointRegistration`'s `Secret`.
+2. **`platform-mesh-operator`** writes its hash into `ProviderEndpoint.spec.pendingSecretHash`.
 3. **`provider-gateway`**, watching the `ProviderEndpoint` over a Session, sees the new hash and makes it current. The old Connection Secret stops working.
 4. **`platform-mesh-operator`** tries a `GET` with the new Connection Secret; once it works, it makes `pendingSecret` the current one and clears `pendingSecretHash`.
 
-Why this way: if a Control Call could change the secret, whoever held the current one could simply replace it and lock PM out. This way no call, Onboarding Token or portal account can change it: the `ProviderEndpoint` can only be written by `platform-mesh-operator` (kcp enforces it), and only reaches the Provider-side through a verified Session. Sessions themselves never use the Connection Secret, so traffic isn't affected.
+Why this way: changing the Connection Secret needs more than the Connection Secret. The new hash must come from the `ProviderEndpoint`, which only `platform-mesh-operator` can write (kcp enforces it), over a verified Session. So no Onboarding Token, portal account or Provider Administrator can change it. Sessions never use the Connection Secret, so traffic isn't affected.
 
-The one exception is a Connection Secret **leaked from the PM-side:** with it, someone could lock PM out of that one Connection, but without gaining any kcp access (see Appendix). In any case, a leak on the level of a PM runtime cluster has an impact of its own.
+The one weak spot is a **Connection Secret leaked from the PM-side.** With it, an attacker could push a Pinned Bundle with their own CA and, through a Session under it, change the secret, locking PM out of that one Connection, without gaining any kcp access. `platform-mesh-operator` checks the Pinned Bundle on every poll and reverts such a change if it notices first (see Appendix). Such a leak needs its own response anyway, like any other PM-side secret leak.
 
 ##### Connector Certificates: every 12 hours
 
@@ -825,7 +827,7 @@ The one exception is a Connection Secret **leaked from the PM-side:** with it, s
 1. **cert-manager** renews the Connector CA, with a new key.
 2. **`platform-mesh-operator`** sees the new CA certificate (in cert-manager's `CertificateRequest`s), adds it to the Connector CA Set, and pushes the set (old and new CA) to every Connection with `PUT .../connector-ca-set`. It reports progress in the `ConnectorCASet` object.
 3. **Connectors** switch to a certificate from the new CA only once every reachable Connection trusts it (`Converged`).
-4. Once every Connector has switched to the new CA, platform-mesh-operator drops the old CA from each Connection, spread over time; provider-gateway closes Sessions still using old-CA certificates gracefully, and the Connectors reopen them at once.
+4. Once every Connector has switched to the new CA, **`platform-mesh-operator`** drops the old CA from each Connection, spread over time; **`provider-gateway`** closes Sessions still using old-CA certificates gracefully, and the Connectors reopen them at once.
 
 A Provider that was down during a Rollover is caught up by its first successful Control Call, whatever it missed: Control Calls don't depend on the Connector CA.
 
@@ -833,8 +835,27 @@ A Provider that was down during a Rollover is caught up by its first successful 
 
 **Who: the Provider Administrators** create a new `ServerKey`. **`provider-gateway`** announces it in `GET`; **`platform-mesh-operator`** adds it to the `ProviderEndpointRegistration` and the `ProviderEndpoint`; **`provider-gateway`** switches each Connection to it once that Connection's `ProviderEndpoint` lists it. The administrators then retire the old key. Keys are never re-fetched over plain HTTPS, where the Edge could swap them.
 
-This *can* be made into an automatic rollover as a follow up - may be required by compliance by some Providers.
+This can be made into an automatic rollover as a follow-up; some Providers may need it for compliance.
 
+#### 11. Offboarding
+
+**Who: the Owner** deletes the `Provider`.
+
+**Who: `platform-mesh-operator`**, in one finalizer, in this order:
+1. **Deletes the `ProviderEndpoint`.** Every Connector stops seeing it and closes its Sessions. The Provider-side's kcp access ends here, immediately, whatever happens next.
+2. **Calls `DELETE`** over a Control Session, with bounded retries. An unreachable Provider doesn't block deletion: access is already gone.
+3. **Deletes the `ProviderEndpointRegistration`** and its `Secret` (the Connection Secret).
+4. **Removes the Connector RBAC, the policies and the `providerendpoints.platform-mesh.io` binding**, then **the SA and the Provider Workspace**.
+
+**Who: `provider-gateway`**, on `DELETE`, deletes the `Connection`: its finalizer closes any remaining Sessions, deletes the kubeconfig `Secret`, and emits `Removed`.
+
+**Who: the Provider's operator** sees the kubeconfig `Secret` go and stops reconciling that Connection. It doesn't delete its consumers' external resources because a Connection went away; only deleting a kcp object does that.
+
+**Nothing to revoke afterwards.** No kcp token was ever handed out, so none survives the SA's deletion.
+
+Two related cases:
+- **Abandoning a Connection** (`providers.platform-mesh.io/abandon-connection=<connectionID>` on the `Provider`, for a Provider-side that's gone for good) runs steps 1–3 but keeps the workspace and the consumers' bindings, so the Owner can onboard the same `Provider` again, against a new Provider-side.
+- **Deleting the Connection on the Provider-side** (in the portal) makes every later call answer "unknown"; the `Provider` shows `ConnectionUnknown`, and the Owner can onboard again.
 
 ---------
 
