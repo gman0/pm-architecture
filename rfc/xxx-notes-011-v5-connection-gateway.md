@@ -71,7 +71,7 @@ stringData:
     clusters:
     - name: workspace
       cluster:
-        server: https://front-proxy.pm.invalid/clusters/2x8k9abc   # placeholder; never resolved
+        server: https://front-proxy.pm.invalid/clusters/3y9j0def   # placeholder; never resolved
         proxy-url: https://c-7f3k9q2mx8w4:<credential>@gateway.wild-west-system.svc:3128
         tls-server-name: gateway.wild-west-system.svc            # verify every handshake against the gateway's name
         certificate-authority-data: <the gateway's serving certificate (self-signed), or its CA>
@@ -145,7 +145,7 @@ stringData:
     clusters:
     - name: workspace
       cluster:
-        server: https://gateway.wild-west-system.svc/connections/c-7f3k9q2mx8w4/workspace/clusters/2x8k9abc
+        server: https://gateway.wild-west-system.svc/connections/c-7f3k9q2mx8w4/workspace/clusters/3y9j0def
         certificate-authority-data: <the gateway's CA>
     users:
     - name: connection
@@ -160,8 +160,8 @@ stringData:
 - **Several Connections**: one kcp provider per Connection, composed with cluster names prefixed by `connectionID`. multicluster-runtime has providers for composing providers by prefix and for discovering clusters from kubeconfig `Secret`s; their exact APIs at v0.23 are to confirm.
 
 **Clients for the virtual-workspace URLs, step by step** (kcp-multicluster-provider `fa033a7`):
-1. **The provider reads the endpoint slice through the gateway.** `provider.NewProvider(cfg, sliceName, opts)` gets the Connection's kubeconfig config, whose `Host` is the gateway's workspace URL, `https://gateway.<ns>.svc/connections/c-7f…/workspace/clusters/2x8k9abc`, and builds a cache for that one `APIExportEndpointSlice`, selected by name (`pkg/provider/provider.go`). The gateway strips `/connections/c-7f…/workspace` and relays the rest over any Session, to the front-proxy.
-2. **The slice lists kcp's real URLs**, e.g. `https://root.kcp.example.com/services/apiexport/2x8k9abc/cowboys` and `https://nereus.kcp.example.com/services/apiexport/2x8k9abc/cowboys`.
+1. **The provider reads the endpoint slice through the gateway.** `provider.NewProvider(cfg, sliceName, opts)` gets the Connection's kubeconfig config, whose `Host` is the gateway's workspace URL, `https://gateway.<ns>.svc/connections/c-7f…/workspace/clusters/3y9j0def`, and builds a cache for that one `APIExportEndpointSlice`, selected by name (`pkg/provider/provider.go`). The gateway strips `/connections/c-7f…/workspace` and relays the rest over any Session, to the front-proxy.
+2. **The slice lists kcp's real URLs**, e.g. `https://root.kcp.example.com/services/apiexport/3y9j0def/cowboys` and `https://nereus.kcp.example.com/services/apiexport/3y9j0def/cowboys`.
 3. **The URL function maps them to the gateway.** On every slice update the provider calls `opts.ExtractURLsFromEndpointSlice(obj)` (`endpointSliceUpdate`); the default reads `status.endpoints[].url` (`pkg/provider/condition.go`). The provider package wraps it:
    ```go
    func gatewayURLs(gatewayBase, connectionID string) func(client.Object) ([]string, error) {
@@ -183,9 +183,9 @@ stringData:
        }
    }
    ```
-   giving `https://gateway.<ns>.svc/connections/c-7f…/vw/nereus.kcp.example.com/services/apiexport/2x8k9abc/cowboys`, and the same for `root`.
+   giving `https://gateway.<ns>.svc/connections/c-7f…/vw/nereus.kcp.example.com/services/apiexport/3y9j0def/cowboys`, and the same for `root`.
 4. **A config per endpoint, copied from the workspace config.** For each new URL the provider does `cfg := rest.CopyConfig(p.config); cfg.Host = url` (`endpointSliceUpdate`). The copy keeps the gateway's CA and the Connection's bearer token, which the gateway expects for these URLs too.
-5. **Watches across consumer clusters.** `NewWildcardCache` appends `/clusters/*` to `Host` (`pkg/cache/wildcard.go`), so informers list and watch `https://gateway…/connections/c-7f…/vw/nereus.kcp…/services/apiexport/2x8k9abc/cowboys/clusters/*/apis/wildwest.dev/v1alpha1/cowboys?watch=true`. The gateway strips `/connections/c-7f…/vw/nereus.kcp…`, picks a Session serving `nereus.kcp…`, and relays `/services/apiexport/2x8k9abc/cowboys/clusters/*/apis/…` with `Host: nereus.kcp…`; the Connector routes it by path to its shard's virtual workspace, which accepts it because `Host` is its own.
+5. **Watches across consumer clusters.** `NewWildcardCache` appends `/clusters/*` to `Host` (`pkg/cache/wildcard.go`), so informers list and watch `https://gateway…/connections/c-7f…/vw/nereus.kcp…/services/apiexport/3y9j0def/cowboys/clusters/*/apis/wildwest.dev/v1alpha1/cowboys?watch=true`. The gateway strips `/connections/c-7f…/vw/nereus.kcp…`, picks a Session serving `nereus.kcp…`, and relays `/services/apiexport/3y9j0def/cowboys/clusters/*/apis/…` with `Host: nereus.kcp…`; the Connector routes it by path to its shard's virtual workspace, which accepts it because `Host` is its own.
 6. **A client per consumer cluster.** When a consumer's `APIBinding` shows up through that endpoint, the provider engages it with `NewScopedCluster`, which joins `/clusters/<consumer>` onto the endpoint's `Host` (`pkg/cache/cluster.go`). Writes, discovery and Events for that consumer use that URL, through the same gateway path; reads come from the wildcard cache.
 
 **One transport for all of them**: every config here has the same TLS settings (the gateway's CA) and no `Proxy`, so client-go's cache gives them one transport and one connection pool to the gateway; the bearer token is added by a wrapper, not part of the cache key. On its side, the gateway can reuse Streams to the Connector for requests of the same Connection and host.

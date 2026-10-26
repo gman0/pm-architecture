@@ -43,7 +43,7 @@ metadata:
 spec:
   registration:                                # immutable as a whole
     owner: alice@example.com                   # selectable field
-    clusterName: 2x8k9abc
+    clusterName: 3y9j0def
     unusedExpiresAt: "2026-10-23T10:00:00Z"    # removed if never reached by then; empty on imports
   pinnedBundle: |                              # the Pinned Bundle, PEM; PM push or administrator re-pin
     -----BEGIN CERTIFICATE-----
@@ -133,7 +133,9 @@ RBAC in the SDK's namespace:
 
 ## Kubeconfig per Connection
 
-`provider-gateway` writes one kubeconfig `Secret` per Connection into its own namespace, the SDK's, labelled with the `connectionID`. `provider-gateway` writes `Secret`s nowhere else; the Provider's operator reads them through a Role the Provider adds there (`get`, `list`, `watch` on `secrets`). It represents the Connection, not its Sessions: created with the `Connection` at Registration or import, deleted with it, unchanged while Sessions come and go. Whether Sessions are up is the `Connection`'s `Ready`.
+`provider-gateway` writes one kubeconfig `Secret` per Connection into its own namespace, the SDK's, labelled with the `connectionID`. `provider-gateway` writes `Secret`s nowhere else; the Provider's operator reads them through a Role the Provider adds there (`get`, `list`, `watch` on `secrets`). It represents the Connection, not its Sessions: created on the Connection's **first verified Session** (after Registration or an import), deleted with the `Connection`, and unchanged while Sessions come and go afterwards. Whether Sessions are up is the `Connection`'s `Ready`.
+
+**Why on the first Session, not at Registration**: the operator only ever sees Connections that have worked at least once, and the first thing it sees, the `Secret` appearing, works at once. A Connection that never gets a Session (PM didn't store the Registration's result, an Edge blocks Sessions) never has a `Secret`, so the operator never builds clients that only fail; orphan expiry removes such a Connection anyway. Sessions that drop later still have to be handled: the operator then gets the "no Session" error (see "Operator proxy").
 
 ```yaml
 apiVersion: v1
@@ -146,7 +148,7 @@ metadata:
     provider-sdk.platform-mesh.io/connection: c-7f3k9q2mx8w4
     app.kubernetes.io/managed-by: provider-gateway
   annotations:
-    provider-sdk.platform-mesh.io/cluster-name: 2x8k9abc
+    provider-sdk.platform-mesh.io/cluster-name: 3y9j0def
 stringData:
   kubeconfig: |
     apiVersion: v1
@@ -154,7 +156,7 @@ stringData:
     clusters:
     - name: c-7f3k9q2mx8w4
       cluster:
-        server: https://front-proxy.pm.invalid/clusters/2x8k9abc     # placeholder for the Provider Workspace; never resolved
+        server: https://front-proxy.pm.invalid/clusters/3y9j0def     # placeholder for the Provider Workspace; never resolved
         proxy-url: https://c-7f3k9q2mx8w4:<credential>@provider-gateway.wild-west-system.svc:3128
         tls-server-name: provider-gateway.wild-west-system.svc       # every handshake verified against the gateway's name
         certificate-authority-data: <provider-gateway's CA>
@@ -171,6 +173,7 @@ stringData:
 - **A credential for `provider-gateway` only**, in the proxy URL: generated with the `Connection`, kept as a hash in its status, useless anywhere else, never sent to PM.
 - **No kcp credential, no kcp CA, no kcp hostname** other than the placeholder.
 - **Changes** only when the `Connection` is created or deleted, when the proxy credential is rotated, or when the CA's trust bundle changes, which is a rare, deliberate operation (see "Operator proxy"). Renewing the serving certificate changes nothing.
+- **A deleted `Secret` is recreated** (for a Connection that has had a verified Session) by the `Connection` controller, which watches the `Secret`s by their label, with a new proxy credential: the old one can't be recovered from `proxyCredentialHash`, so it stops working at once. Open tunnels keep running; new `CONNECT`s with the old credential get `407` until the operator loads the new `Secret`, which an operator watching the `Secret`s does on its own. Nothing reaches the PM-side: the proxy credential is local to the Provider.
 
 ## Components
 
@@ -183,7 +186,7 @@ Serves the three endpoints under the Base URL. It **routes by the path below `/v
 2. **Accept the WebSocket** and run the Inner TLS server with the token's `ServerKey`, ALPN `pm-register/1`.
 3. **Verify `tokenSecret`** against `tokenHash`, constant-time.
 4. **Apply the idempotency rules**: a retry with the same idempotency key, `secretHash` and `clusterName` gets the stored answer; a different one is refused; a changed Connector CA Set on a retry is ignored ([01 Protocol, "Registration"](./xxx-notes-011-v5-impl-01-protocol.md)).
-5. **Spend the token and create the `Connection`** (Owner, `clusterName`, `unusedExpiresAt`, Connection Secret hash, the Pinned Bundle, the Server Keys returned), with its proxy credential and kubeconfig `Secret`, then return `connectionID`, Server Keys and `unusedExpiresAt`.
+5. **Spend the token and create the `Connection`** (Owner, `clusterName`, `unusedExpiresAt`, Connection Secret hash, the Pinned Bundle, the Server Keys returned), then return `connectionID`, Server Keys and `unusedExpiresAt`.
 
 **Orphan expiry**: a `Connection` with an empty `lastSeen` at its `unusedExpiresAt` is deleted, after a fresh, uncached read confirms `lastSeen` is still empty. It's meant for a Registration whose result PM never stored; it also removes a Connection PM stored but never reached within the window, which loses nothing, since it never had a Session. A Connection that was used once is never expired for being idle, however long its Provider or PM is away. An imported `Connection`, without `unusedExpiresAt`, is never expired.
 
@@ -211,15 +214,16 @@ The `ProviderEndpoint` is trusted because of how it arrives: over a Session whos
 2. **Accept the WebSocket** and run the **Inner TLS server**, requiring a client certificate issued directly by a CA in the Connection's Pinned Bundle, with the `clientAuth` EKU ([01 Protocol, "Inner layer"](./xxx-notes-011-v5-impl-01-protocol.md)). A short timeout covers the whole handshake.
 3. **Read the Hello**; close the Session unless its `connectionID` is the path's `{id}` and its `clusterName` is the Connection's. This check is essential, not defense in depth: one Connector Certificate serves every Connection of a PM Instance ([01 Protocol, "Hello"](./xxx-notes-011-v5-impl-01-protocol.md)).
 4. **Start yamux**; register the Session under its Connection, with the virtual-workspace hosts it serves (from the Hello's `hosts`). Every Session also serves the Provider Workspace.
-5. **Honour go-away**: stop opening Streams on a Session the Connector is replacing.
-6. **Close all Sessions** of a Connection that's deleted.
-7. **Re-check open Sessions when the Pinned Bundle changes** (a push or a re-pin): a Session whose client certificate, kept from its handshake, no longer chains to a CA in the new bundle gets go-away, a short grace period for in-flight requests (e.g. 30 seconds, configurable), then is closed. Only the issuer counts, not the certificate's expiry. This ends Sessions opened with a leaked CA or Connector Certificate key once PM drops it; why it matters, and its limits, are in [01 Protocol, "Pinned Bundle"](./xxx-notes-011-v5-impl-01-protocol.md).
+5. **On the Connection's first verified Session**, generate its proxy credential (its hash into `proxyCredentialHash`) and write its kubeconfig `Secret`, if there isn't one yet (see "Kubeconfig per Connection").
+6. **Honour go-away**: stop opening Streams on a Session the Connector is replacing.
+7. **Close all Sessions** of a Connection that's deleted.
+8. **Re-check open Sessions when the Pinned Bundle changes** (a push or a re-pin): a Session whose client certificate, kept from its handshake, no longer chains to a CA in the new bundle gets go-away, a short grace period for in-flight requests (e.g. 30 seconds, configurable), then is closed. Only the issuer counts, not the certificate's expiry. This ends Sessions opened with a leaked CA or Connector Certificate key once PM drops it; why it matters, and its limits, are in [01 Protocol, "Pinned Bundle"](./xxx-notes-011-v5-impl-01-protocol.md).
 
 ### Operator proxy
 
 How the Provider's operator reaches kcp: an in-cluster HTTPS forward proxy, `provider-gateway`'s Service on a separate port, which only the active replica serves.
 1. **`CONNECT host:443`** from client-go, with `Proxy-Authorization: Basic` from the kubeconfig's proxy URL. The credential names the Connection and is checked against `proxyCredentialHash`; a wrong or missing one is refused with `407`, an unknown Connection with `404`.
-2. **Pick a Session**: for the workspace placeholder, any Session of the Connection; for a virtual-workspace host, a Session whose Hello announced it. A host no Session of that Connection serves is refused with `404`; no Session at the moment gets `503`, and client-go retries.
+2. **Pick a Session**: for the workspace placeholder, any Session of the Connection; for a virtual-workspace host, a Session whose Hello announced it. A host no Session of that Connection serves is refused with `404`; no Session at the moment gets `503` with a message saying so ("no Session for Connection c-…"), so it shows in the operator's logs as what it is, and client-go retries.
 3. **Open a Stream** on that Session and answer `200`.
 4. **Terminate the TLS inside the tunnel** with `provider-gateway`'s own serving certificate. client-go verifies it against the kubeconfig's `tls-server-name`, the gateway's own name, so one certificate covers every host. ALPN is `http/1.1` only: a Stream carries one HTTP/1.1 connection to the Connector, whose server doesn't speak h2c.
 5. **Copy bytes** both ways between the tunnel and the Stream, without parsing HTTP. The Connector routes, authorizes and adds the SA token as for any Stream ([05 Connector, "Request pipeline"](./xxx-notes-011-v5-impl-05-connector.md)); its responses, refusals included, pass through unchanged.
@@ -265,7 +269,7 @@ Prometheus collectors on `provider-gateway`'s metrics endpoint, with a `ServiceM
 
 Runbooks for Provider Administrators, for cases no protocol call can fix safely. Everything is `kubectl` on the resources; `provider-gateway`'s controllers react. Inputs are exchanged out-of-band with the PM Administrators.
 - **Re-pin a Connection's Pinned Bundle**, when no Session verifies (for example, a bundle that missed a whole Rollover while the Connection also lost its Connection Secret): edit `spec.pinnedBundle`. Once Sessions work again, PM repairs the Connection Secret through the `ProviderEndpoint`.
-- **Import a Connection** after the Provider-side lost its state: apply a `Connection` with its `connectionID`, Owner, `clusterName` and the Pinned Bundle. No Connection Secret hash: `platform-mesh-operator` notices the failed authentication and changes the Connection Secret through the `ProviderEndpoint`. New Server Keys go to PM Administrators, since PM never fetches them over plain HTTPS. `provider-gateway` writes the Connection's kubeconfig `Secret` anew.
+- **Import a Connection** after the Provider-side lost its state: apply a `Connection` with its `connectionID`, Owner, `clusterName` and the Pinned Bundle. No Connection Secret hash: `platform-mesh-operator` notices the failed authentication and changes the Connection Secret through the `ProviderEndpoint`. New Server Keys go to PM Administrators, since PM never fetches them over plain HTTPS. `provider-gateway` writes the Connection's kubeconfig `Secret` anew, on its first verified Session after the import.
 - **Move to a new Base URL**: serve the Connection API under the new URL as well, then ask the PM Administrators to change each Connection's Base URL ([03 Operator, "Writing ProviderEndpoints"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)); if the new hostname's certificate comes from a different private CA, tell Owners to add it to their `caBundle` first. Stop serving the old URL once no Session arrives there.
 - **Rotate the Server Key**:
   1. create a new `ServerKey`, a manifest with just `generateName: sk-` (`kubectl create`);

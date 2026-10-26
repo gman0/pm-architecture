@@ -76,7 +76,7 @@ Some things exist before any Owner does anything.
 
 > **Concept: fingerprint.** A public key is a few hundred bytes. Its **fingerprint** is a SHA-256 hash of it, short enough to put in a token: `key-sha256:<hex>`. Two keys with the same fingerprint are, in practice, the same key. (Technically the hash is over the key's standard encoding, the `SubjectPublicKeyInfo` or **SPKI**.)
 
-**Who: the Provider's operator** is deployed and waiting. It will find Connections as kubeconfig `Secret`s that `provider-gateway` writes (step 4).
+**Who: the Provider's operator** is deployed and waiting. It will find Connections as kubeconfig `Secret`s that `provider-gateway` writes once a Connection's first Session is up (step 7e).
 
 ---
 
@@ -149,7 +149,7 @@ spec:
 
 **3a. Create the Provider Workspace** `:root:providers:wildwest-<Alice's workspace ID>`, and in it a ServiceAccount `default/provider` with admin rights there (condition `Workspace`). That SA is the identity the Provider will act as in kcp, but the Provider never gets a credential for it: the Connectors will use it on the Provider's behalf (step 9).
 
-> **Concept: Provider Workspace.** A workspace PM creates for each `Provider`. The Provider is admin there and creates its APIExport (the service it offers) in it. It lives on one shard, its **Hosting Shard**; in the example, `root`, with logical cluster name `2x8k9abc`.
+> **Concept: Provider Workspace.** A workspace PM creates for each `Provider`. The Provider is admin there and creates its APIExport (the service it offers) in it. It lives on one shard, its **Hosting Shard**; in the example, `root`, with logical cluster name `3y9j0def`.
 
 **3b. Bind the Connection Export** into the Provider Workspace (condition `ConnectionBinding`).
 
@@ -175,7 +175,7 @@ Then it grants the Connectors' group exactly two rights in the workspace: `acces
 
 > **Concept: ServiceAccount tokens and TokenRequest.** A ServiceAccount (SA) is a non-human identity. A client proves it's that SA with a **token**: a signed, short-lived bearer credential. **TokenRequest** is the API call that mints one (`create` on `serviceaccounts/token`). Granting it to the Connectors means they can act as the Provider's SA, minting a fresh token whenever they need one, without any token ever being stored or sent to the Provider.
 
-**3d. Read the workspace's logical cluster name** (`2x8k9abc`) from kcp. The Provider-side will know the workspace only by this name.
+**3d. Read the workspace's logical cluster name** (`3y9j0def`) from kcp. The Provider-side will know the workspace only by this name.
 
 **3e. Check the request** (the `Registered` step begins). Remote Providers are installed (otherwise `RemoteProvidersNotReady`); the `Provider` exists (otherwise `ProviderNotFound`, until the Owner creates it); it's remote and not yet registered; the token `Secret` exists, parses, and its ID equals `spec.tokenID`; the Base URL passes the egress rules (step 4). The token `Secret` is read by name, never cached: `platform-mesh-operator` keeps no copies of other people's `Secret`s in memory.
 
@@ -201,14 +201,14 @@ sequenceDiagram
     G->>O: certificate for the token's Server Key
     Note over O: key fingerprint == keyfp from the token?
     O->>G: R5: POST /v1/connections, Bearer tokenSecret,<br/>clusterName, secretHash, Connector CA Set
-    Note over G: R6: check secret, spend token,<br/>create Connection, kubeconfig Secret
+    Note over G: R6: check secret, spend token,<br/>create Connection
     G-->>O: 201 connectionID, serverKeys, unusedExpiresAt
     Note over O: R7: persist, delete token data,<br/>request → Registered
 ```
 
 ### R1. `platform-mesh-operator` writes before it sends
 
-**Who: `platform-mesh-operator`.** It creates a `ProviderEndpointRegistration` named `2x8k9abc` in its own namespace in PM's runtime cluster, and generates the **Connection Secret** into a `Secret` next to it. The request's phase becomes `Registering`.
+**Who: `platform-mesh-operator`.** It creates a `ProviderEndpointRegistration` named `3y9j0def` in its own namespace in PM's runtime cluster, and generates the **Connection Secret** into a `Secret` next to it. The request's phase becomes `Registering`.
 
 > **Concept: Connection Secret.** The bearer credential with which `platform-mesh-operator` authenticates its later calls to the Provider-side (Control Calls, step 5). A prefix plus 256 random bits, `pmc1_<base64url>`; the prefix lets secret scanners spot leaks. PM generates it, keeps it only in its runtime cluster (never in kcp, never in the Owner's workspace). At Registration it sends only the **hash**, which is all the Provider-side stores; afterwards it presents the secret itself on each Control Call, inside the Inner TLS. Only PM can change it (step 10).
 
@@ -276,7 +276,7 @@ POST /v1/connections
 Authorization: Bearer <tokenSecret>
 {
   "idempotencyKey": "<the request's UID>",
-  "clusterName":    "2x8k9abc",
+  "clusterName":    "3y9j0def",
   "secretHash":     "sha256:<hash of the Connection Secret>",
   "connectorCASet": "<PEM: the Connector CA certificates>"
 }
@@ -295,7 +295,7 @@ Authorization: Bearer <tokenSecret>
 3. Parses the Connector CA Set strictly: only CA certificates, at least one unexpired, nothing else.
 4. Marks the token **spent**, atomically, so it can't be used twice.
 5. Creates the `Connection` object: `connectionID`, the Owner's account, `clusterName`, the Pinned Bundle, the Connection Secret's hash, the Server Keys it hands out, and `unusedExpiresAt` (the end of the token's retry window, its expiry plus 7 days: if nothing ever reaches this Connection by then, it's removed, see step 5).
-6. Creates a **kubeconfig `Secret`** for the Connection, for the Provider's operator (step 9), and emits a `Registered` Event, so the Provider can tell its customer.
+6. Emits a `Registered` Event, so the Provider can tell its customer. There's no kubeconfig for the Provider's operator yet: it comes with the first Session (step 7e).
 7. Answers `201 { connectionID, serverKeys, unusedExpiresAt }`.
 
 Apart from the token secret, which is now spent, nothing in the request or the response is a usable secret: a hash, public CA certificates, public keys and IDs.
@@ -310,7 +310,7 @@ Apart from the token secret, which is now spent, nothing in the request or the r
 3. Deletes the token data from Alice's `Secret`: a spent token shouldn't linger in backups or Git.
 4. Marks the request `Registered`. The request is done; everything after is reported on the `Provider`.
 
-**Who: the Provider's operator** notices the new kubeconfig `Secret`, but can't do anything useful with it yet: no Session exists.
+**Who: the Provider's operator** sees nothing yet: no kubeconfig `Secret` exists until the Connection has a Session.
 
 ---
 
@@ -358,7 +358,7 @@ So a Connection never gets Sessions unless its control path has worked at least 
 **Who: `platform-mesh-operator`.** It re-checks the Base URL against the egress rules, then writes, through the Connection Export, into the Provider Workspace:
 
 ```yaml
-kind: ProviderEndpoint                # in 2x8k9abc, PM-written only
+kind: ProviderEndpoint                # in 3y9j0def, PM-written only
 metadata: { name: default }
 spec:
   connectionID: c-7f3k9q2mx8w4
@@ -392,7 +392,7 @@ From here on, `platform-mesh-operator` is no longer involved in traffic. The Con
 
 ### 7b. The Connector dials
 
-**Who: each replica of `root`'s Connector.** Egress checks as in R2; outer TLS verified with the `ProviderEndpoint`'s `caBundle` or web PKI; WebSocket upgrade to `/v1/connections/c-7f3k9q2mx8w4/session`, without credentials.
+**Who: each replica of `root`'s Connector.** Egress checks as in R2; outer TLS verified with the `ProviderEndpoint`'s `caBundle` or web PKI; WebSocket upgrade to `/v1/connections/c-7f3k9q2mx8w4/session`, without credentials. Each replica dials on its own, so the Provider sees one Session per replica, typically two or three per shard.
 
 **Who: `provider-gateway`.** Refuses unknown Connection IDs before the upgrade, caps handshakes in progress, then accepts. If this replica is a standby, it answers `503` with `Retry-After: 5` instead, and the Connector tries again; only the leader holds Sessions.
 
@@ -432,7 +432,7 @@ This time **both** sides prove who they are.
 **Who: the Connector**, as the first message inside the Inner TLS:
 
 ```json
-{ "connectionID": "c-7f3k9q2mx8w4", "clusterName": "2x8k9abc",
+{ "connectionID": "c-7f3k9q2mx8w4", "clusterName": "3y9j0def",
   "hosts": ["root.kcp.example"], "sub": "<opaque, for audit>" }
 ```
 
@@ -442,17 +442,59 @@ This time **both** sides prove who they are.
 
 ### 7e. The Session is live
 
-**Who: both.** yamux starts. `provider-gateway` adds the Session to its in-memory table for the Connection: "serves the Provider Workspace, and `root.kcp.example`". Each Connector replica opens its own Session, so the Provider sees two or three per shard.
+**Who: the Connector** starts yamux on the Session and waits for Streams. It never opens Streams itself; it only accepts them, and treats each one as an HTTP connection to forward to kcp (step 9).
 
-**Who: `provider-gateway`** now watches its `ProviderEndpoint` over this Session (through a Stream, like any request, see step 9). It trusts what it reads because of how it arrives: through a Session that passed the Inner TLS and the Hello, from an object only PM can write, naming this Connection.
+**Who: `provider-gateway`** starts yamux on its side and adds the Session to its in-memory table for the Connection. The Session serves:
+- the Provider Workspace, through the front-proxy, which every Session of a Connection serves;
+- the hosts from the Hello: here `root.kcp.example`.
 
-**Who: the Provider's operator** can now reach its Provider Workspace through the kubeconfig `Secret`, and its bootstrap creates its APIExport (`cowboys`), its schemas and its APIExportEndpointSlice in `2x8k9abc`.
+From now on, whenever a request for one of those hosts comes in, `provider-gateway` picks a Session that serves it and opens a Stream on it.
+
+**Who: `provider-gateway`**, as its first own request over the Session, watches the Connection's `ProviderEndpoint`. It opens a Stream like any other client, and the Connector forwards the request to kcp (step 9). It trusts what it reads because of how it arrives: over a Session that passed the Inner TLS and the Hello, from an object only PM can write, naming this Connection.
+
+**Who: `provider-gateway`**, since this is the Connection's first verified Session, creates the Connection's **kubeconfig `Secret`** in its own namespace (`wild-west-system`), with a proxy credential for this Connection. It keeps it for the Connection's life, while Sessions come and go, and deletes it with the `Connection`. A Connection that never gets a Session never gets a `Secret`, so the Provider's operator only ever sees Connections that work.
+
+```yaml
+apiVersion: v1
+kind: Secret
+type: Opaque
+metadata:
+  name: connection-c-7f3k9q2mx8w4
+  namespace: wild-west-system                        # provider-gateway's namespace
+  labels:
+    provider-sdk.platform-mesh.io/connection: c-7f3k9q2mx8w4
+    app.kubernetes.io/managed-by: provider-gateway
+  annotations:
+    provider-sdk.platform-mesh.io/cluster-name: 3y9j0def
+stringData:
+  kubeconfig: |
+    apiVersion: v1
+    kind: Config
+    clusters:
+    - name: c-7f3k9q2mx8w4
+      cluster:
+        server: https://front-proxy.pm.invalid/clusters/3y9j0def    # placeholder for the Provider Workspace; never resolved
+        proxy-url: https://c-7f3k9q2mx8w4:<password>@provider-gateway.wild-west-system.svc:3128
+        tls-server-name: provider-gateway.wild-west-system.svc      # TLS is checked against the gateway, not kcp
+        certificate-authority-data: <provider-gateway's CA>
+    users:
+    - name: c-7f3k9q2mx8w4
+      user: {}                                       # empty: the Connector adds the SA token towards kcp
+    contexts:
+    - name: c-7f3k9q2mx8w4
+      context: { cluster: c-7f3k9q2mx8w4, user: c-7f3k9q2mx8w4 }
+    current-context: c-7f3k9q2mx8w4
+```
+
+Everything goes through `provider-gateway`: the `server` is a placeholder, and there's no kcp credential (step 9 explains how requests travel).
+
+**Who: the Provider's operator** sees the new `Secret`, through a Role the Provider adds in `wild-west-system`, and can now reach its Provider Workspace through it. Its bootstrap creates its APIExport (`cowboys`), its schemas and its APIExportEndpointSlice in `3y9j0def`.
 
 ### 7f. Later: a consumer on another shard
 
 **Who: a consumer** in some workspace on `nereus` binds the `cowboys` export.
 
-**Who: kcp** adds `https://nereus.kcp.example/services/apiexport/2x8k9abc/cowboys/` to the export's endpoint slice.
+**Who: kcp** adds `https://nereus.kcp.example/services/apiexport/3y9j0def/cowboys/` to the export's endpoint slice.
 
 **Who: `nereus`'s Connector** sees that slice through the Connection Export's permission claim, checks that it's in the Provider Workspace, for an export in that same workspace, and lists its own shard. Each of its replicas then opens a Session exactly as in 7b–7e, with `hosts: ["nereus.kcp.example"]`.
 
@@ -483,8 +525,8 @@ The Provider's operator reconciles a `Cowboy` that a consumer on `nereus` create
 
 > **Concept: forward proxy and `CONNECT`.** A client configured with a proxy doesn't connect to the server directly. It connects to the proxy and asks `CONNECT host:443`; the proxy opens a path to that host and answers `200`; from then on the client talks through the proxy as if directly. client-go supports this through `proxy-url` in a kubeconfig.
 
-> **Concept: the kubeconfig per Connection.** What `provider-gateway` wrote in R6:
-> - `server`: `https://front-proxy.pm.invalid/clusters/2x8k9abc`, a placeholder host that's never looked up;
+> **Concept: the kubeconfig per Connection.** What `provider-gateway` wrote in step 7e:
+> - `server`: `https://front-proxy.pm.invalid/clusters/3y9j0def`, a placeholder host that's never looked up;
 > - `proxy-url`: `provider-gateway`'s in-cluster address, with a password for this Connection;
 > - `tls-server-name`: `provider-gateway`'s own name, so client-go checks TLS against the gateway's certificate, not kcp's;
 > - no user credentials: towards kcp, the Connector adds them.
@@ -492,7 +534,7 @@ The Provider's operator reconciles a `Cowboy` that a consumer on `nereus` create
 > kcp-multicluster-provider reads the export's endpoint slice and derives a config per URL by changing only the host, so every request, to the workspace or to any shard's virtual workspace, goes through `provider-gateway`.
 
 **Outbound:**
-1. **The Provider's operator** (client-go) wants `GET https://nereus.kcp.example/services/apiexport/2x8k9abc/cowboys/clusters/<consumer>/…/cowboys/billy`. It connects to `provider-gateway` and sends `CONNECT nereus.kcp.example:443` with the Connection's proxy password.
+1. **The Provider's operator** (client-go) wants `GET https://nereus.kcp.example/services/apiexport/3y9j0def/cowboys/clusters/<consumer>/…/cowboys/billy`. It connects to `provider-gateway` and sends `CONNECT nereus.kcp.example:443` with the Connection's proxy password.
 2. **`provider-gateway`** checks the password (it names the Connection), picks one of that Connection's Sessions whose Hello listed `nereus.kcp.example`, opens a Stream on it, and answers `200`. Then it terminates the TLS that client-go starts inside the tunnel, with its own serving certificate.
 3. **`provider-gateway`** copies the plain HTTP request onto the Stream. On the way to PM it's wrapped in yamux, the Inner TLS, the WebSocket and the outer TLS. The Edge sees only encrypted bytes.
 4. **`nereus`'s Connector** unwraps it and hands the Stream to its built-in HTTP server, which knows which Connection the Session belongs to. Then, for this request:
@@ -586,10 +628,10 @@ sequenceDiagram
     Note over Op: 3. Provider Workspace, binding,<br/>policies (confirmed), Connector RBAC
     Op->>G: 4. Registration (Inner TLS pinned to keyfp)
     G-->>Op: connectionID, Server Keys
-    G->>P: kubeconfig Secret
     Op->>G: 5. first Control Call (Inner TLS, Connection Secret)
     Note over Op: 6. write ProviderEndpoint
     C->>G: 7. Session (mTLS: Connector Certificate ⇄ Server Key, Hello)
+    G->>P: kubeconfig Secret
     P->>G: CONNECT, Stream
     G->>C: requests over the Session
     C->>C: check, add SA token, forward to kcp

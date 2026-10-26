@@ -2,7 +2,7 @@
 
 Working draft, not RFC text. Each step says who acts, what happens and why, in a few lines, then shows the APIs it introduces, trimmed to the fields that carry a design decision. Field names follow `platform-mesh/apis/providers/v1alpha1`, `provider-sdk/api/v1alpha1` and `provider-protocol/connections/v1` as of 2026-10-22.
 
-Running example: Provider "Wild West", Base URL `https://wildwest.example.com/pm`; Owner `alice` in `:root:orgs:acme:alice`; `Provider` `wildwest`; Provider Workspace `2x8k9abc` hosted on shard `root`; a consumer later on shard `nereus`.
+Running example: Provider "Wild West", Base URL `https://wildwest.example.com/pm`; Owner `alice` in `:root:orgs:acme:alice`; `Provider` `wildwest`; Provider Workspace `3y9j0def` hosted on shard `root`; a consumer later on shard `nereus`.
 
 | Step | Who | APIs introduced |
 |---|---|---|
@@ -164,7 +164,7 @@ spec:
 apiVersion: providers.platform-mesh.io/v1alpha1
 kind: ProviderEndpointRegistration    # PM's runtime cluster; authoritative record of one Connection
 metadata:
-  name: 2x8k9abc                      # the Provider Workspace's logical cluster
+  name: 3y9j0def                      # the Provider Workspace's logical cluster
   namespace: platform-mesh-system
 spec:
   connectionID: c-7f3k9q2mx8w4h6j1n5p3r7t9vb
@@ -175,7 +175,7 @@ spec:
 apiVersion: v1
 kind: Secret                          # PM's runtime cluster, never in kcp
 metadata:
-  name: 2x8k9abc-secret
+  name: 3y9j0def-secret
   namespace: platform-mesh-system
 stringData:
   secret: pmc1_…                      # the Connection Secret; the Provider-side stores only its hash
@@ -197,7 +197,7 @@ Authorization: Bearer <tokenSecret>
 
 {
   "idempotencyKey": "<the request's UID>",
-  "clusterName":    "2x8k9abc",
+  "clusterName":    "3y9j0def",
   "secretHash":     "sha256:<hash of the Connection Secret>",
   "connectorCASet": "-----BEGIN CERTIFICATE-----…"
 }
@@ -224,7 +224,7 @@ metadata:
 spec:
   registration:                       # immutable
     owner: alice@example.com
-    clusterName: 2x8k9abc
+    clusterName: 3y9j0def
     unusedExpiresAt: "2026-10-29T09:30:00Z"
   pinnedBundle: |                     # the Connector CA(s) Sessions are verified against
     -----BEGIN CERTIFICATE-----
@@ -250,7 +250,7 @@ stringData:
     clusters:
     - name: c-7f3k9q2mx8w4h6j1n5p3r7t9vb
       cluster:
-        server: https://front-proxy.pm.invalid/clusters/2x8k9abc   # placeholder, never resolved
+        server: https://front-proxy.pm.invalid/clusters/3y9j0def   # placeholder, never resolved
         proxy-url: https://c-7f3k9q2mx8w4h6j1n5p3r7t9vb:<credential>@provider-gateway.wild-west-system.svc:3128
         tls-server-name: provider-gateway.wild-west-system.svc     # TLS to the gateway, not to kcp
         certificate-authority-data: <provider-gateway's CA>
@@ -334,7 +334,7 @@ Inner TLS (ALPN `pm-session/1`), mutual; then the Hello:
 ```json
 {
   "connectionID": "c-7f3k9q2mx8w4h6j1n5p3r7t9vb",
-  "clusterName":  "2x8k9abc",
+  "clusterName":  "3y9j0def",
   "hosts":        [ "nereus.kcp.example" ],
   "sub":          "<opaque, for audit>"
 }
@@ -372,7 +372,7 @@ HTTP/1.1 200 Connection established
 TLS to `provider-gateway`'s own certificate (`tls-server-name`); inside it, on a Stream:
 
 ```http
-GET /services/apiexport/2x8k9abc/cowboys/clusters/<consumer>/apis/wildwest.dev/v1alpha1/namespaces/default/cowboys/billy HTTP/1.1
+GET /services/apiexport/3y9j0def/cowboys/clusters/<consumer>/apis/wildwest.dev/v1alpha1/namespaces/default/cowboys/billy HTTP/1.1
 Host: nereus.kcp.example
                                       # no Authorization: the Connector adds the SA token
 ```
