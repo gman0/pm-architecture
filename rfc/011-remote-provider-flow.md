@@ -588,7 +588,7 @@ sequenceDiagram
     C->>G: 7c: Inner-TLS, both ways<br/>(Connector Certificate ⇄ Server Key)
     C->>G: 7d: Hello (connectionID, clusterName, hosts)
     Note over G: path and Hello match?
-    Note over C,G: 7e: yamux; the Provider-side opens Streams
+    Note over C,G: 7e: yamux, the Provider-side opens Streams
     G->>C: watch ProviderEndpoint (a Stream)
     G->>P: kubeconfig Secret (first Session)
     P->>G: CONNECT → Streams to kcp
