@@ -483,6 +483,20 @@ Before telling the Connectors (remember, that's the PM-side) about the Connectio
 >
 > Each carries the Connection Secret as a bearer credential, inside the Inner-TLS, so the Edge never sees it.
 
+```mermaid
+sequenceDiagram
+    participant O as platform-mesh-operator
+    participant E as Provider's Edge
+    participant G as provider-gateway
+    O->>E: C1: GET /v1/connections/{id}/control<br/>WebSocket upgrade, PM-Server-Key
+    E->>G: forward
+    G-->>O: 101 Switching Protocols
+    O->>G: Inner-TLS (pinned Server Key)
+    O->>G: C2: GET /v1/connections/{id}, Bearer Connection Secret
+    G-->>O: status, Server Keys, Pinned Bundle etag
+    Note over O: C3: act on the answer<br/>(push bundle, Secret Change, …)
+```
+
 ##### C1. `platform-mesh-operator` opens a Control Session
 
 **Who: `platform-mesh-operator`.** Dials as in R2 and opens a WebSocket to `/pm/v1/connections/c-7f3k9q2mx8w4.../control`. The upgrade request contains the fingerprint of the Server Key. `provider-gateway` then looks up a key with that hash, and uses it in the Inner-TLS handshake (in the next step).
@@ -560,6 +574,25 @@ Nothing is sent to the Provider here. The Provider-side reads its `ProviderEndpo
 #### 7. Connectors open Sessions
 
 From here on, `platform-mesh-operator` is no longer involved in traffic. The Connectors take over.
+
+```mermaid
+sequenceDiagram
+    participant C as Connector (root)
+    participant E as Provider's Edge
+    participant G as provider-gateway
+    participant P as Provider's operator
+    Note over C: 7a: ProviderEndpoint arrives through<br/>its own virtual workspace → Session needed
+    C->>E: 7b: GET /v1/connections/{id}/session<br/>WebSocket upgrade (Outer-TLS)
+    E->>G: forward
+    G-->>C: 101 Switching Protocols
+    C->>G: 7c: Inner-TLS, both ways<br/>(Connector Certificate ⇄ Server Key)
+    C->>G: 7d: Hello (connectionID, clusterName, hosts)
+    Note over G: path and Hello match?
+    Note over C,G: 7e: yamux; the Provider-side opens Streams
+    G->>C: watch ProviderEndpoint (a Stream)
+    G->>P: kubeconfig Secret (first Session)
+    P->>G: CONNECT → Streams to kcp
+```
 
 ##### 7a. Connectors notice the `ProviderEndpoint`
 
