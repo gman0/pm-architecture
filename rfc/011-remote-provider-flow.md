@@ -13,11 +13,11 @@ title: Remote Providers flow
 
 ## Summary
 
-Remote Provider flow support for lifecycling third-party Providers. Defines APIs, protocols, components and flows to enable automatic onboarding, securing, and offboarding of Providers.
+This RFC adds support for Remote Providers: third-party Providers that are onboarded, kept up to date and offboarded through APIs, with the PM Instance connecting out to the Provider and no kcp credential ever leaving PM. It defines the APIs, protocols, components and flows for that.
 
 ## Motivation
 
-Today, the Provider onboarding is fully manual: the Owner (of the user workspace that contains the `Provider` object) *waits* until the Provider workspace is ready, *retrieves* the kubeconfig (referenced by `Provider.status.providerKubeconfigSecretRef`), *copies it* over to a "safe location" so that the service provider can retrieve it. Then, the service provider *deploys* their service operator with this kubeconfig (which populates the `:root:providers:<Provider ws name>` workspace) and starts reconciling consumers.
+Today, Provider onboarding is fully manual: the Owner (of the user workspace that contains the `Provider` object) *waits* until the Provider workspace is ready, *retrieves* the kubeconfig (referenced by `Provider.status.providerKubeconfigSecretRef`), *copies it* over to a "safe location" so that the service provider can retrieve it. Then, the service provider *deploys* their service operator with this kubeconfig (which populates the `:root:providers:<Provider ws name>` workspace) and starts reconciling consumers.
 
 Because the manual flow couples the Owner and Provider, there is a fundamental assumption: the Owner and the Provider are the same persona (you trust the kubeconfig, so you deliver it yourself). For you, as a service provider, this has far-reaching consequences:
 
@@ -30,7 +30,7 @@ In its current form, Platform Mesh puts the burden of being able to offer a serv
 **Goals:**
 
 - Allow distinct personas for "I want to publish a service on this PM Instance" (i.e. Owner) and "I want to offer my service to PM Instances" (i.e. Provider).
-- The Provider doesn't need to care about one specific PM Instance; onboarding and up-keep are fully automatic through APIs.
+- The Provider doesn't need to care about one specific PM Instance; onboarding and upkeep are fully automatic through APIs.
 - Assume as little as possible about the Provider's infrastructure. Any HTTPS endpoint that supports WebSockets must do. No TLS passthrough, no client-certificate-verifying ingress.
 - No protocol code in the Provider's operator: it runs standard multicluster-runtime reconcilers against one kubeconfig.
   - There can be many kubeconfigs, one per PM connection. A multicluster provider that discovers those kubeconfigs is a follow-up.
@@ -40,12 +40,12 @@ In its current form, Platform Mesh puts the burden of being able to offer a serv
 
 - Converting a Local Provider (i.e. the manual flow, [RFC 006](./006_provider-bootstrap-operator.md)) into a Remote Provider (this RFC). ManagedProvider-flow (also RFC 006) has a different trust model from a Remote Provider.
 - Tunneling the service's own data plane. The Remote Provider is still responsible for making non-KRM APIs of its own service available to its consumers.
-- Verifying the PM Instance onto which this Provider is to be onboarded is genuine. PM Instances can be private; there is no way for a Provider to verify PM's authenticity (we would need a public registry).
-- Ensuring every possible network configuration under the sun works out-of-the-box with this RFC. If PM-side cannot reach Provider-side, network teams still need to *somehow* allow HTTPS traffic with WebSocket upgrades to pass from the PM-side into the Provider-side (they would need that anyway, so that the consumers can reach the service's own data plane). This RFC is only ensuring that as long as the PM-side can reach the Provider-side, the onboarding *can* succeed and the Provider *can* serve consumers on the PM Instance.
+- Verifying that the PM Instance onto which this Provider is to be onboarded is genuine. PM Instances can be private; there is no way for a Provider to verify PM's authenticity (we would need a public registry).
+- Ensuring every possible network configuration under the sun works out-of-the-box with this RFC. If the PM-side cannot reach Provider-side, network teams still need to *somehow* allow HTTPS traffic with WebSocket upgrades to pass from the PM-side into the Provider-side (they would need that anyway, so that the consumers can reach the service's own data plane). This RFC is only ensuring that as long as the PM-side can reach the Provider-side, the onboarding *can* succeed and the Provider *can* serve consumers on the PM Instance.
 
 ## Architecture
 
-**The general idea is:** because the Provider doesn't care about one specific PM Instance (there can be many), it is the PM Instance that calls out to the Provider to "onboard". And because it is **always** the PM-side that opens the connections first, the Provider-side has to expose an HTTPS endpoint that the PM-side can reach. This is a critical pre-condition to the whole design, and every design choice here relies on that.
+**The general idea is:** because the Provider doesn't care about one specific PM Instance (there can be many), it is the PM Instance that calls out to the Provider to "onboard". And because it is **always** the PM-side that opens the connections first, the Provider-side has to expose an HTTPS endpoint that the PM-side can reach. This is a critical precondition to the whole design, and every design choice here relies on that.
 
 **In TLS we Trust**
 
@@ -56,7 +56,7 @@ What runs on that endpoint is ours to deliver (`provider-gateway`, this RFC disc
 - any other horror scenario one could dream of.
 
 So while any of the above may happen, we mitigate the impact by ensuring that:
-- All traffic is under TLS end-to-end. Because we cannot assume the Provider would be happy to give PM a TLS passthrough, we employ a two-layer TLS setup: **Outer-TLS** between the PM-side and the Provider's ingress, where it's terminated. **Inner-TLS** then travels inside the upgraded WebSocket connection, and is terminated only by our HTTP server, the `provider-gateway` - on the Provider-side.
+- All traffic is under TLS end-to-end. Because we cannot assume the Provider would be happy to give PM a TLS passthrough, we employ a two-layer TLS setup: **Outer-TLS** between the PM-side and the Provider's edge (its ingress, load balancer, CDN or WAF), where it's terminated. **Inner-TLS** then travels inside the upgraded WebSocket connection, and is terminated only by our HTTP server, the `provider-gateway` - on the Provider-side.
   - Why does either side trust the Inner-TLS? Initially (before onboarding) neither of them does, but they build this trust progressively: starting from the token handover during onboarding, and then both sides pin each other's public key material, and verify the handshake against that.
 - Every key, certificate and CA this RFC introduces can be rotated without re-onboarding (most are already designed to rotate automatically, or can be made automatic as a follow-up).
 - No private key or other secret crosses sides; only public keys, certificates and hashes do - with two exceptions:
@@ -99,7 +99,7 @@ The trust boundary, compared with today:
                                          the network, the Edge
 
     Owner ◀─────────── Onboarding Token, out-of-band ──────────── Provider's portal
-      └─▶ a Secret in the Owner's workspace                         └─▶ has provider-gateway issue it
+      └─▶ a Secret in the Owner's workspace                         └─▶ issues it with the SDK
 
     ──▶ / ══▶   opened only by the PM-side: Registration and Control Calls from platform-mesh-operator,
                 Sessions from Connectors. Outer-TLS ends at the Edge, Inner-TLS (pinned) at provider-gateway.
@@ -121,11 +121,11 @@ With this RFC, each side gains one new exposure, specifically:
 
 ### Overview
 
-First, I apologize to all readers for the length, but there is quite a few moving pieces in this RFC, and I believe it's better to be explicit now and know what we're signig up for rather than finding out later during implementation and disagreeing then.
+First, I apologize to all readers for the length, but there are quite a few moving pieces in this RFC, and I believe it's better to be explicit now and know what we're signig up for rather than finding out later during implementation and disagreeing then.
 
 The whole API and protocol design would be impossible to digest in one go. So instead, let me tell you a story:
 
-*The Provider "Wild West" serves its Connection API under the Base URL `https://wildwest.example.com/pm`. Alice onboards it as a Provider named `wildwest`. PM has two shards, root and nereus.*
+*The Provider "Wild West" serves its Connection API under the Base URL `https://wildwest.example.com/pm`. Alice onboards it as a Provider named `wildwest`. PM has two shards, `root` and `nereus`.*
 
 **The cast:**
 
@@ -133,10 +133,10 @@ The whole API and protocol design would be impossible to digest in one go. So in
 |---|---|---|
 | **Owner** | — | A person (or their GitOps) controlling a workspace in PM, here `:root:orgs:acme:alice`. The Provider's customer: they want the Provider's service available in PM. |
 | **The Provider's portal** | Provider-side | The Provider's website for its customers. Issues Onboarding Tokens. |
-| **`provider-gateway`** | Provider-side | Installed by the Provider from PM's Helm chart, in the Provider's cluster. Serves the Connection API, holds Sessions, and is the proxy through which the Provider's operator reaches kcp. "The SDK" for short. |
+| **`provider-gateway`** | Provider-side | Installed by the Provider from PM's Helm chart, in the Provider's cluster. Serves the Connection API, holds Sessions, and is the proxy through which the Provider's operator reaches kcp. |
 | **The Provider's operator** | Provider-side | The Provider's own controllers that reconcile its service (here: the Wild West `Cowboys` API). |
 | **The Provider's Edge** | Provider-side | Whatever sits in front of the Provider's public URL: ingress, load balancer, CDN, WAF. Carries traffic, but isn't trusted with it. |
-| **`platform-mesh-operator`** | PM-side | PM's operator. Owns every `Provider` object, makes every call to the Provider that isn't traffic, and holds all Connection state. |
+| **`platform-mesh-operator`** | PM-side | PM's operator. Reconciles `Provider` objects, makes "management" calls to the Provider, and holds the PM-side of the Connection state. |
 | **Connectors** | PM-side | One small proxy Deployment per kcp shard (`providerconnections-connector`). They open Sessions to the Provider and carry all traffic between it and kcp. Stateless. |
 | **PM Administrators / Provider Administrators** | either | People running each side. Only needed for rare tasks (e.g. recovery, responding to a leak). |
 
@@ -145,12 +145,10 @@ A **Connection** is one `Provider` on one PM Instance, paired with one Provider-
 The PM-side talks to the Provider-side's `provider-gateway`, at the Provider's **Base URL**, over three channels. Each is a WebSocket with Inner-TLS inside:
 
 | Channel | Opened by | Received by | When | Authenticated by | Request has | Response has |
-|---|---|---|---|---|
-| **Registration** | `platform-mesh-operator` | `provider-gateway` | once, to create the Connection | the Onboarding Token; Inner-TLS pinned to the Server Key that are inside this Onboarding Token | PM's Connector CA and the Connection Secret's hash | the Provider-side answers with the Connection's ID |
-| **Control** | `platform-mesh-operator` | `provider-gateway` | on demand and periodically | the Connection Secret; Inner-TLS pinned to the Provider's Server Keys | health checks, the Provider's Server Keys, Connector CA
-rotations, the final delete | Error or `200` |
-| **Session** | a Connector, one per kcp shard | `provider-gateway`| only on shards where the Connection has traffic | Inner-TLS pinned both ways: Server Key and Connector CA | the Provider's requests to kcp, which the
-Connector checks and sends on with a short-lived SA token |
+|---|---|---|---|---|---|
+| **Registration** | `platform-mesh-operator` | `provider-gateway` | once, to create the Connection | the Onboarding Token; Inner-TLS pinned to the Server Key the token names | PM's Connector CA Set and the Connection Secret's hash | the Connection's ID and the Provider's Server Keys |
+| **Control** | `platform-mesh-operator` | `provider-gateway` | periodically, and on demand | the Connection Secret; Inner-TLS pinned to the Provider's Server Keys | status requests, Connector CA Set updates, the final delete | the Connection's status, the Provider's current Server Keys |
+| **Session** | a Connector | `provider-gateway` | on each shard where the Connection has traffic | Inner-TLS pinned both ways: Server Key and Connector CA | the Provider's requests to kcp, which the Connector checks and sends on with a short-lived SA token | kcp's responses |
 
 The objects, and who writes them:
 
@@ -162,11 +160,7 @@ The objects, and who writes them:
 | The Provider's cluster | `Connection`, `ServerKey`, one kubeconfig `Secret` per Connection | `provider-gateway` |
 | The Provider's cluster | `OnboardingToken` | the Provider's portal |
 
-Two placements matter for what follows:
-- **The Connection Secret never leaves PM's runtime cluster**; the Provider-side keeps only its hash, and the Owner's workspace never holds it.
-- **The `ProviderEndpoint` sits in kcp, next to the shards that use it**, so Connectors keep their Sessions even while PM's runtime cluster or `platform-mesh-operator` is down: outages there delay onboarding and changes, not traffic.
-
-You don't have to remember all of this, the following sections go through each concept again in bit more detail.
+You don't have to remember all of this: the following sections go through each concept again, in a bit more detail.
 
 ### Flow & APIs
 
@@ -184,10 +178,10 @@ Some things exist before any Owner does anything.
 
 ##### On the PM-side
 
-**Who: the PM Administrators, through `platform-mesh-operator`'s deployment.** The `provider-operator` Helm chart (TBD) is rendered with one entry per shard:
+**Who: the PM Administrators, through `platform-mesh-operator`'s deployment.** A Helm chart (later part of a `provider-operator` chart, once the Provider code moves out of `platform-mesh-operator` into its own operator; see Follow-ups) is rendered with one entry per shard:
 
-- **one Connector Deployment per shard**, configured with its own shard's virtual-workspace host and the front-proxy's host, plus an in-cluster address for each,
-- **a kcp identity for each shard's Connector**,
+- **one Connector Deployment per shard**, configured with its own shard's virtual-workspace host and the front-proxy's host, plus an in-cluster address for each;
+- **a kcp identity for each shard's Connector**;
 - **the Connector CA** and **one Connector Certificate per shard**, both cert-manager resources (explained in Step 7, where they're first used).
 
 `platform-mesh-operator` also applies the kcp setup:
@@ -195,7 +189,7 @@ Some things exist before any Owner does anything.
 | APIExport name | Location | Who binds it | Why |
 |---|---|---|---|
 | `providers.platform-mesh.io` | `:root:platform-mesh-system` | Owner's workspace in `:root:orgs:acme:alice` | To get APIs for `Provider`s and `ProviderOnboardingRequest`s. |
-| `providerendpoints.platform-mesh.io` | `:root:platform-mesh-system` | Provider's workspace in `:root:providers:wildwest-2x8k9abc` | To get an API for `ProviderEndpoint`s. It also claims read-only access to the Provider's APIExportEndpointSlices. This is a system export for PM's own components, not for the Provider: `ProviderEndpoint`s are protected by a maximal permission policy. |
+| `providerendpoints.platform-mesh.io` | `:root:platform-mesh-system` | the Provider Workspace `:root:providers:wildwest-2x8k9abc` | To get an API for `ProviderEndpoint`s. It also claims read-only access to the Provider's APIExportEndpointSlices. This is a system export for PM's own components, not for the Provider: `ProviderEndpoint`s are protected by a maximal permission policy. |
 
 ##### On the Provider-side
 
@@ -203,7 +197,7 @@ Some things exist before any Owner does anything.
 
 **Who: `provider-gateway`, on its first start**, creates its first **Server Key**.
 
-> **Concept: Server Key.** The Provider-side's keypair (long-lived, can be rotated) for talking to PM.
+> **Concept: Server Key.** The Provider-side's keypair (long-lived, can be rotated) for talking to PM through Inner-TLS.
 >
 > `provider-gateway` generates it (ECDSA P-256), keeps the private key in a Kubernetes `Secret` that only it can read, and publishes the public key in a `ServerKey` object. The PM-side will remember ("pin") the public key and from then on only talk to whoever can sign with the private key:
 >
@@ -222,12 +216,12 @@ Some things exist before any Owner does anything.
 > ---
 >
 > # The private key is in Secret "sk-2026-10", in provider-gateway's ns.
-> # HMS/KMS is also an option and can be a follow-up later.
+> # HSM/KMS is also an option (see Follow-ups).
 > ```
 
 **Who: the Provider's operator** is deployed and waiting. Later, it will find Connections as kubeconfig `Secret`s that `provider-gateway` writes (once Sessions are up, in Step 7e).
 
-You might be wondering: how does the Provider Administrator know they configured this PM-facing setup correctly? See Provider's self-check in [Follow-ups](#follow-ups).
+You might be wondering: how does the Provider Administrator know they configured this outward-facing setup correctly? See Provider's self-check in [Follow-ups](#follow-ups).
 
 #### 1. The Owner gets an Onboarding Token
 
@@ -237,7 +231,7 @@ Moving on! Alice has an account on the PM Instance of her choice, and wants to c
 
 > Note that the PM-side has **no opinion** on how this portal works. It is free to have its own identity provider, billing, auditing, whatever. We don't care. Because we authenticate over our own path, the business side of the Provider is (pun intended) *not our business*.
 
-**Who: the Provider's portal** calls the SDK's token helper (a Golang function inside the SDK module *we* deliver), which:
+**Who: the Provider's portal** calls the SDK's token helper (a Go function inside the SDK module *we* deliver), which:
 
 1. picks the newest `ServerKey` that's ready and not being retired;
 2. generates a random **token ID** and a random **token secret**;
@@ -257,9 +251,13 @@ pm1.<base64url(https://wildwest.example.com/pm)>.<key-sha256 of the Server Key>.
 > - the **token ID** names the token, in URLs and logs; it isn't secret;
 > - the **token secret** is the actual credential.
 
-The portal shows the token as a `kubectl create secret ...` command, never in a URL or a manifest, because URLs and manifests get logged and committed.
+The portal shows the token as a command:
 
-**Trust note.** The path from the portal to PM (the portal page, the Owner, their terminal) is trusted: whoever reads the token there before PM uses it can register a Connection in the Owner's name. They can't touch any existing Connection, though (see "Putting it together").
+```sh
+kubectl create secret generic wildwest-token --from-literal=token='pm1...' 
+```
+
+**Trust note.** The path from the portal to PM (the portal page, the Owner, their terminal) **has to be trusted:** whoever reads the token there before PM uses it can register a Connection in the Owner's name. They cannot do any real damage to existing Connections, but they could legitimately use up Provider's resources (see also [What if onboarding token is stolen](#what-if-an-unspent-onboarding-token-is-stolen) in Appendix).
 
 #### 2. The Owner creates the `Provider` and the `ProviderOnboardingRequest`
 
@@ -269,18 +267,18 @@ The portal shows the token as a `kubectl create secret ...` command, never in a 
 # 1. the token, from the portal's command
 kind: Secret
 metadata: { name: wildwest-token }
-stringData: { token: "pm1...." }      # deleted by platform-mesh-operator once spent
+stringData: { token: "pm1...." }
 ---
 # 2. the Provider: "I want this service here, and it's remote"
 kind: Provider
 metadata: { name: wildwest }
 spec:
   remote:                             # marks a Remote Provider
-    caBundle: ""                      # optional: private CA(s) for the Base URL's outer TLS
+    caBundle: ""                      # optional: private CA(s) for the Base URL's Outer-TLS
 status:                               # written only by platform-mesh-operator
   phase: Ready                        # Pending → Provisioning → Ready ⇄ Degraded, Deleting
-  conditions:                         # one per step: Workspace, ConnectionBinding,
-    - type: Ready                     #   ConnectorAccess, Registered, Connected; and Ready
+  conditions:                         # one per step: Workspace, ConnectorAccess,
+    - type: Ready                     #   Registered, Connected; and Ready
       status: "True"
   connection:                         # for the Owner's information only, never used by PM
     url: https://wildwest.example.com/pm
@@ -289,7 +287,7 @@ status:                               # written only by platform-mesh-operator
 # 3. the request: "connect this Provider, using this token"
 kind: ProviderOnboardingRequest
 metadata: { name: wildwest-2026-10-21 }
-spec:
+spec:                                 # immutable
   providerRef: { name: wildwest }
   tokenSecretRef: { namespace: default, name: wildwest-token, key: token }
   tokenID: t-q8m2vxk3j7p4w9n2c5h8r6t1aa
@@ -299,31 +297,35 @@ status:
 ```
 
 - **`Provider`** is PM's long-lived object for this Provider (introduced in RFC 006). Everything after Registration is reported on its status.
-- **`ProviderOnboardingRequest`** is a one-off action: spend this token to register the `Provider`'s Connection. Its spec can't be changed afterwards, and the token ID in it stops anyone swapping the token `Secret` mid-flight.
+- **`ProviderOnboardingRequest`** is a one-off action and says "spend this token to register the `Provider`'s Connection".
 - If several requests exist for one `Provider`, the oldest unfinished one wins; the others fail at once.
 
-> **Concept: Connection.** The link between one `Provider` in PM and the Provider-side, identified by a random `connectionID` (e.g. `c-7f3k9q2mx8w4`). PM records its half in a `ProviderEndpointRegistration` and a `ProviderEndpoint`; the Provider-side in a `Connection` object. A Provider serving many PM Instances or many Owners has many Connections; everything it stores is keyed by `connectionID`.
+> **Concept: Connection.** The link between one `Provider` in PM and the Provider-side, identified by a random `connectionID` (e.g. `c-7f3k9q2mx8w4h6j1n5p3r7t9vb`). PM records its half in a `ProviderEndpointRegistration` and a `ProviderEndpoint`; the Provider-side in a `Connection` object. A Provider serving many PM Instances or many Owners has many Connections; everything it stores is keyed by `connectionID`.
 
 #### 3. `platform-mesh-operator` prepares the Provider Workspace
 
 > **Concept: Provider Workspace.** A workspace PM creates for each `Provider`. The Provider is admin there and creates its APIExports in it. Let's call the shard where this logical cluster lives the **Hosting Shard**; in the example, `root`, with logical cluster name `3y9j0def`.
 
-**Who: `platform-mesh-operator`.** It reconciles each `Provider` in a fixed sequence of steps, each reported as a condition on the `Provider`: `Workspace`, `ConnectorAccess`, `Registered`, `Connected` (yes, these are different from what we have today - this will be a breaking change, don't care ¯\(ツ)/¯).
+**Who: `platform-mesh-operator`.** It reconciles each `Provider` in a fixed sequence of steps, each reported as a condition on the `Provider`: `Workspace`, `ConnectorAccess`, `Registered`, `Connected` (yes, these are different from what we have today - this will be a breaking change, don't care `¯\(ツ)/¯` these are intermediate conditions that tools shouldn't rely on anyway).
 
-**3a. Create the Provider Workspace** `:root:providers:wildwest-<Alice's lc name>`, and in it a ServiceAccount `default/provider` with admin rights there (condition `Workspace`). That SA is the identity the Provider will act as in kcp, but the Provider never gets a credential for it: the Connectors will use it on the Provider's behalf (Step 9). The `providerendpoints.platform-mesh.io` is default-bound by the WorkspaceType (an alternative: the pm-operator could create the binding conditionally if that's cleaner).
+**3a. Create the Provider Workspace** `:root:providers:wildwest-<Alice's logical cluster name>`, and in it a ServiceAccount `default/provider` with admin rights there (condition `Workspace`). That SA is the identity the Provider will act as in kcp, but the Provider never gets a credential for it: the Connectors will use it on the Provider's behalf (Step 9). The `providerendpoints.platform-mesh.io` export is default-bound by the WorkspaceType (an alternative: the `platform-mesh-operator` could create the binding conditionally if that's cleaner).
 
 **3b. Lock down the workspace, then grant the Connectors access** (condition `ConnectorAccess`).
 
-As mentioned, Connectors will be minting tokens for the Connection, to impersonate the Provider's SA. We'll discuss what's what in later sections (Step 9). For now, `platform-mesh-operator` grants the Connectors' system group `system:platform-mesh:providers-connectors` two rights in the workspace: `access` to it, and `create` on `serviceaccounts/token` for `default/provider` only.
+As mentioned, Connectors will be minting tokens for the Connection, to act as the Provider's SA. We'll discuss what's what in later sections (Step 9).
 
-It also creates two `ValidatingAdmissionPolicies` in the Provider Workspace:
+The Provider itself must not be able to give itself a kcp credential, since that would bypass the Connector. To enforce that (the not creating credentials for self), `platform-mesh-operator` creates two `ValidatingAdmissionPolicies` in the Provider Workspace:
 
 - role bindings may only name the workspace's own ServiceAccounts, kcp's binding subjects, or grant `bind` on the Provider's APIExports (how consumers get to bind);
 - `Secret`s of type `kubernetes.io/service-account-token` are refused.
 
-kcp starts enforcing new policies with a delay, so `platform-mesh-operator` **checks** that they are enforced: it tries a dry-run write the policy must refuse, impersonating the Provider's SA. Until it's refused, it stops here with `PolicyNotEnforced`.
+Once these two policies are up, `platform-mesh-operator` grants the Connectors' system group `system:platform-mesh:providers-connectors` (new group *we've* introduced) two rights in the workspace: `access` to it, and `create` on `serviceaccounts/token` for `default/provider` SA only.
 
-**3c. Check the `ProviderOnboardingRequest`** (condition `Registered`). the `Provider` exists (otherwise `ProviderNotFound`, until the Owner creates it); it's remote and not yet registered; the token `Secret` exists, parses, and its ID equals `spec.tokenID`; the Base URL passes the egress rules (Step 4). The token `Secret` is read by name, never cached: `platform-mesh-operator` keeps no copies of other people's `Secret`s in memory.
+**3c. Check the `ProviderOnboardingRequest`** (condition `Registered`). It checks that:
+- the `Provider` exists (otherwise `ProviderNotFound`, until the Owner creates it);
+- it's remote and not yet registered;
+- the token `Secret` exists, parses, and its ID equals `spec.tokenID`;
+- the Base URL passes the egress rules (Step 4).
 
 And that's all we (the Platform Mesh) need to do in the Provider Workspace. Nothing has been sent to the Provider just yet!
 
@@ -337,26 +339,24 @@ sequenceDiagram
     participant E as Provider's Edge
     participant G as provider-gateway
     Note over O: R1: create ProviderEndpointRegistration,<br/>generate Connection Secret (write before send)
-    O->>E: R2: GET /v1/connections/register/{tokenID}<br/>WebSocket upgrade (outer TLS)
+    O->>E: R2: GET /v1/connections/register/{tokenID}<br/>WebSocket upgrade (Outer-TLS)
     E->>G: forward
     Note over G: R3: token known, unexpired, unspent<br/>(or a retry within its window)?<br/>its Server Key usable?
     G-->>O: 101 Switching Protocols
-    O->>G: R4: inner TLS handshake (through the Edge, opaque to it)
+    O->>G: R4: Inner-TLS handshake (through the Edge, opaque to it)
     G->>O: certificate for the token's Server Key
     Note over O: key fingerprint == keyfp from the token?
     O->>G: R5: POST /v1/connections, Bearer tokenSecret,<br/>clusterName, secretHash, Connector CA Set
     Note over G: R6: check secret, spend token,<br/>create Connection
     G-->>O: 201 connectionID, serverKeys, unusedExpiresAt
-    Note over O: R7: persist, delete token data,<br/>request → Registered
+    Note over O: R7: persist, request → Registered
 ```
 
 ##### R1. `platform-mesh-operator` notes down the ongoing registration
 
 **Who: `platform-mesh-operator`.** It creates a `ProviderEndpointRegistration` named `3y9j0def` in its own namespace, locally, in PM's runtime cluster. It also generates the **Connection Secret** into a `Secret` next to it. `ProviderOnboardingRequest`'s phase becomes `Registering`.
 
-> **Concept: Connection Secret.** The bearer credential with which `platform-mesh-operator` authenticates its later calls to the Provider-side (Control Calls, step 5). A prefix plus 256 random bits, `pmc1_<base64url>`. PM generates it and keeps it only in its runtime cluster. Here, during Registration, it sends only the **hash**. Afterwards it presents the secret itself on each Control Call - but then it's already inside the Inner-TLS, so that is safe because only the party that holds the pinned Server Key sees it.
-
-> **Concept: Connection Secret.** The bearer credential with which `platform-mesh-operator` authenticates its later calls to the Provider-side (Control Calls, step 5). A prefix plus 256 random bits, `pmc1_<base64url>`. PM generates it and keeps it only in its runtime cluster. Here, during Registration, it sends only the **hash:** that's all the Provider-side needs to check the secret later, so the plaintext is never stored there. Afterwards PM presents the secret itself on each Control Call, inside the Inner-TLS verified in C1, so the Edge never sees it.
+> **Concept: Connection Secret.** The bearer credential with which `platform-mesh-operator` authenticates its later calls to the Provider-side (Control Calls, Step 5). It is formatted like so: `pmc1_<base64url>`: a prefix plus 256 random bits. PM generates it and keeps it only in its runtime cluster. The Provider-side then stores only its hash.
 
 ```yaml
 apiVersion: providers.platform-mesh.io/v1alpha1
@@ -365,10 +365,11 @@ metadata:
   name: 3y9j0def                      # the Provider Workspace's logical cluster
   namespace: platform-mesh-system
 spec:
-  connectionID: c-7f3k9q2mx8w4h6j1n5p3r7t9vb
   url: https://wildwest.example.com/pm
+  # The fields below (connectionID, serverKeys, unusedExpiresAt) are populated in R7.
+  connectionID: c-7f3k9q2mx8w4h6j1n5p3r7t9vb
   serverKeys: ["-----BEGIN PUBLIC KEY-----..."]   # pinned
-  unusedExpiresAt: "2026-10-29T09:30:00Z"       # If, by this time, there was no response (e.g. Provider down), this ProviderEndpointRegistration is automatically garbage-collected.
+  unusedExpiresAt: "2026-10-29T09:30:00Z"       # the Provider-side removes the Connection if PM hasn't reached it by then
 ---
 apiVersion: v1
 kind: Secret                          # The Connection Secret. Stored in PM's runtime cluster.
@@ -388,9 +389,9 @@ stringData:
 
    > **Concept: why "resolve once".** An Owner chooses the Base URL, so it could try to make PM connect where it shouldn't, such as the pod's own loopback or the cloud metadata service. Checking the address isn't enough if the name is looked up again to connect: a hostile DNS server could answer differently the second time (**DNS rebinding**). Resolving once and dialling the checked addresses closes that. Private addresses stay allowed, so on-prem Providers work; which of them PM may reach is up to the deployment's network policy.
 
-2. **Open a TCP connection and the Outer-TLS** to `wildwest.example.com`. We default to Web PKI. The owner could have set up `Provider.spec.caBundle` in which case we'd use that one (rotation of that CA bundle is up to the Owner, by the Owner).
+2. **Open a TCP connection and the Outer-TLS** to `wildwest.example.com`. We default to Web PKI. The Owner could have set up `Provider.spec.remote.caBundle` in which case we'd use that one (rotation of that CA bundle is up to the Owner, by the Owner).
 
-3. **Send a WebSocket upgrade**: `GET /v1/connections/register/t-q8m2...`. It carries no credential: the token secret travels later, inside the Inner TLS.
+3. **Send a WebSocket upgrade**: `GET /v1/connections/register/t-q8m2...`. It carries no credential: the token secret travels later, inside the Inner-TLS.
 
 ```http
 GET /pm/v1/connections/register/t-q8m2vxk3j7p4w9n2c5h8r6t1aa HTTP/1.1
@@ -403,18 +404,16 @@ Upgrade: websocket
 
 ##### R3. `provider-gateway` checks the token, then accepts the upgrade
 
-**Who: `provider-gateway`.** Before switching to a WebSocket, it looks up the `OnboardingToken` by the ID in the path: it must exist, be unexpired and unspent, and its `ServerKey` must exist, be ready and not being retired. One exception: a token that's already spent is let through while its **retry window** is open (the token's expiry plus 7 days). That's the case where PM retries a Registration whose answer it lost (see "idempotency" in R6); whether it really is that retry can only be checked inside the Inner TLS. It also caps how many handshakes may be in progress. If anything fails, it refuses with a stable status, and `platform-mesh-operator` fails the request with `TokenRefused` (in which case the Owner needs to go get a new token).
+**Who: `provider-gateway`.** Before switching to a WebSocket, it looks up the `OnboardingToken` by the ID in the path: it must exist, be unexpired and unspent, and its `ServerKey` must exist, be ready and not being retired. One exception: a token that's already spent is let through while its **retry window** is open (the token's expiry plus 7 days). That's the case where PM retries a Registration whose answer it lost (see "idempotency" in R6); whether it really is that retry can only be checked inside the Inner-TLS. It also caps how many handshakes may be in progress. If anything fails, it refuses with a stable status, and `platform-mesh-operator` fails the request with `TokenRefused` (in which case the Owner needs to go get a new token).
 
 Otherwise it answers `101` and the WebSocket is open.
 
-Inner TLS (ALPN `pm-register/1`), accepting only the Server Key whose fingerprint is the token's `keyfp`; inside it:
-
-##### R4. Both sides run the Inner TLS, pinned to the token's Server Key
+##### R4. Both sides run the Inner-TLS, pinned to the token's Server Key
 
 **Who: `platform-mesh-operator` (client) and `provider-gateway` (server).** Inside the WebSocket, they run a **second, complete TLS 1.3 handshake** (the Inner-TLS), end to end between the two programs.
 
 ```
-platform-mesh-operator ══ outer TLS (web PKI) ══▶ Edge ── WebSocket ──▶ provider-gateway
+platform-mesh-operator ══ Outer-TLS (web PKI) ══▶ Edge ── WebSocket ──▶ provider-gateway
                        ╚═ WebSocket: /v1/connections/register/{tokenID} ═══════╝
                             ╚═ Inner-TLS 1.3: pinned Server Key ═══════════════╝
                                  ╚═ one HTTP request: the Registration ════════╝
@@ -431,7 +430,7 @@ Both sides also agree on the protocol through **ALPN**: `pm-register/1`. In case
 **Who: `platform-mesh-operator`**, one HTTP request inside the Inner-TLS:
 
 ```
-POST /pm/v1/connections HTTP/1.1
+POST /v1/connections HTTP/1.1
 Authorization: Bearer <tokenSecret>
 {
   "idempotencyKey": "<ProviderOnboardingRequest.UID>",
@@ -443,7 +442,7 @@ Authorization: Bearer <tokenSecret>
 
 - the **token secret** proves the Owner's right to register;
 - **`clusterName`** tells the Provider-side which Provider Workspace this Connection is for;
-- **`secretHash`** lets the Provider-side check the Connection Secret later, without ever receiving it;
+- **`secretHash`** is all the Provider-side stores of the Connection Secret: enough to check it on every later Control Call;
 - **`connectorCASet`** tells the Provider-side whom to trust for Sessions (step 7). It becomes the Connection's **Pinned Bundle**.
 
 ##### R6. `provider-gateway` creates the Connection
@@ -466,7 +465,7 @@ Authorization: Bearer <tokenSecret>
     }
    ```
 
-On idempotency: If the response gets lost, `platform-mesh-operator` can't tell whether the Registration happened. So it retries with the same **idempotency key** (the `ProviderOnboardingRequest.UID`), hash and `clusterName`, and the Provider-side, recognising them, returns the stored answer instead of creating a second Connection. It honours such retries until the token's retry window ends. A retry with a different hash is refused, so someone replaying a logged request gains nothing.
+**On idempotency.** If the response gets lost, `platform-mesh-operator` can't tell whether the Registration happened. So it retries with the same **idempotency key** (the `ProviderOnboardingRequest.UID`), hash and `clusterName`, and the Provider-side, recognising them, returns the stored answer instead of creating a second Connection. It honours such retries until the token's retry window ends. A retry with a different hash is refused, so someone replaying a logged request gains nothing.
 
 Apart from the token secret, which is now spent, nothing in the request or the response is a usable secret: a hash, public CA certificates, public keys and IDs.
 
@@ -475,8 +474,7 @@ Apart from the token secret, which is now spent, nothing in the request or the r
 **Who: `platform-mesh-operator`.**
 1. Writes `connectionID`, the Base URL, the returned Server Keys and `unusedExpiresAt` into the `ProviderEndpointRegistration`, in one write. From now on this object, not the token, is PM's source of truth for the Connection. The Server Keys in it are now PM's pins for every later call.
 2. Records the `connectionID` on the request, and copies URL and `connectionID` into the `Provider`'s status, for the Owner's information only (the Owner can edit that status, so PM never relies on it).
-3. Deletes the token data from Alice's `Secret`: a spent token shouldn't linger in backups or Git.
-4. Marks the request `Registered`. The request is done; everything after is reported on the `Provider`.
+3. Marks the request `Registered`. The request is done; everything after is reported on the `Provider`.
 
 And just like that, we've convinced both sides to trust each other, in *seven* easy steps!
 
@@ -537,7 +535,7 @@ HTTP/1.1 200 OK
 
 > **Concept: compare-and-swap.** "Replace X, but only if it's still Y." The `etag` is a hash of the current Pinned Bundle; if anything changed it since PM read it, the `PUT` fails with `412` and PM reads again. Two calls arriving out of order can never overwrite a newer bundle unnoticed.
 
-- **Secret rejected** (the Inner TLS worked, the Connection exists, but the hash doesn't match, e.g. the Provider restored an old backup): it doesn't wait; it starts a Secret Change right away (step 10) and goes on to step 6.
+- **Secret rejected** (the Inner-TLS worked, the Connection exists, but the hash doesn't match, e.g. the Provider restored an old backup): it doesn't wait; it starts a Secret Change right away (step 10) and goes on to step 6.
 - **"Unknown"**: the Provider-side no longer has the Connection: `Registered=False` with `ConnectionUnknown`. The Owner can onboard the `Provider` again.
 - **No answer**: the Edge is in the way, or the Provider is down. `platform-mesh-operator` classifies the failure (an HTML page instead of an upgrade looks like bot protection, `EdgeBotChallenge`; a cut right after a binary message looks like a WAF, `EdgePayloadBlocked`; and so on), shows it on the `Provider` with the deadline from `unusedExpiresAt`, and retries. Nothing else happens until it works.
 
@@ -562,7 +560,15 @@ spec:
 
 The `Provider` shows `Registered=True`.
 
-> **Concept: `ProviderEndpoint`.** The PM-side half of a Connection as the Connectors (and the Provider) see it: where to dial, which keys to pin. It's written from the `ProviderEndpointRegistration`, which stays authoritative. It's also the **only** channel through which a Connection Secret can change (step 10), which is safe because kcp's maximal permission policy lets only `platform-mesh-operator` write it.
+> **Concept: ProviderEndpoint.** The PM-side half of a Connection as the Connectors (and the Provider) see it: where to dial, which keys to pin, and, during a Secret Change, the new secret's hash (Step 10).
+>
+> **Relationship with the ProviderEndpointRegistration:** the PER, in PM's runtime cluster, is the authoritative record; the ProviderEndpoint is the copy Connectors read, in kcp, next to their shards. That way PM's runtime cluster isn't a single point of failure for traffic: Connectors never need to reach it, so they keep working while it, or `platform-mesh-operator`, is down.
+
+> **Concept: `ProviderEndpoint`.** The PM-side half of a Connection as the Connectors (and the Provider) see it: where to dial, which keys to pin. It's written from the `ProviderEndpointRegistration`, which stays authoritative.
+>
+> **Why a second copy, in kcp:** Connectors run next to their shards, and once shards live in their own clusters, Connectors shouldn't depend on PM's runtime cluster to find their Connections. The ProviderEndpoint gives them everything they need in kcp, next to the shard. As a consequence, traffic keeps flowing while PM's runtime cluster or platform-mesh-operator is down.
+>
+> It's also the **only** channel through which a Connection Secret can change (step 10), which is safe because kcp's maximal permission policy lets only `platform-mesh-operator` write it.
 
 Nothing is sent to the Provider here. The Provider-side reads its `ProviderEndpoint` once Sessions exist.
 
@@ -942,11 +948,12 @@ serves every PM Instance without extra wiring.
 - **In-band changes announced by the Provider-side**: a new Base URL, or a new private CA for the Outer-TLS, verified by PM through the Inner-TLS. Today both are out-of-band.
 
 **PM-side**
-- **The `Provider` part of `platform-mesh-operator` as its own operator.** Until then, code that talks to Providers on the internet runs in PM's most privileged component.
+- **The `Provider` part of `platform-mesh-operator` as its own operator.**
 - **Deletion protection for `Provider`s with consumer bindings.** Deleting a `Provider` deletes its APIExport's identity, which kcp can't re-pair with existing bindings.
 - **Egress through an HTTP proxy**, for PM Instances whose networks require one.
 - **Edge diagnosis for Sessions**, not just for Control Calls, so Owners learn when the Provider's Edge breaks Sessions.
 - **Per-replica Connector Certificates** from an external issuer, so no private key is mounted into Connectors.
+- GC spent ProviderOnboardingRequests and their Onboarding Tokens.
 - **Load tests of the Connector**, the extra hop in front of kcp's virtual workspaces.
 
 ## Appendix
