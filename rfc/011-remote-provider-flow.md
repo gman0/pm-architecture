@@ -45,7 +45,7 @@ In its current form, Platform Mesh puts the burden of being able to offer a serv
 
 ## Architecture
 
-**The general idea is:** because the Provider doesn't care about one specific PM Instance (there can be many), it is the PM Instance that calls out to the Provider to "onboard". And because it is **always** the PM-side that opens the connections first, the Provider-side has to expose an HTTPS endpoint that the PM-side can reach. This is a critical precondition to the whole design, and every design choice here relies on that.
+**The general idea is:** because the Provider doesn't care about one specific PM Instance (there can be many), it is the PM Instance that calls out to the Provider to "onboard". And because it is **always** the PM-side that opens the connections first, the Provider-side has to expose *some* API that allows the PM-side to reach out and onboard itself programmatically. This RFC delivers that API, and the Provider-side must expose it. This is a critical precondition to the whole design, and every design choice here relies on that.
 
 **In TLS we Trust**
 
