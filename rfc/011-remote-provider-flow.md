@@ -45,18 +45,18 @@ In its current form, Platform Mesh puts the burden of being able to offer a serv
 
 ## Architecture
 
-**The general idea is:** because the Provider doesn't care about one specific PM Instance (there can be many), it is the PM Instance that calls out to the Provider to "onboard". And because it is **always** the PM-side that opens the connections first, the Provider-side has to expose *some* API that allows the PM-side to reach out and onboard itself programmatically. This RFC delivers that API, and the Provider-side must expose it. This is a critical precondition to the whole design, and every design choice here relies on that.
+**The general idea is:** because the Provider doesn't care about one specific PM Instance (there can be many), it is the PM Instance that calls out to the Provider to "onboard". And because it is **always** the PM-side that opens the connections first, the Provider-side has to expose *some* API that allows the PM-side to reach out and onboard the Provider programmatically. This RFC delivers that API, and the Provider-side must expose it. This is a critical precondition to the whole design, and every design choice here relies on that.
 
 **In TLS we Trust**
 
-What runs on that endpoint is ours to deliver (`provider-gateway`, this RFC discusses that), and the Provider just deploys and applies standard security restrictions as with any ingress-facing Deployment. The traffic may go over the Internet and private/public egress/ingress (CDNs, WAFs, LBs, ...) and into remote clusters (not ours), and we cannot assume control of any of those:
+That API is served by an HTTPS server that this RFC also delivers (`provider-gateway`). The Provider deploys it and protects it like they would any other ingress-facing Deployment. The traffic may go over the Internet and private/public egress/ingress (CDNs, WAFs, LBs, ...) and into remote clusters, and we cannot assume control of any of those:
 - CDN can log the body of requests / responses - we can't possibly know who has access to those,
 - Provider's cluster falls behind K8s version upgrades, and is now vulnerable to attacks - putting the consumers of their services at risk,
 - PM's runtime cluster falls behind K8s version upgrades, and is now vulnerable to attacks - putting the connected Providers at risk,
 - any other horror scenario one could dream of.
 
 So while any of the above may happen, we mitigate the impact by ensuring that:
-- All traffic is under TLS end-to-end. Because we cannot assume the Provider would be happy to give PM a TLS passthrough, we employ a two-layer TLS setup: **Outer-TLS** between the PM-side and the Provider's edge (its ingress, load balancer, CDN or WAF), where it's terminated. **Inner-TLS** then travels inside the upgraded WebSocket connection, and is terminated only by our HTTP server, the `provider-gateway` - on the Provider-side.
+- All traffic is under TLS end-to-end. Because we cannot assume the Provider would be happy to give PM a TLS passthrough, we employ a two-layer TLS setup: **Outer-TLS** between the PM-side and the Provider's edge (its ingress, load balancer, CDN or WAF), where it's terminated. **Inner-TLS** then travels inside a WebSocket connection, and is terminated only by `provider-gateway` - on the Provider-side.
   - Why does either side trust the Inner-TLS? Initially (before onboarding) neither of them does, but they build this trust progressively: starting from the token handover during onboarding, and then both sides pin each other's public key material, and verify the handshake against that.
 - Every key, certificate and CA this RFC introduces can be rotated without re-onboarding (most are already designed to rotate automatically, or can be made automatic as a follow-up).
 - No private key or other secret crosses sides; only public keys, certificates and hashes do - with two exceptions:
