@@ -118,7 +118,7 @@ The portal shows the token as a `kubectl create secret …` command, never in a 
 # 1. the token, from the portal's command
 kind: Secret
 metadata: { name: wildwest-token }
-stringData: { token: "pm1.…" }
+stringData: { token: "pm1.…" }      # left as is: once spent, the token is useless; Alice may delete it
 ---
 # 2. the Provider: "I want this service here, and it's remote"
 kind: Provider
@@ -203,7 +203,7 @@ sequenceDiagram
     O->>G: R5: POST /v1/connections, Bearer tokenSecret,<br/>clusterName, secretHash, Connector CA Set
     Note over G: R6: check secret, spend token,<br/>create Connection
     G-->>O: 201 connectionID, serverKeys, unusedExpiresAt
-    Note over O: R7: persist, delete token data,<br/>request → Registered
+    Note over O: R7: persist,<br/>request → Registered
 ```
 
 ### R1. `platform-mesh-operator` writes before it sends
@@ -307,8 +307,7 @@ Apart from the token secret, which is now spent, nothing in the request or the r
 **Who: `platform-mesh-operator`.**
 1. Writes `connectionID`, the Base URL, the returned Server Keys and `unusedExpiresAt` into the `ProviderEndpointRegistration`, in one write. From now on this object, not the token, is PM's source of truth for the Connection. The Server Keys in it are now PM's pins for every later call.
 2. Records the `connectionID` on the request, and copies URL and `connectionID` into the `Provider`'s status, for the Owner's information only (the Owner can edit that status, so PM never relies on it).
-3. Deletes the token data from Alice's `Secret`: a spent token shouldn't linger in backups or Git.
-4. Marks the request `Registered`. The request is done; everything after is reported on the `Provider`.
+3. Marks the request `Registered`. The request is done; everything after is reported on the `Provider`.
 
 **Who: the Provider's operator** sees nothing yet: no kubeconfig `Secret` exists until the Connection has a Session.
 

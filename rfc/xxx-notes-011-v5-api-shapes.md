@@ -81,7 +81,7 @@ metadata:
   name: wildwest-token
   namespace: default
 stringData:
-  token: pm1.…                        # deleted by platform-mesh-operator once spent
+  token: pm1.…                        # left as is: once spent, the token is useless; the Owner may delete it
 ---
 apiVersion: providers.platform-mesh.io/v1alpha1
 kind: Provider                        # Owner's workspace
@@ -263,7 +263,7 @@ stringData:
     current-context: c-7f3k9q2mx8w4h6j1n5p3r7t9vb
 ```
 
-`platform-mesh-operator` then stores the result, deletes the spent token from the Owner's `Secret`, and marks the request `Registered`.
+`platform-mesh-operator` then stores the result and marks the request `Registered`.
 
 ---
 
