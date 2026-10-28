@@ -30,7 +30,8 @@ In its current form, Platform Mesh puts the burden of being able to offer a serv
 **Goals:**
 
 - Allow distinct personas for "I want to publish a service on this PM Instance" (i.e. Owner) and "I want to offer my service to PM Instances" (i.e. Provider).
-- The Provider doesn't need to care about one specific PM Instance; onboarding and upkeep are fully automatic through APIs.
+- Allow onboarding, upkeep and offboarding of Remote Providers through APIs, without manual steps.
+- The Provider doesn't need to care about one specific PM Instance: one setup serves any number of them.
 - Assume as little as possible about the Provider's infrastructure. Any HTTPS endpoint that supports WebSockets must do. No TLS passthrough, no client-certificate-verifying ingress.
 - No protocol code in the Provider's operator: it runs standard multicluster-runtime reconcilers against one kubeconfig.
   - There can be many kubeconfigs, one per PM connection. A multicluster provider that discovers those kubeconfigs is a follow-up.
