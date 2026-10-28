@@ -8,8 +8,8 @@ title: Remote Providers flow
 | Status  | Proposed   |
 |---------|------------|
 | Author  | @gman0     |
-| Created | 2026-10-27 |
-| Updated | 2026-10-27 |
+| Created | 2026-10-28 |
+| Updated | 2026-10-28 |
 
 ## Summary
 
@@ -143,7 +143,7 @@ The whole API and protocol design would be impossible to digest in one go. So in
 
 A **Connection** is one `Provider` object on one PM Instance (the PM-side), paired with one service provider (the Provider-side). Everything below belongs to exactly one Connection, which is what lets one Provider serve many PM Instances and Owners without mixing them up.
 
-The PM-side talks to the Provider-side's `provider-gateway`, exposed at **Base URL** that the Provider sets up. The "talk", depending on what it is supposed to do, is split into three different channels. Each channel is represented by a WebSocket that goes through the Inner-TLS authentication:
+The PM-side talks to the Provider-side's `provider-gateway`, exposed at a **Base URL** that the Provider sets up. The "talk", depending on what it is supposed to do, is split into three different channels. Each channel is a WebSocket with the Inner-TLS running inside it:
 
 | Channel | Opened by | Received by | When | Authenticated by | Request has | Response has |
 |---|---|---|---|---|---|---|
@@ -624,15 +624,15 @@ Until this first Control Call passes, no Sessions are opened.
 ---
 #### 6. `platform-mesh-operator` writes the `ProviderEndpoint`
 
-Now that PM knows it can reach the Provider-side (Step 5), it tells the Connectors about the Connection, by writing the object they watch: the `ProviderEndpoint`.
+Now that PM knows it can reach the Provider-side (Step 5), it notifies the Connectors about the Connection, by writing the object they watch: the `ProviderEndpoint`.
 
-**`platform-mesh-operator`** writes a singleton `ProviderEndpoint` object named `default` into the Provider Workspace:
+**`platform-mesh-operator`** writes a singleton `ProviderEndpoint` object named `self` into the Provider Workspace:
 
 ```yaml
 apiVersion: providers.platform-mesh.io/v1alpha1
 kind: ProviderEndpoint                # Provider Workspace (3y9j0def); written only by platform-mesh-operator
 metadata:
-  name: default                       # singleton
+  name: self                          # singleton
 spec:
   connectionID: c-7f3k9q2mx8w4h6j1n5p3r7t9vb
   url: https://wildwest.example.com/pm
@@ -641,7 +641,7 @@ spec:
   pendingSecretHash: ""               # only while the Connection Secret changes
 ```
 
-> **Concept: `ProviderEndpoint`.** The PM-side half of a Connection as the Connectors (and the Provider) see it: where to dial, which keys to pin, and, during a Secret Change, the new secret's hash (Step 10).
+> **Concept: `ProviderEndpoint`.** The PM-side half of the Connection. This is what the Connectors (and the Provider too, because this is their workspace) see: where to dial, which keys to pin, and, during a Secret Change, the new secret's hash (Step 10).
 >
 > **Relationship with the `ProviderEndpointRegistration` (PER):** the PER lives in PM's runtime cluster. It is the authoritative record from which the `ProviderEndpoint` is built and stored inside the Provider Workspace on the kcp side. This `ProviderEndpoint` is then the object that Connectors read. That way PM's runtime cluster isn't a single point of failure for traffic: Connectors never need to reach it, so they keep working while it is down.
 
@@ -652,7 +652,7 @@ Nothing is sent to the Provider here. The Provider-side reads this `ProviderEndp
 ---
 #### 7. Connectors open Sessions
 
-Everything so far set the Connection up. Now the Provider gets what it actually needs: a way to reach kcp. The Connectors open Sessions to `provider-gateway`, and the Provider's requests travel over them. From here on, `platform-mesh-operator` is no longer involved in traffic.
+Everything we've seen so far was to set up the Connection. Now the Provider gets what it actually needs: a way to reach kcp. The Connectors open Sessions to `provider-gateway`, and the Provider's requests travel over them. From here on, `platform-mesh-operator` is no longer involved in traffic.
 
 ```mermaid
 sequenceDiagram
@@ -676,7 +676,7 @@ sequenceDiagram
 ---
 ##### 7a. Connectors notice the `ProviderEndpoint`
 
-Each Connector watches the `ProviderEndpoint`s through the `providerendpoints.platform-mesh.io` APIExportEndpointSlice, and decides whether its shard needs a Session for this Connection.
+Each **Connector** watches the `ProviderEndpoint`s through the `providerendpoints.platform-mesh.io` APIExportEndpointSlice, and decides whether its shard needs a **Session** for this Connection.
 
 First, what a Connector and a Session are:
 
@@ -756,12 +756,16 @@ Just a technical note: anyone can try to open a WebSocket at `.../{connectionID}
 ---
 ##### 7c. Both sides authenticate (mTLS)
 
-Inside the `.../session` WebSocket, the Inner-TLS is now mutual. In Registration and on Control Calls, PM proved itself with a secret, inside a one-sided handshake. A Session carries no secret, so the Connector has to prove itself in the handshake itself, with its Connector Certificate. This is the first time the Pinned Bundle from Registration is used.
+Inside the `.../session` WebSocket, the Inner-TLS is now **mutual:** both sides prove who they are in the handshake itself.
+
+If you remember, the Control Calls used a one-way handshake where PM-side verified the Provider, and then the Provider verified PM using the Connection Secret. That was fine because all of this was executed by `platform-mesh-operator` who anyway owns the Connection Secrets, and has them stored locally - in the same cluster. With Connectors however the situation is completely different. They are running next to their respective shards, possibly running in separate clusters. We'd have to somehow distribute *all* per-Connection Connection Secrets among all shards, across the whole PM Installation. Because the system is distributed, we want to limit the dependencies between parts. That's why here the Connectors prove themselves with their own local **Connector Certificates,** from a CA that the Provider-side pinned during Registration.
+
+That way, each Connector is independent, and able to serve traffic regardless of what's happening on the control side of things. Now we'll see how the **Pinned Bundle** from Registration is used.
 
 **`provider-gateway` (server)** presents its Server Key, as in R4 (here, ALPN `pm-session/1` is used). **The Connector** accepts it only if it's in the `ProviderEndpoint.spec.serverKeys[]`.
 
-**The Connector (client)** presents its **Connector Certificate**. **`provider-gateway`** accepts it only if:
-1. it was issued **directly** by a CA in this Connection's **Pinned Bundle** (nothing else is trusted);
+**The Connector (client)** presents its **Connector Certificate**. **`provider-gateway` (server)** accepts it only if:
+1. it was issued **directly** by a CA in this Connection's **Pinned Bundle**;
 2. both the certificate and that CA are still valid;
 3. it's a client certificate.
 
@@ -771,7 +775,7 @@ If any of those checks fail, the handshake aborts and the WebSocket is closed.
 > - The **Connector CA** is one CA per PM Instance, used for nothing but Connector Certificates. cert-manager runs it: valid one year, renewed with a new key 90 days before expiry. Its private key sits in a `Secret` only cert-manager reads.
 > - A **Connector Certificate** is one per shard, issued by the Connector CA, valid 24 hours, renewed by cert-manager every 12 hours with a new key.
 > - The **Connector CA Set** is the list of Connector CA certificates PM currently trusts: the current CA, plus the previous one for a while after a renewal.
-> - The **Pinned Bundle** is the Provider-side's copy of that set, for one Connection: sent at Registration (R5), updated by `PUT .../connector-ca-set`.
+> - The **Pinned Bundle** is the Provider-side's copy of that set, for one Connection: sent at Registration (R5), updated by `PUT .../connector-ca-set`. It's used only to verify Sessions (i.e. neither Registration nor Control Calls ever use this, they just transport it).
 >
 > Why a CA instead of one pinned key per Connector: shards can be added and certificates renewed every day without telling any Provider. Only the yearly CA renewal needs a push to every Connection, which `platform-mesh-operator` does automatically (Step 10).
 
@@ -804,7 +808,7 @@ If both match, it accepts the Session for this Connection (7e).
 ---
 ##### 7e. The Session is live
 
-The Session is now authenticated and bound to its Connection. What's left is to put it to use: both sides start the multiplexer, `provider-gateway` learns what the Session serves, and the Provider's operator gets the kubeconfig it uses to reach kcp.
+The Session is now authenticated and bound to its Connection. What's left is to put it to use: both sides start the multiplexer ([github.com/hashicorp/yamux](https://github.com/hashicorp/yamux)), `provider-gateway` learns what the Session serves, and the Provider's operator gets the kubeconfig it uses to reach kcp.
 
 **Both sides** speak the yamux protocol inside the Session. The direction of communication now reverses: the Provider-side opens Streams towards the PM-side.
 
@@ -927,7 +931,7 @@ We can work on a "runbook" type of document to work out all the actions needed -
 ##### Changing the Connection Secret
 
 The Connection Secret is only ever changed through the `ProviderEndpoint`, never by a call. That happens:
-- on demand (`providers.platform-mesh.io/rotate-connection-secret` annotation on the `Provider` object),
+- on demand (`providers.platform-mesh.io/rotate-connection-secret` annotation on the `Provider` object); we can see if we need this one,
 - when tampering is detected (PM finds an unexpired pinned certificate that isn't one of its own CAs, which only someone holding the Connection Secret could have pushed),
 - or to repair a secret that one side lost.
 
@@ -953,7 +957,7 @@ The Connector CA itself expires after a year. The challenge is to get the new CA
 
 1. **cert-manager** renews the Connector CA, with a new key.
 2. **`platform-mesh-operator`** sees the new CA certificate (in cert-manager's `CertificateRequest`), adds it to the Connector CA Set, and pushes the set (old and new CA) to every Connection with `PUT .../connector-ca-set`. It reports progress in the `ConnectorCASet` object.
-3. **Connectors** switch to a certificate from the new CA only once every reachable Connection trusts it (`Converged`).
+3. **Connectors** switch to a certificate from the new CA only once every reachable Connection trusts it (condition `Converged`).
 4. Once every Connector has switched to the new CA, **`platform-mesh-operator`** drops the old CA from each Connection, spread over time; **`provider-gateway`** closes Sessions still using old-CA certificates gracefully, and the Connectors reopen them at once.
 
 A Provider that was down during a Rollover is caught up by its first successful Control Call, whatever it missed: Control Calls don't depend on the Connector CA.
@@ -1041,7 +1045,7 @@ The alternatives below are whole approaches, not variations of this design. Each
 **PM dials out, but hands the Provider kcp credentials.** PM opens the connection, as in this RFC, but delivers a kcp ServiceAccount token over it. The Provider-side then talks to kcp directly, end to end, through a dial proxy. That spares PM the authorizing proxy. But every Provider has to receive, refresh and protect kcp credentials and trust kcp's CA. A compromised Provider-side keeps a usable kcp token until it expires. And revocation depends on rotating tokens, not on closing connections.
 
 **Syncing objects instead of proxying access.** An agent copies consumers' objects between kcp and the Provider's cluster, and the Provider's operator reconciles local copies. That suits operators that aren't multi-cluster. The problem is where the agent sits:
-- **on the PM-side, as in kube-bind:** PM holds a kubeconfig into the Provider's cluster, so the Provider must expose its own Kubernetes API to every PM Instance it serves and mint a credential for each, and a compromised PM-side can write into the Provider's cluster;
+- **on the PM-side:** PM holds a kubeconfig into the Provider's cluster, so the Provider must expose its own Kubernetes API to every PM Instance it serves and mint a credential for each, and a compromised PM-side can write into the Provider's cluster;
 - **on the Provider-side, as kcp's api-syncagent runs today:** the agent needs a kcp credential, which brings back the first alternative.
 
 Either way, the credentials and the exposure stay, only in a different place. (Running a sync agent *on top of* this RFC, with the kubeconfig `provider-gateway` writes, avoids both; see Follow-ups.)
@@ -1059,7 +1063,7 @@ This model stays supported; it's complementary. This RFC is for Providers that r
 - **Ready-made tunnels and networks:** mesh VPNs need a coordination server both sides trust, and managed tunnels make the vendor's edge trusted.
 - **Newer HTTP tunnelling** (MASQUE, WebTransport, HTTP `CONNECT`): Edges don't reliably pass them.
 - **Application-level signatures:** these would be custom cryptography in place of standard TLS.
-- **SSH over WebSocket:** one audited protocol instead of the Inner-TLS and the multiplexer. But WAFs commonly block SSH as a tunnelling protocol, which conflicts with the goal that any WebSocket-capable Edge must do; and SSH certificates would take the Connector CA out of cert-manager's automatic lifecycle.
+- **SSH over WebSocket:** one audited protocol instead of the Inner-TLS and the multiplexer. But WAFs commonly block SSH as a tunnelling protocol, which conflicts with the goal that any WebSocket-capable Edge must do.
 
 None of these provides the identity lifecycle, meaning Onboarding, rotation and the authorizing proxy, which is where most of this design's complexity lies. TLS inside a WebSocket, with yamux, is built from standard parts and looks like any other encrypted WebSocket traffic to the Edge.
 
@@ -1082,7 +1086,7 @@ None of these change the design; each builds on it.
 
 **PM-side**
 - **The `Provider` part of `platform-mesh-operator` as its own operator.**
-- **Deletion protection for `Provider`s with consumer bindings.** Deleting a `Provider` deletes its APIExport's identity, which kcp can't re-pair with existing bindings.
+- **Deletion protection for `Provider`s with consumer bindings.**
 - **Egress through an HTTP proxy**, for PM Instances whose networks require one.
 - **Edge diagnosis for Sessions**, not just for Control Calls, so Owners learn when the Provider's Edge breaks Sessions.
 - **Per-replica Connector Certificates** from an external issuer, so no private key is mounted into Connectors.
@@ -1091,7 +1095,29 @@ None of these change the design; each builds on it.
 
 ## Appendix
 
-### What if...
+### Recovery
+
+**Moving a side to a new cluster.** Each side's state is in ordinary Kubernetes resources, so a move is a backup and restore, as long as the keys come along:
+- **the Provider** moves its `Connection`s, `ServerKey`s and their `Secret`s with `provider-gateway`;
+- **PM** moves the Connector CA's `Secret` and the `ProviderEndpointRegistration`s with their `Secret`s.
+
+**A Connection deleted by mistake** on the Provider-side shows as `ConnectionUnknown`. The Provider Administrators re-create it with its old `connectionID`, so the consumers' data stays linked to it.
+
+**A `Provider` deleted by mistake** can't be recovered: its workspace and the APIExport's identity go with it, and kcp can't re-pair existing bindings. Deletion protection is a follow-up.
+
+**A side lost without a backup** is a manual effort across organisations. If PM loses the Connector CA's key, every Provider has to re-pin PM's new CA, Connection by Connection. If a Provider loses its Server Keys, it has to hand new ones to the PM Administrators of every PM Instance it serves. Both sides should back up their keys like any other critical credential store.
+
+Step-by-step procedures are follow-up runbooks.
+
+### What the Provider's Edge must allow
+
+On the paths under `<Base URL>/v1/connections/`:
+- **WebSocket upgrades**, over HTTP/1.1;
+- **binary messages up to 32 KB, unchanged**: no payload inspection, no bot challenges;
+- **long-lived connections**: idle timeouts above 30 seconds, and a maximum connection age of an hour or more;
+- **several connections from the same PM address**: a few per Connection.
+
+### Q&A
 
 #### What stops someone from guessing the Connection Secret?
 
@@ -1136,7 +1162,7 @@ With the secret, someone could pin a CA of their own at the Provider, open a Ses
 
 #### What if the Connector CA's key leaks?
 
-PM replaces the CA, and Providers stop trusting the old one within minutes.
+PM Administrator replaces the CA, and Providers stop trusting the old one within minutes:
 1. PM Administrators renew the Connector CA and the Connectors' certificates, and mark the old CA as distrusted.
 2. Once PM's own Connectors use the new CA, `platform-mesh-operator` removes the old one from every Connection, and the Provider-side closes every Session opened under it.
 
@@ -1177,25 +1203,3 @@ They still work together. Each channel negotiates its protocol version, and both
 #### What stops one Provider from starving others?
 
 All Providers share PM's Connectors, so each Connection has its own limits there: on Streams, request rate and requests in flight. No single Provider can exhaust a Connector for the others.
-
-### Recovery
-
-**Moving a side to a new cluster.** Each side's state is in ordinary Kubernetes resources, so a move is a backup and restore, as long as the keys come along:
-- **the Provider** moves its `Connection`s, `ServerKey`s and their `Secret`s with `provider-gateway`;
-- **PM** moves the Connector CA's `Secret` and the `ProviderEndpointRegistration`s with their `Secret`s.
-
-**A Connection deleted by mistake** on the Provider-side shows as `ConnectionUnknown`. The Provider Administrators re-create it with its old `connectionID`, so the consumers' data stays linked to it.
-
-**A `Provider` deleted by mistake** can't be recovered: its workspace and the APIExport's identity go with it, and kcp can't re-pair existing bindings. Deletion protection is a follow-up.
-
-**A side lost without a backup** is a manual effort across organisations. If PM loses the Connector CA's key, every Provider has to re-pin PM's new CA, Connection by Connection. If a Provider loses its Server Keys, it has to hand new ones to the PM Administrators of every PM Instance it serves. Both sides should back up their keys like any other critical credential store.
-
-Step-by-step procedures are follow-up runbooks.
-
-### What the Provider's Edge must allow
-
-On the paths under `<Base URL>/v1/connections/`:
-- **WebSocket upgrades**, over HTTP/1.1;
-- **binary messages up to 32 KB, unchanged**: no payload inspection, no bot challenges;
-- **long-lived connections**: idle timeouts above 30 seconds, and a maximum connection age of an hour or more;
-- **several connections from the same PM address**: a few per Connection.
