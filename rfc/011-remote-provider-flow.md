@@ -931,9 +931,9 @@ We can work on a "runbook" type of document to work out all the actions needed -
 ##### Changing the Connection Secret
 
 The Connection Secret is only ever changed through the `ProviderEndpoint`, never by a call. That happens:
-- on demand (`providers.platform-mesh.io/rotate-connection-secret` annotation on the `Provider` object); we can see if we need this one,
 - when tampering is detected (PM finds an unexpired pinned certificate that isn't one of its own CAs, which only someone holding the Connection Secret could have pushed),
 - or to repair a secret that one side lost.
+- (optional, see [Open questions](#open-questions)) on demand with `providers.platform-mesh.io/rotate-connection-secret` annotation on the `Provider` object,
 
 The flow is then:
 1. **`platform-mesh-operator`** generates a new Connection Secret and stores it as `pendingSecret` inside the `ProviderEndpointRegistration`'s `Secret`.
@@ -1035,6 +1035,8 @@ Local / Managed Providers work the same way as today: they don't define `Provide
 **Who can create `Provider` objects?** At the moment users need a manual binding of `:root:platform-mesh-system:providers.platform-mesh.io` APIExport to get access to the Provider API. We still need to decide on:
 - How can we make this binding automatic? E.g. a dedicated account type?
 - Should those accounts (that have the Provider API) be able to create both Local Providers (with static SA token) AND Remote Providers (with `spec.remote` defined)? If not, maybe we need to have a dedicated `RemoteProviders` resource instead, with a dedicated export.
+
+**Do we need on-demand Connection Secret rotation?** Tampering detection and repair already change the secret when needed; the `providers.platform-mesh.io/rotate-connection-secret` annotation would add rotation on request, e.g. after a suspected leak.
 
 ## Alternatives considered
 
@@ -1162,7 +1164,7 @@ With the secret, someone could pin a CA of their own at the Provider, open a Ses
 
 #### What if the Connector CA's key leaks?
 
-PM Administrator replaces the CA, and Providers stop trusting the old one within minutes:
+PM Administrators replace the CA, and Providers stop trusting the old one within minutes:
 1. PM Administrators renew the Connector CA and the Connectors' certificates, and mark the old CA as distrusted.
 2. Once PM's own Connectors use the new CA, `platform-mesh-operator` removes the old one from every Connection, and the Provider-side closes every Session opened under it.
 
