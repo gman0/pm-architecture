@@ -12,8 +12,8 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Ho
 
 In `platform-mesh-operator`'s kcp manifests (`manifests/kcp`), next to the existing Providers Export:
 - **Providers Export**: add `provideronboardingrequests` and its `APIResourceSchema` ([02 APIs, "ProviderOnboardingRequest"](./xxx-notes-011-v5-impl-02-apis.md)).
-- **In `:root:providers:system`** (the `03-providers` group): the `APIResourceSchema` for `providerendpoints` in `providers.platform-mesh.io`, the `APIExport` `connections.providers.platform-mesh.io` with its permission claim and maximal permission policy, its `APIExportEndpointSlice`, and the policy's RBAC ([02 APIs, "Connection Export"](./xxx-notes-011-v5-impl-02-apis.md)).
-- **Access** in `:root:providers:system`, for the Connectors' group and `platform-mesh-operator`: `access` on `/`; `get`, `list`, `watch` on the Connection Export's `APIExportEndpointSlice`; `apiexports/content` on the Connection Export, read for the Connectors and read and write for `platform-mesh-operator`; `bind` on it for `platform-mesh-operator` ([02 APIs, "Connection Export"](./xxx-notes-011-v5-impl-02-apis.md)).
+- **In `:root:platform-mesh-system`** (the `03-providers` group): the `APIResourceSchema` for `providerendpoints` in `providers.platform-mesh.io`, the `APIExport` `providerendpoints.platform-mesh.io` with its permission claim and maximal permission policy, its `APIExportEndpointSlice`, and the policy's RBAC ([02 APIs, "Connection Export"](./xxx-notes-011-v5-impl-02-apis.md)); and a default binding of it in the Provider Workspaces' `WorkspaceType`, accepting its permission claim ([02 APIs, "The binding in Provider Workspaces"](./xxx-notes-011-v5-impl-02-apis.md)).
+- **Access** in `:root:platform-mesh-system`, for the Connectors' group and `platform-mesh-operator`: `access` on `/`; `get`, `list`, `watch` on the Connection Export's `APIExportEndpointSlice`; `apiexports/content` on the Connection Export, read for the Connectors and read and write for `platform-mesh-operator` ([02 APIs, "Connection Export"](./xxx-notes-011-v5-impl-02-apis.md)).
 
 ## Charts
 
@@ -65,11 +65,11 @@ kcpTopology:
   - **Request headers at the shards**: whoever holds the front-proxy's client certificate.
 
   All but OIDC need PM Administrator access, which is already inside the PM-side's trust boundary. The deployment:
-  - **uses a reserved, distinctive group name**, e.g. `system:platform-mesh:providers-connectors`, set once in values and used for both the `Kubeconfig`s and `platform-mesh-operator`'s Connector RBAC;
+  - **uses a reserved, distinctive group name**, `system:platform-mesh:providers-connectors` (the RFC's), set once in values and used for both the `Kubeconfig`s and `platform-mesh-operator`'s Connector RBAC;
   - **sets an OIDC groups prefix** (e.g. `oidc:`) wherever kcp or the front-proxy accepts OIDC, so no IdP group can match an unprefixed name. **To check**: what PM's Keycloak setup configures today;
   - **restricts runtime-cluster RBAC**: only the chart's deployer can create or update kcp-operator `Kubeconfig`s, and only the Connector can read its certificate `Secret`;
   - **monitors**, if kcp's audit log is collected: TokenRequests from the group that don't come from Connector pods.
-- **Per-shard configuration**, from its `kcpTopology` entry: shard name, its virtual-workspace host, the front-proxy host, and the in-cluster address for each (see "Network"). The virtual-workspace host must be the one kcp writes into endpoint slices (the shard's `virtualWorkspaceURL`): the Connector recognises Provider Workspaces hosted on its shard by it ([05 Connector, "Discovery"](./xxx-notes-011-v5-impl-05-connector.md)).
+- **Per-shard configuration**, from its `kcpTopology` entry: shard name, its virtual-workspace URL (the Connector's `--virtual-workspace-url`), the front-proxy host, and the in-cluster address for each (see "Network"). The virtual-workspace host must be the one kcp writes into endpoint slices (the shard's `virtualWorkspaceURL`): the Connector recognises Provider Workspaces hosted on its shard by it ([05 Connector, "Discovery"](./xxx-notes-011-v5-impl-05-connector.md)).
 - **Connector Certificate**: one cert-manager `Certificate` per shard, rendered in the same loop, from the Connector CA's `ClusterIssuer` (see "Connector CA" below), with a common label for renewing them all at once, mounted into that shard's Connector as an ordinary volume ([04 Connector CA, "Connector Certificates"](./xxx-notes-011-v5-impl-04-connector-ca.md)).
 - **Replicas, resources, anti-affinity** set directly on the Deployment: requests and limits sized from the shard's expected watch count; anti-affinity from the shard's own pods so a burst can't starve the shard; a PodDisruptionBudget so rollouts keep at least one replica.
 

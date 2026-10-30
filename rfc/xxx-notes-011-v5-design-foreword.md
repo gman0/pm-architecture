@@ -172,4 +172,4 @@ The four already in the RFC, plus the ones the sections above establish:
 ## Left for elsewhere
 
 - Versioning, observability, limits: the protocol and component details, not the foreword.
-- Recovery and incident response (lost state, distrusting a CA, abandoning a Connection): RFC 012.
+- Recovery and incident response (lost state, distrusting a CA, abandoning a Connection): RFC 011's Appendix (Recovery, Q&A); step-by-step procedures are follow-up runbooks.

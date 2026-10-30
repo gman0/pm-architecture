@@ -30,7 +30,7 @@ Start here, then follow the walkthrough below, or jump to a component.
 | `providerconnections-connector` | A new service: **`services/providerconnections-connector`**, a **standalone proxy server modelled on kcp's front-proxy**, one per shard, deployed as a plain Deployment with its identity from a kcp-operator `Kubeconfig`. |
 | the SDK | **`platform-mesh/provider-sdk`**: `provider-gateway` (image and chart) built from the module `go.platform-mesh.io/provider-sdk`, both on one semver line released through `cmd/release` ([07](./xxx-notes-011-v5-impl-07-provider-sdk.md)). |
 | Connection object type | **`providers.platform-mesh.io/ProviderEndpoint`**, served only by the Connection Export. `ProviderConnection` is removed. |
-| Connection Export home | **`:root:providers:system`**. |
+| Connection Export home | **`:root:platform-mesh-system`**. |
 | Multiplexer | **yamux** over the WebSocket. |
 | Connector CA | **Managed by cert-manager and rolled over automatically**: 1 year, renewed 90 days before expiry, self-signed by default or from an `issuerRef`. `platform-mesh-operator` pushes each new CA to every Provider before Connectors use it; the **`ConnectorCASet`** reports progress in its status, and PM Administrators distrust a compromised CA by its key in its spec, gated until PM's own Connectors have switched ([04](./xxx-notes-011-v5-impl-04-connector-ca.md)). |
 | Provider-side state | **Custom resources in the Provider's cluster** (`Connection`, `OnboardingToken`, `ServerKey` in `provider-sdk.platform-mesh.io`), the only source of truth; the only `Secret`s hold private keys, `provider-gateway`'s CA, and the kubeconfigs for the operator. |
@@ -67,10 +67,10 @@ Start here, then follow the walkthrough below, or jump to a component.
  └──────────────────────────────────────────┘    side)     │   consumes: providers export,                │
                                                            │             connection export                │
                                                            │   ProviderEndpointRegistrations (own ns)     │
- :root:providers:system                                    │ connector CA (cert-manager, doc 04)          │
+ :root:platform-mesh-system                                │ connector CA (cert-manager, doc 04)          │
  ┌──────────────────────────────────────────┐              └──────────────┬───────────────────────────────┘
  │ connection export                        │                             │ connector certificates
- │   connections.providers.platform-mesh.io │                             │
+ │   providerendpoints.platform-mesh.io     │                             │
  │   + maximal permission policy RBAC       │                             ▼
  │ providers export (unchanged home)        │              ┌──────────────────────────────────────────────┐
  └──────────────────────────────────────────┘              │ connector @ shard-A, -B, …                   │
@@ -96,7 +96,7 @@ Each step names the document and section that owns it; read them in this order t
 1. **The Owner gets a token** from the Provider's portal. It names the Server Key that protects Registration. The token format and its single-use rules: [01 Protocol, "Onboarding Token"](./xxx-notes-011-v5-impl-01-protocol.md). Issuing and verifying: [07 SDK, "OnboardingToken"](./xxx-notes-011-v5-impl-07-provider-sdk.md).
 2. **The Owner creates a remote `Provider` and a `ProviderOnboardingRequest`** referencing it and the token `Secret`, in either order: [02 APIs, "ProviderOnboardingRequest"](./xxx-notes-011-v5-impl-02-apis.md).
 3. **`platform-mesh-operator` reconciles the request under its `Provider`**, reporting `ProviderNotFound` until it exists: [03 Operator, "Reconciling Providers" and "Onboarding requests"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md).
-4. **`platform-mesh-operator` bootstraps the Provider Workspace** (workspace, SA, Connection Export binding, the policies, confirmed in force, then Connector RBAC), without a kubeconfig for Remote Providers: [03 Operator, "Reconciling Providers"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md); the policies: [02 APIs, "Policies in Provider Workspaces"](./xxx-notes-011-v5-impl-02-apis.md).
+4. **`platform-mesh-operator` bootstraps the Provider Workspace** (workspace, SA, the policies, confirmed in force, then Connector RBAC), without a kubeconfig for Remote Providers: [03 Operator, "Reconciling Providers"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md); the policies: [02 APIs, "Policies in Provider Workspaces"](./xxx-notes-011-v5-impl-02-apis.md).
 5. **The request registers the Connection** with the Provider-side, inside Inner TLS pinned to the token's Server Key: generates the Connection Secret, sends its hash and the Connector CA certificates, receives the `connectionID`, Server Keys and `unusedExpiresAt`, and is done (`Registered`): [03 Operator, "Registration"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md); the Provider's side: [07 SDK, "Connection API"](./xxx-notes-011-v5-impl-07-provider-sdk.md); the CA certificates it sends: [04 Connector CA, "The Connector CA Set"](./xxx-notes-011-v5-impl-04-connector-ca.md).
 6. **`platform-mesh-operator` makes a first Control Call**, pushing the current Connector CA Set if it changed, **and writes the `ProviderEndpoint`** into the Provider Workspace through the Connection Export: [03 Operator, "First Control Call and ProviderEndpoint" and "Writing ProviderEndpoints"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md); type and policy: [02 APIs, "ProviderEndpoint" and "Connection Export"](./xxx-notes-011-v5-impl-02-apis.md).
 7. **Connectors discover the `ProviderEndpoint` and open Sessions** where needed: [05 Connector, "Discovery" and "Which Sessions"](./xxx-notes-011-v5-impl-05-connector.md); the Session handshake: [01 Protocol, "Sessions"](./xxx-notes-011-v5-impl-01-protocol.md); the Provider's side: [07 SDK, "Session server"](./xxx-notes-011-v5-impl-07-provider-sdk.md).

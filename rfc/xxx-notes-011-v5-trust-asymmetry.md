@@ -30,7 +30,7 @@ Who carries which risk when something goes wrong, for the RFC's principles. Each
 ## Recovery is asymmetric
 
 - **The Provider-side loses state:** the PM-side notices (`SecretRejected`, or an unknown Connection) and repairs the Connection Secret, or replaces the Connection by Onboarding again, which needs a new token from the Owner.
-- **The PM-side loses the `ProviderEndpointRegistration`'s `Secret`:** the Connection Secret is gone and the Provider-side holds only its hash, so it can't help. Left to RFC 012 (recovery).
+- **The PM-side loses the `ProviderEndpointRegistration`'s `Secret`:** the Connection Secret is gone and the Provider-side holds only its hash, so it can't help. `platform-mesh-operator` repairs it with a Secret Change: it writes a new Connection Secret and puts its hash into the `ProviderEndpoint`, which the Provider-side reads over a Session. If no Session verifies either (a Pinned Bundle that missed a Rollover), the Provider Administrators re-pin the bundle out-of-band first.
 
 The PM-side is the more resilient side and also the bigger single point of failure.
 

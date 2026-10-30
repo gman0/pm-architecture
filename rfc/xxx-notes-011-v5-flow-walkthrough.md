@@ -60,7 +60,7 @@ Some things exist before any Owner does anything.
 
 > **Concept: the Connectors' kcp identity.** To talk to kcp at all (to read `ProviderEndpoint`s, and to mint tokens later), a Connector needs a login. kcp-operator provides one as a `Kubeconfig` resource: it issues a client certificate that names a user and its **groups**, and keeps it renewed. The chart renders one per shard, but they're all alike: each is made for the front-proxy and works at every shard too, and each carries the same group. Rights in kcp are only ever granted to that group, so any shard's Connector can do exactly what any other can.
 
-`platform-mesh-operator` has applied the kcp setup: the **Providers Export** that Owners bind to create `Provider`s, and the **Connection Export** in `:root:providers:system` (explained in step 3).
+`platform-mesh-operator` has applied the kcp setup: the **Providers Export** that Owners bind to create `Provider`s, and the **Connection Export** in `:root:platform-mesh-system` (explained in step 3).
 
 > **Concept: kcp workspaces and shards.** kcp is one Kubernetes-like API split into many **workspaces**, each looking like its own small cluster. Each workspace has a path (`:root:orgs:acme:alice`) and a short internal ID, its **logical cluster name** (e.g. `2x8k9abc`). Workspaces are spread over several **shards** (separate kcp servers); the **front-proxy** sits in front of them and routes `/clusters/<logical cluster name>/…` to the right shard.
 
@@ -145,17 +145,17 @@ spec:
 
 ## 3. `platform-mesh-operator` prepares the Provider Workspace
 
-**Who: `platform-mesh-operator`.** It reconciles each `Provider` in a fixed sequence of steps, each reported as a condition on the `Provider`: `Workspace`, `ConnectionBinding`, `ConnectorAccess`, `Registered`, `Connected`. Each step runs only once the ones before it are done. The first three (3a–3c below) run as soon as the `Provider` exists, whether or not there's a request yet. The request is reconciled under its `Provider`, so everything about one Connection runs in one queue, but it's only acted on in the `Registered` step (3e, then step 4) ([03 Operator, "Reconciling Providers"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
+**Who: `platform-mesh-operator`.** It reconciles each `Provider` in a fixed sequence of steps, each reported as a condition on the `Provider`: `Workspace`, `ConnectorAccess`, `Registered`, `Connected`. Each step runs only once the ones before it are done. The first two (3a–3c below) run as soon as the `Provider` exists, whether or not there's a request yet. The request is reconciled under its `Provider`, so everything about one Connection runs in one queue, but it's only acted on in the `Registered` step (3e, then step 4) ([03 Operator, "Reconciling Providers"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
 
 **3a. Create the Provider Workspace** `:root:providers:wildwest-<Alice's workspace ID>`, and in it a ServiceAccount `default/provider` with admin rights there (condition `Workspace`). That SA is the identity the Provider will act as in kcp, but the Provider never gets a credential for it: the Connectors will use it on the Provider's behalf (step 9).
 
 > **Concept: Provider Workspace.** A workspace PM creates for each `Provider`. The Provider is admin there and creates its APIExport (the service it offers) in it. It lives on one shard, its **Hosting Shard**; in the example, `root`, with logical cluster name `3y9j0def`.
 
-**3b. Bind the Connection Export** into the Provider Workspace (condition `ConnectionBinding`).
+**3b. The Connection Export is already bound** in the Provider Workspace: the workspace's `WorkspaceType` binds it by default, so there's no step or condition for it.
 
 > **Concept: APIExport, APIBinding, virtual workspace.** In kcp, a workspace offers an API by creating an **APIExport**; other workspaces consume it by creating an **APIBinding** to it. The exporter's controllers then see all consumers' objects through the export's **virtual workspace**: a special URL per shard (`https://<shard host>/services/apiexport/<exporter>/<export>/…`) that shows the bound objects across every consumer on that shard. kcp lists those URLs, one per shard that has at least one consumer, in the export's **APIExportEndpointSlice**.
 
-> **Concept: Connection Export.** PM's own APIExport, `connections.providers.platform-mesh.io`, which serves exactly one kind: `ProviderEndpoint`. By binding it into every Provider Workspace, PM can put a `ProviderEndpoint` there (step 6), and every Connector can read all `ProviderEndpoint`s across all shards through the export's virtual workspaces, without needing read access to the Provider Workspaces themselves.
+> **Concept: Connection Export.** PM's own APIExport, `providerendpoints.platform-mesh.io`, which serves exactly one kind: `ProviderEndpoint`. By binding it into every Provider Workspace, PM can put a `ProviderEndpoint` there (step 6), and every Connector can read all `ProviderEndpoint`s across all shards through the export's virtual workspaces, without needing read access to the Provider Workspaces themselves.
 >
 > Two kcp features make it safe even though the Provider is admin in its workspace:
 > - **Maximal permission policy**: the export caps what anyone may do to the objects it serves, wherever they're bound. PM's policy lets everyone read `ProviderEndpoint`s but only `platform-mesh-operator` write them, so the Provider can't edit its own.

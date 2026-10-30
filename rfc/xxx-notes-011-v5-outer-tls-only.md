@@ -1,6 +1,6 @@
 # Notes v5: a sketch with Outer TLS only
 
-Working notes for [011](./011-provider-onboarding-flow-improvements.md), next to the [v5 notes](./xxx-notes-011-provider-onboarding-flow-improvements-v5.md) and the [implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Not the RFC itself. A sketch of v5 without the Inner TLS: every channel is protected only by the TLS that the Provider's Edge terminates. It's what v5 lists as the rejected alternative "Plain Sessions, trusting the Provider's Edge", worked out far enough to compare it with v5 and with the [two-RFC split](./xxx-notes-011-v5-rfc-split.md).
+Working notes for [011](./011-provider-onboarding-flow-improvements.md), next to the [v5 notes](./xxx-notes-011-provider-onboarding-flow-improvements-v5.md) and the [implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Not the RFC itself. A sketch of v5 without the Inner TLS: every channel is protected only by the TLS that the Provider's Edge terminates. It's what v5 lists as the rejected alternative "Plain Sessions, trusting the Provider's Edge", worked out far enough to compare it with v5.
 
 ## The trust model
 
@@ -97,7 +97,7 @@ If the Provider's Edge passes TLS through (an L4 load balancer, SNI routing) and
 ## Where it could fit
 
 - **On its own**: only if PM accepts relying on every Provider's Edge, and states it as a requirement Providers must meet.
-- **As an interim first RFC**, with the Inner TLS as the second: possible, but it ships the regression for a while and adds the Session token that the second RFC removes (see the [split notes](./xxx-notes-011-v5-rfc-split.md) for a split that avoids both).
+- **As an interim first RFC**, with the Inner TLS as the second: possible, but it ships the regression for a while and adds the Session token that the second RFC removes.
 - **The narrower variant** (TLS terminated by `provider-gateway`) as a recommendation inside v5: it doesn't replace the Inner TLS, since PM can't rely on it, but it removes the Edge from the path for Providers that can do it.
 
 ## Documents it would change

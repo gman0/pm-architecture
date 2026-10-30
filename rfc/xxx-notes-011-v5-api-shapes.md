@@ -92,8 +92,8 @@ spec:
     caBundle: ""                      # optional: private CA(s) for the Base URL's outer TLS
 status:                               # written only by platform-mesh-operator
   phase: Ready                        # Pending → Provisioning → Ready ⇄ Degraded, Deleting
-  conditions:                         # one per step: Workspace, ConnectionBinding,
-    - type: Ready                     #   ConnectorAccess, Registered, Connected; and Ready
+  conditions:                         # one per step: Workspace, ConnectorAccess,
+    - type: Ready                     #   Registered, Connected; and Ready
       status: "True"
   connection:                         # for the Owner's information only, never used by PM
     url: https://wildwest.example.com/pm
@@ -122,9 +122,9 @@ The Connection Export serves one kind, `ProviderEndpoint` (step 6), and lets Con
 
 ```yaml
 apiVersion: apis.kcp.io/v1alpha2
-kind: APIExport                       # :root:providers:system
+kind: APIExport                       # :root:platform-mesh-system
 metadata:
-  name: connections.providers.platform-mesh.io
+  name: providerendpoints.platform-mesh.io
 spec:
   resources:
     - group: providers.platform-mesh.io
@@ -140,10 +140,10 @@ spec:
 apiVersion: apis.kcp.io/v1alpha2
 kind: APIBinding                      # Provider Workspace; created by platform-mesh-operator
 metadata:
-  name: connections.providers.platform-mesh.io
+  name: providerendpoints.platform-mesh.io
 spec:
   reference:
-    export: { path: root:providers:system, name: connections.providers.platform-mesh.io }
+    export: { path: root:providers:system, name: providerendpoints.platform-mesh.io }
   permissionClaims:
     - group: apis.kcp.io
       resource: apiexportendpointslices

@@ -38,10 +38,10 @@ Defined in `provideronboardingrequest_types.go` (bringing the type in line with 
 - **Created by the Owner**, never by `platform-mesh-operator`. A `Provider` left behind by a failed Onboarding waits for the next request.
 - **Admin SA**: for Remote Providers, `platform-mesh-operator` creates it as `provider` in namespace `default` in every Provider Workspace; Connectors know the name as a constant. Local Providers keep `<name>-provider` (RFC 006).
 - **One writer**: `platform-mesh-operator` writes the whole status, for both kinds ([03 Operator](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
-- **Conditions**: one per reconcile step, plus the aggregate `Ready`. For Remote Providers: `Workspace`, `ConnectionBinding`, `ConnectorAccess`, `Registered`, `Connected`, `Ready`, and the warnings `ProtocolOutdated` and `TrustOutdated`, which don't affect `Ready`. Specific causes are in the messages, which start with a stable label. Aggregate only; no shard names.
+- **Conditions**: one per reconcile step, plus the aggregate `Ready`. For Remote Providers: `Workspace`, `ConnectorAccess`, `Registered`, `Connected`, `Ready`, and the warnings `ProtocolOutdated` and `TrustOutdated`, which don't affect `Ready`. Specific causes are in the messages, which start with a stable label. Aggregate only; no shard names.
 - **`phase`**, for both kinds: `Pending → Provisioning → Ready ⇄ Degraded`, and `Deleting`, computed from the conditions; `Degraded` only for a `Provider` that was `Ready` before (`status.lastReadyTime`).
 - **`status.connection`**: `url` and `connectionID` in use, for the Owner's information; never used as a link. When a new Connection replaces an earlier one, an Event names the old and the new Base URL host and `connectionID` ([03 Operator, "Onboarding requests"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
-- **Annotation `providers.platform-mesh.io/rotate-connection-secret`**: any new value makes `platform-mesh-operator` change the Connection Secret once; values arriving while a change runs are coalesced, and on-demand changes are rate-limited ([03 Operator, "Secret Changes"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
+- **Annotation `providers.platform-mesh.io/rotate-connection-secret`** (optional: an open question in the RFC, whether on-demand rotation is needed at all; implement last, behind the other triggers): any new value makes `platform-mesh-operator` change the Connection Secret once; values arriving while a change runs are coalesced, and on-demand changes are rate-limited ([03 Operator, "Secret Changes"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
 - **Annotation `providers.platform-mesh.io/abandon-connection=<connectionID>`**: gives up the Connection, for a Provider that won't come back. It acts only if the value is the current `connectionID`. `platform-mesh-operator` deletes the `ProviderEndpoint`, sends a best-effort `DELETE` to the Provider-side, and deletes the `ProviderEndpointRegistration` and its `Secret`; the Provider Workspace, its SA, the binding and the RBAC stay. The `Provider` then shows `Registered=False` with `ConnectionAbandoned`, plus an Event, and a normal request onboards it anew, with a new `connectionID` ([03 Operator, "Abandoning a Connection"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
 
 ### ProviderConnection (remove)
@@ -115,24 +115,24 @@ spec:
 
 ### Connection Export
 
-`APIExport connections.providers.platform-mesh.io` in **`:root:providers:system`**:
+`APIExport providerendpoints.platform-mesh.io` in **`:root:platform-mesh-system`**:
 - **Resources**: `providerendpoints` in `providers.platform-mesh.io`. The Providers Export serves other resources of the same group; kcp checks binding conflicts per resource name, not per group, and no workspace binds both exports.
 - **Permission claim**: `apis.kcp.io/apiexportendpointslices`, verbs `get`, `list`, `watch`. The only claim. Connectors use it to see which shards have consumers ([05 Connector, "Which Sessions"](./xxx-notes-011-v5-impl-05-connector.md)).
-- **`maximalPermissionPolicy.local`**, with RBAC in `:root:providers:system`:
+- **`maximalPermissionPolicy.local`**, with RBAC in `:root:platform-mesh-system`:
   - `get`, `list`, `watch` on `providerendpoints` for the group `apis.kcp.io:binding:system:authenticated`;
   - writes (including `deletecollection` and `/status` if ever added) only for `apis.kcp.io:binding:<operator identity>`.
 - **Endpoint slice**: one `APIExportEndpointSlice` for the export, consumed by `platform-mesh-operator` and every Connector.
-- **Access in `:root:providers:system`**, for the Connectors' group (read only) and `platform-mesh-operator` (read and write on `content`). Nobody else:
+- **Access in `:root:platform-mesh-system`**, for the Connectors' group (read only) and `platform-mesh-operator` (read and write on `content`). Nobody else:
   - `access` on `/`: kcp requires it for any workspace content, and the APIExport virtual workspace checks `apiexports/content` with a SubjectAccessReview in this workspace, which applies the same check;
-  - `get`, `list`, `watch` on `apiexportendpointslices`, `resourceNames: [connections.providers.platform-mesh.io]`: multicluster-provider lists and watches the slice by name;
+  - `get`, `list`, `watch` on `apiexportendpointslices`, `resourceNames: [providerendpoints.platform-mesh.io]`: multicluster-provider lists and watches the slice by name;
   - `get`, `list`, `watch` on `apiexports/content` for this export; `platform-mesh-operator` also the write verbs.
 
   `platform-mesh-operator`'s grants are listed even though its current identity (`kcp-admin`) has them anyway, so a dedicated identity later doesn't silently lose access.
 
 ### The binding in Provider Workspaces
 
-- **Created by `platform-mesh-operator`** with the workspace, with a **fixed name** (e.g. `connections.providers.platform-mesh.io`), accepting the one permission claim ([03 Operator, "Connection Export binding"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
-- **Protected by the Connector's policy**: the Provider can't update or delete it through a Session ([05 Connector, "Authorization and policy"](./xxx-notes-011-v5-impl-05-connector.md)). If it disappears anyway, `platform-mesh-operator` recreates it and rewrites the `ProviderEndpoint`.
+- **A default binding of the Provider Workspaces' `WorkspaceType`**, so every Provider Workspace has it from creation, accepting the one permission claim ([03 Operator, "Connection Export binding"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md), which also notes what to verify).
+- **Protected by the Connector's policy**: the Provider can't update or delete it through a Session ([05 Connector, "Authorization and policy"](./xxx-notes-011-v5-impl-05-connector.md)). It isn't recreated automatically; a PM Administrator's mistake is fixed by hand.
 
 ## Policies in Provider Workspaces
 

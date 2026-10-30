@@ -17,7 +17,7 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Th
 
 ## Principles
 
-- **Stateless** (overview, principle 5): everything comes from its deployment (shard name, its virtual-workspace host, the front-proxy, the in-cluster address of each, its Connector Certificate) and the Connection Export.
+- **Stateless** (overview, principle 5): everything comes from its deployment (shard name, its virtual-workspace URL, the flag `--virtual-workspace-url`, the front-proxy, the in-cluster address of each, its Connector Certificate) and the Connection Export.
 - **The Provider's only path into kcp**: whatever it allows, the Provider can do; the policy is the security guarantee and is tested as such ([10 Testing](./xxx-notes-011-v5-impl-10-testing.md)).
 - **A standalone proxy, like kcp's front-proxy** (`kcp/pkg/proxy`): its own `http.Server`, a few filters taken from upstream `k8s.io/apiserver` (`WithPanicRecovery`, `WithHTTPLogging`), its own path parsing (see "Path parsing"), and `httputil.ReverseProxy`. No generic apiserver.
 - **kcp owns request timeouts.** The Connector applies none of its own to proxied requests and has no shared in-flight cap; its limits are per Connection (see "Limits").
@@ -52,7 +52,7 @@ Nothing reaches the Connector from the network except the ops listener: it dials
 
 ## Discovery
 
-- **Consumes the Connection Export's endpoint slice** through the front-proxy, and list/watches through every shard's virtual-workspace URL in it, with read-only `apiexports/content`, using multicluster-runtime's endpoint-slice provider (kcp-multicluster-provider). The grants it needs in `:root:providers:system` are in [02 APIs, "Connection Export"](./xxx-notes-011-v5-impl-02-apis.md).
+- **Consumes the Connection Export's endpoint slice** through the front-proxy, and list/watches through every shard's virtual-workspace URL in it, with read-only `apiexports/content`, using multicluster-runtime's endpoint-slice provider (kcp-multicluster-provider). The grants it needs in `:root:platform-mesh-system` are in [02 APIs, "Connection Export"](./xxx-notes-011-v5-impl-02-apis.md).
 - **Sees two things**:
   - `ProviderEndpoint`s, each arriving with its Provider Workspace's logical cluster;
   - the Provider Workspaces' Service `apiexportendpointslices`, through the export's permission claim.
@@ -169,7 +169,7 @@ Adding a shape later is a contained change: a parser, a scope rule and an upstre
 
 - **SA tokens**: each replica mints tokens for the fixed admin SA `default/provider` in the Provider Workspace of every Connection it has Sessions for, with TokenRequest through the front-proxy, caches them in memory, refreshes at half their lifetime, and never writes or sends them anywhere else.
 - **The Connector's own identity** comes from a kcp-operator `Kubeconfig` per shard ([09 Deployment, "Connector"](./xxx-notes-011-v5-impl-09-deployment.md)): a client certificate for **one group** shared by all shards' Connectors. Its certificate is issued for the front-proxy, by the RootShard's client CA, which the shards also trust, so it's accepted at every shard's virtual-workspace URL as well. The identity needs:
-  - in `:root:providers:system`: `access` on `/`, read on the Connection Export's `APIExportEndpointSlice`, and read-only `apiexports/content` on the Connection Export ([02 APIs, "Connection Export"](./xxx-notes-011-v5-impl-02-apis.md));
+  - in `:root:platform-mesh-system`: `access` on `/`, read on the Connection Export's `APIExportEndpointSlice`, and read-only `apiexports/content` on the Connection Export ([02 APIs, "Connection Export"](./xxx-notes-011-v5-impl-02-apis.md));
   - in every Provider Workspace, `access` and `create` on `serviceaccounts/token` for that one SA (`resourceNames: [provider]`), granted by `platform-mesh-operator` ([03 Operator, "Connector RBAC"](./xxx-notes-011-v5-impl-03-platform-mesh-operator.md)).
 - **In the runtime cluster**: read access to the `ConnectorCASet` in `providers.platform-mesh.io` (public data, for the switch rule) and its own Connector Certificate `Secret`. Nothing else.
 - **No `Shard` objects, no `/services/admin`, no cache server.**
@@ -217,7 +217,7 @@ Adding a shape later is a contained change: a parser, a scope rule and an upstre
 - **Replicas**: every replica serves every Connection its shard needs; rendezvous hashing over replicas remains an option if Session counts at Providers ever matter more.
 - **Deployment**: a plain Deployment per shard, its identity from a kcp-operator `Kubeconfig`, the Connector Certificate as an ordinary volume ([09 Deployment, "Connector"](./xxx-notes-011-v5-impl-09-deployment.md)).
 - **Workspace creation** below the Provider Workspace: denied.
-- **Connector identity**: one group for all shards.
+- **Connector identity**: one group for all shards, `system:platform-mesh:providers-connectors`.
 - **Where Service endpoint slices live**: a stated requirement for Providers: in the Provider Workspace, for exports in that workspace ([07 SDK](./xxx-notes-011-v5-impl-07-provider-sdk.md), [08 Quickstart](./xxx-notes-011-v5-impl-08-provider-quickstart.md)).
 
 ## Declined

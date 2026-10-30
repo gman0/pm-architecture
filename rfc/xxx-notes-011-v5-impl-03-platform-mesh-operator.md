@@ -6,7 +6,7 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). `p
 
 **Owns:**
 - reconciling `Provider`s, local and remote, and with them their `ProviderOnboardingRequest`s;
-- Provider Workspaces and everything PM creates in them: the admin SA, the Connection Export binding, the policies that restrict RBAC subjects and SA-token `Secret`s, the Connector RBAC, and for Local Providers the scoped kubeconfig;
+- Provider Workspaces and everything PM creates in them: the admin SA, the policies that restrict RBAC subjects and SA-token `Secret`s, the Connector RBAC, and for Local Providers the scoped kubeconfig;
 - `ProviderEndpointRegistration`s and their `Secret`s, in its namespace in PM's runtime cluster ([02 APIs, "ProviderEndpointRegistration"](./xxx-notes-011-v5-impl-02-apis.md));
 - every call to a Provider's Connection API ([01 Protocol](./xxx-notes-011-v5-impl-01-protocol.md));
 - `ProviderEndpoint`s in Provider Workspaces ([02 APIs](./xxx-notes-011-v5-impl-02-apis.md));
@@ -20,7 +20,7 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). `p
 ## What it consumes
 
 - **The Providers Export's endpoint slice**: `ProviderOnboardingRequest`s and `Provider`s in Owners' workspaces, and token `Secret`s there, read by name and uncached through the export's `Secret`s claim (see "`Secret`s").
-- **The Connection Export's endpoint slice** (`:root:providers:system`): it reconciles Provider Workspaces over it, each through its shard's virtual workspace, and writes their `ProviderEndpoint`s.
+- **The Connection Export's endpoint slice** (`:root:platform-mesh-system`): it reconciles Provider Workspaces over it, each through its shard's virtual workspace, and writes their `ProviderEndpoint`s.
 - **`Workspace` objects in `:root:providers`**, for Provider Workspaces' logical clusters.
 - **The Connector CA's `CertificateRequest`s** in cert-manager's namespace, for the CA's public certificates; **the Connector Certificates' `CertificateRequest`s** in the Connectors' namespace, to see which CA each Connector's current certificate chains to; and the **`ConnectorCASet`**, whose `spec.distrust` it reads and whose status it writes ([04 Connector CA](./xxx-notes-011-v5-impl-04-connector-ca.md)).
 - **Outbound HTTPS to Providers' Base URLs.**
@@ -43,10 +43,9 @@ The `Provider` reconciler runs a fixed sequence of steps per kind. Each step onl
 | Step | Local Providers | Remote Providers |
 |---|---|---|
 | 1 | `Workspace`: the Provider Workspace and the admin SA | `Workspace`: the Provider Workspace and the admin SA `default/provider` (cluster-admin in the workspace, the SA that Connectors act as) |
-| 2 | `Kubeconfig`: an SA-token `Secret`, and a scoped kubeconfig copied to the Owner's workspace (RFC 006) | `ConnectionBinding`: the binding to the Connection Export (below) |
-| 3 | | `ConnectorAccess`: the policies in the Provider Workspace, confirmed, then the Connector RBAC (below) |
-| 4 | | `Registered`: handles the onboarding request (see "Onboarding requests"), makes the first Control Call, writes the `ProviderEndpoint` (see "First Control Call and ProviderEndpoint") |
-| 5 | | `Connected`: health on every poll, plus the Connection's upkeep (see "Health") |
+| 2 | `Kubeconfig`: an SA-token `Secret`, and a scoped kubeconfig copied to the Owner's workspace (RFC 006) | `ConnectorAccess`: the policies in the Provider Workspace, confirmed, then the Connector RBAC (below) |
+| 3 | | `Registered`: handles the onboarding request (see "Onboarding requests"), makes the first Control Call, writes the `ProviderEndpoint` (see "First Control Call and ProviderEndpoint") |
+| 4 | | `Connected`: health on every poll, plus the Connection's upkeep (see "Health") |
 
 **`ProviderOnboardingRequest`s are reconciled under their `Provider`'s key.** An event for a request enqueues the key of the `Provider` its `spec.providerRef` names (the request's logical cluster plus that name), so everything about one Connection (the request, Registration, the `ProviderEndpointRegistration`, Secret Changes, health) runs in one queue, one reconcile at a time. The `ProviderEndpointRegistration` therefore has one writer in code; PM Administrators' edits to it are updates with `resourceVersion`, like any other write. If the `Provider` doesn't exist, the reconcile sets the condition `ProviderNotFound` on the request and stops there.
 
@@ -54,15 +53,14 @@ The Provider Workspace is `:root:providers:<Provider name>-<the Provider's kcp.i
 
 ### Connection Export binding
 
-- **Created with a fixed name** in the Provider Workspace, referencing the Connection Export in `:root:providers:system` and accepting its one permission claim (read-only `apiexportendpointslices`) ([02 APIs, "The binding in Provider Workspaces"](./xxx-notes-011-v5-impl-02-apis.md)).
-- **Recreated if deleted.** The Provider can't delete it through a Session ([05 Connector, "Authorization and policy"](./xxx-notes-011-v5-impl-05-connector.md)), but a PM Administrator's error could.
-- **Bind permission**: `platform-mesh-operator` needs `bind` on the Connection Export.
+- **Comes with the workspace**: the Provider Workspaces' `WorkspaceType` binds the Connection Export by default, accepting its one permission claim (read-only `apiexportendpointslices`) ([02 APIs, "The binding in Provider Workspaces"](./xxx-notes-011-v5-impl-02-apis.md)). `platform-mesh-operator` creates no binding and has no step or condition for it. **To verify**: that a `WorkspaceType`'s default binding can accept the export's permission claim; if not, `platform-mesh-operator` creates the binding itself after `Workspace` (the RFC's alternative).
+- **Not recreated if deleted.** The Provider can't delete it through a Session ([05 Connector, "Authorization and policy"](./xxx-notes-011-v5-impl-05-connector.md)); a PM Administrator who deletes it by mistake re-creates it by hand. Until then, `platform-mesh-operator` can't write the `ProviderEndpoint`, which shows on the `Provider`.
 
 ### Connector RBAC
 
 Before granting any access, `platform-mesh-operator` creates in the Provider Workspace the two `ValidatingAdmissionPolicy`s, their bindings and the ClusterRole `providers.platform-mesh.io:apiexport-bind` ([02 APIs, "Policies in Provider Workspaces"](./xxx-notes-011-v5-impl-02-apis.md)), with its own kcp username, from its configuration, in their `matchConditions`. kcp enforces new policies asynchronously, so it then **confirms enforcement**: a dry-run create (`dryRun=All`) of a `RoleBinding` that the policy must refuse (a `User` subject outside `apis.kcp.io:binding:`), impersonating `default/provider`. Until the policy refuses it, `ConnectorAccess=False` with `PolicyNotEnforced`, and nothing later runs; no `ProviderEndpoint` is written before the policies are in force.
 
-Then, for the **Connectors' identity** (one group shared by all shards' Connectors), a role and binding:
+Then, for the **Connectors' identity** (one group shared by all shards' Connectors, `system:platform-mesh:providers-connectors`, from the configuration), a role and binding:
 - `access` on `/` (workspace content);
 - `create` on `serviceaccounts/token` with `resourceNames: [provider]`, in namespace `default`.
 
@@ -78,7 +76,7 @@ A CEL rule on `ProviderSpec`: `spec.remote` excludes `providerKubeconfigSecret` 
 - **one per step, named after it**: `True` when it's done, `False` when it isn't, with a message saying why. Steps after one that isn't done aren't run;
 - **`Ready`**: `True` when every step is done. The printer column shows it.
 
-For Remote Providers that's `Workspace`, `ConnectionBinding`, `ConnectorAccess`, `Registered`, `Connected` and `Ready`, plus the warnings **`ProtocolOutdated`** and **`TrustOutdated`** (see "Health"), which don't affect `Ready`.
+For Remote Providers that's `Workspace`, `ConnectorAccess`, `Registered`, `Connected` and `Ready`, plus the warnings **`ProtocolOutdated`** and **`TrustOutdated`** (see "Health"), which don't affect `Ready`.
 
 **Messages start with a stable label** and say what to fix, for example `EdgeBotChallenge: the Provider's edge answered the WebSocket upgrade on /control with an HTML page. Ask the Provider to exempt its connection paths from bot protection; see its edge checklist.` People read these; the labels keep them consistent and testable. The labels are listed with the steps that use them below.
 
@@ -217,7 +215,7 @@ The only way a Connection Secret changes ([01 Protocol, "Changing the Connection
 **One at a time** per Connection. A trigger that arrives while a change runs is acted on after it completes; several on-demand requests in the meantime are coalesced into one.
 
 **Triggers:**
-- **On demand**: the annotation `providers.platform-mesh.io/rotate-connection-secret` on the `Provider`, set by the Owner or by PM Administrators, e.g. `kubectl annotate provider my-provider providers.platform-mesh.io/rotate-connection-secret="$(date -u +%FT%TZ)" --overwrite`. Any new value triggers one change; the value last acted on is kept in the `ProviderEndpointRegistration` (`rotationRequest`), so re-applying the same value (e.g. through GitOps) does nothing. On-demand changes are rate-limited per Connection (e.g. at most one per 10 minutes), so a script or a GitOps loop writing timestamps can't keep a Connection changing; a deferred one is noted in the `Connected` message and counted. Trusting it is harmless: it only makes PM change a Connection Secret that PM controls, and it's never used as a link.
+- **On demand** (optional, an open question in the RFC; tampering and repair don't depend on it): the annotation `providers.platform-mesh.io/rotate-connection-secret` on the `Provider`, set by the Owner or by PM Administrators, e.g. `kubectl annotate provider my-provider providers.platform-mesh.io/rotate-connection-secret="$(date -u +%FT%TZ)" --overwrite`. Any new value triggers one change; the value last acted on is kept in the `ProviderEndpointRegistration` (`rotationRequest`), so re-applying the same value (e.g. through GitOps) does nothing. On-demand changes are rate-limited per Connection (e.g. at most one per 10 minutes), so a script or a GitOps loop writing timestamps can't keep a Connection changing; a deferred one is noted in the `Connected` message and counted. Trusting it is harmless: it only makes PM change a Connection Secret that PM controls, and it's never used as a link.
 - **After tampering** with a Pinned Bundle, and when a **distrusted CA is still pinned** (see "Connector CA Set"). Not rate-limited.
 - **Repair**: when the `Secret` is missing, or the Provider-side rejects both `secret` and `pendingSecret` while the Inner TLS against its pinned Server Key succeeds and the answer concerns this Connection (e.g. its store was restored from an older backup). A missing `ProviderEndpointRegistration` is first rebuilt from the `ProviderEndpoint` (`connectionID`, Base URL, Server Keys). Repairs are rate-limited per Connection (e.g. at most one per hour), so an Edge or Provider bug that breaks authentication can't cause a loop of changes; the first repair of a new Connection, before its `ProviderEndpoint` exists, is exempt (see "First Control Call and ProviderEndpoint").
 
@@ -291,7 +289,7 @@ The code for Remote Providers makes outbound calls to Providers on the internet 
 
 Beyond what `platform-mesh-operator` needs for Local Providers:
 - **In kcp**:
-  - in `:root:providers:system`: `access` on `/`, read on the Connection Export's `APIExportEndpointSlice`, and `apiexports/content` on the Connection Export, including writes to `providerendpoints`, granted by the export's maximal permission policy ([02 APIs, "Connection Export"](./xxx-notes-011-v5-impl-02-apis.md)); `bind` on the Connection Export;
+  - in `:root:platform-mesh-system`: `access` on `/`, read on the Connection Export's `APIExportEndpointSlice`, and `apiexports/content` on the Connection Export, including writes to `providerendpoints`, granted by the export's maximal permission policy ([02 APIs, "Connection Export"](./xxx-notes-011-v5-impl-02-apis.md));
   - in Provider Workspaces: creating the policies, their bindings, the ClusterRole and the Connector RBAC, and impersonating `default/provider` for the dry-run check.
 
   Its current identity, `kcp-admin`, has all of this; the grants are listed so that a dedicated identity later doesn't silently lose any.
@@ -315,7 +313,7 @@ Beyond what `platform-mesh-operator` needs for Local Providers:
 
 1. The `Provider` reconciler's remote sequence, next to the local one, with onboarding requests mapped to their `Provider`'s key; `phase` computed from the conditions for both kinds, with `status.lastReadyTime`.
 2. The CEL rules in `platform-mesh/apis`: local fields on Remote Providers; the request's immutable spec.
-3. The remote bootstrap steps: workspace, Connection Export binding, the policies and their dry-run check, Connector RBAC.
+3. The remote bootstrap steps: workspace, the policies and their dry-run check, Connector RBAC.
 4. Onboarding requests and their phases, including the gate on Remote Providers being installed.
 5. The protocol client, in its own package: Registration and Control Sessions (WebSocket, Inner TLS with pinned keys, HTTP/1.1), retries, egress rules, input limits and fuzz tests. Built against the SDK's test server ([07 SDK, "Testing support"](./xxx-notes-011-v5-impl-07-provider-sdk.md)).
 6. The `ProviderEndpointRegistration` CRD; Registration, the first Control Call and the `ProviderEndpoint`s writer, with drift repair, server-key updates, Base URL changes, `caBundle` and `pendingSecretHash`; rebuilding a lost `ProviderEndpointRegistration`.

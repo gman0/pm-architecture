@@ -4,7 +4,7 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Wo
 
 ## Cleanups in existing code
 
-- **Rename the Local Provider steps in `platform-mesh-operator`'s code** (`ProviderWorkspaceSubroutine`, `ScopedKubeconfigSubroutine`) to `Workspace` and `Kubeconfig`. Their names become the condition types Owners see, consistent with the remote steps (`Workspace`, `ConnectionBinding`, `ConnectorAccess`, `Registered`, `Connected`).
+- **Rename the Local Provider steps in `platform-mesh-operator`'s code** (`ProviderWorkspaceSubroutine`, `ScopedKubeconfigSubroutine`) to `Workspace` and `Kubeconfig`. Their names become the condition types Owners see, consistent with the remote steps (`Workspace`, `ConnectorAccess`, `Registered`, `Connected`).
 - **ManagedProviders and `Degraded`**: decide how a ManagedProvider reacts when its `Provider` goes from `Ready` to `Degraded`. Its wait step compares `phase` with `Ready`.
 - **Fix the `Provider`'s `KubeconfigSecret` printer column**: it points at `.status.kubeconfigSecretRef.name`, while the field is `providerKubeconfigSecretRef`.
 - **Update the types in `platform-mesh/apis`** to the plan: the `ProviderOnboardingRequest` type still has the `Rebinding` phase and `connectionSecretRef`; `Provider`'s condition constants still list `SessionsConnected`, `KcpReachable`, `SecretCurrent` and `Rebinding`; the doc comment on `status.connection` still mentions rebinding. The request also gains `spec.tokenID` and an immutable spec. The new `ProviderEndpointRegistration`, `ConnectorCASet` (with `spec.distrust`) and `ProviderEndpoint` kinds go into `providers.platform-mesh.io`, next to `ManagedProvider` in `platform-mesh-operator`'s `api/providers/v1alpha1`.
@@ -13,7 +13,7 @@ Part of the [v5 implementation plan](./xxx-notes-011-v5-impl-00-overview.md). Wo
 
 - **Split the `Provider` part of `platform-mesh-operator` into its own operator**, taking the Remote Providers' Connection code with it. Until then, code that talks to Providers on the internet runs in PM's most privileged component; the split ends that.
 - **Deletion protection for `Provider`s with consumer bindings.** Deleting a `Provider` deletes its workspace and the APIExport's identity, which kcp can't re-pair with existing bindings.
-- **Runbooks**, written together with RFC B from a full scan of all v5 docs (everything they call a runbook or a manual step), step by step, each with when to use it, the commands, and how to tell it worked:
+- **Runbooks** (a follow-up in RFC 011), written from a full scan of all v5 docs (everything they call a runbook or a manual step), step by step, each with when to use it, the commands, and how to tell it worked:
   - *shards*: adding or removing a shard, changing `infra`'s shards and the `providerconnections` `kcpTopology` in one profile change;
   - *Connector CA*: what the `ConnectorCASet` status means; Connections not reached; the CA's `CertificateRequest`s (don't delete them, raise `revisionHistoryLimit` when its alert fires, approver-policy must allow them); an expired Connector Certificate (what ends open Sessions, what can't start);
   - *compromise response*: `cmctl renew` of the CA and of every Connector Certificate by label, getting a `key-sha256` fingerprint (the openssl commands), `spec.distrust`, `immediate`, rollback; a shard's Connector Certificate key;

@@ -72,7 +72,7 @@ How kcp-multicluster-provider engages clusters, including when a logical cluster
 
 | Scenario | Checks |
 |---|---|
-| Secret Change | A new value of the `providers.platform-mesh.io/rotate-connection-secret` annotation: the hash goes through the `ProviderEndpoint`, the Provider-side adopts it, the old Connection Secret is refused afterwards; Sessions unaffected |
+| Secret Change | A repair (e.g. a deleted Connection Secret `Secret`), or, if on-demand rotation is kept, a new value of the `providers.platform-mesh.io/rotate-connection-secret` annotation: the hash goes through the `ProviderEndpoint`, the Provider-side adopts it, the old Connection Secret is refused afterwards; Sessions unaffected |
 | Rapid annotations | Several new values in quick succession: one change at a time, later values coalesced, on-demand changes within the rate limit, a deferral noted in `Connected`'s message |
 | Secret Change without Sessions | All Sessions blocked at the test Edge: the change waits, the old Connection Secret keeps working, and the change completes once Sessions return |
 | Connection Secret repair | In turn: the `ProviderEndpointRegistration`'s `Secret` deleted; the `ProviderEndpointRegistration` deleted (its `Secret` goes with it, and it's rebuilt from the `ProviderEndpoint`); the quickstart's `Connection` restored from an older snapshot, so it rejects PM's Connection Secret. Each time the Connection Secret is repaired with the same `connectionID`, without Owner action, and repeated failures stay within the rate limit |
