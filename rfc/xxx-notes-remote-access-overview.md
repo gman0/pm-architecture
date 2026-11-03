@@ -20,32 +20,32 @@ The universal primitive is: **a user wants their external runtime cluster to
 hold a kubeconfig for a workspace they control on a PM instance.** Their
 operators run against that workspace from their own infrastructure.
 
-On top of this primitive, two components address different points on the
-complexity curve:
+On top of this primitive, the **access SDK** manages kubeconfig Secrets in
+the user-side cluster: SA token renewal, CA bundle rotation, offboarding
+detection. It serves the public HTTPS `/access` endpoint that access-operator
+dials to deliver credentials (PM-initiated), and mints `pma1` tokens on
+`AccessIdentity` creation (owned Secret, HMAC secret stored for
+verification). Tunnel mode is opt-in (RFC 3): keeps the `/access` connection
+alive as a reverse L4 channel when PM's front-proxy is not directly
+reachable, and adds session-based reconnect authentication on top of the
+baseline handshake.
 
-- **access SDK** — manages kubeconfig Secrets in the user-side cluster: SA
-  token renewal, CA bundle rotation, offboarding detection. Serves the public
-  HTTPS `/access` endpoint that access-operator dials to deliver credentials
-  (PM-initiated). Mints `pma1` tokens on `AccessIdentity` creation (owned
-  Secret, HMAC secret stored for verification). Tunnel mode is opt-in (RFC 3):
-  keeps the `/access` connection alive as a reverse L4 channel when PM's
-  front-proxy is not directly reachable, and adds session-based reconnect
-  authentication on top of the baseline handshake.
-- **provider SDK** — Go library a Provider's portal imports when it operates a
-  multi-tenant service. Automates `AccessIdentity` creation on the Provider's
-  own cluster (same cluster the access SDK runs on) and surfaces `pma1` tokens
-  to the portal UI, so the Customer logs into the portal, retrieves the token,
-  and pastes it into a `ProviderAccessRequest` on their PM.
+The access SDK lives in `go.platform-mesh.io/sdk`.
 
-Both live in `go.platform-mesh.io/sdk` and share code at the library level.
+**Trust-boundary / deployment-model note.** "User-side" throughout this
+document means "wherever the access SDK runs." The two common deployment
+models:
 
-**Trust-boundary note.** In RFC 1 (direct), User = Customer = Owner; the
-user-side cluster is the Customer's own. In RFC 2 (portal), the user-side
-cluster is the **Provider's** cluster — it hosts the portal, the access SDK,
-and all `AccessIdentity` / `Access` / Secret objects, one group per Customer
-PM instance. The Customer's only footprint is their PM workspace; they don't
-run access SDK. "User-side" throughout this document means "wherever the
-access SDK runs," which is determined by this split.
+- **Direct**: the Customer (= User = Owner) runs the access SDK on their
+  own cluster. One cluster, one identity, one PM instance.
+- **Multi-tenant portal**: a Provider runs the access SDK on their own
+  cluster and operates it on behalf of many Customers, each with their own
+  PM instance. One `AccessIdentity` per Customer PM instance, created by
+  the portal (any Kubernetes client works; typed helpers may be factored
+  out as a library). The Customer's only footprint is their PM workspace;
+  they log into the portal to retrieve a `pma1` and paste it into a
+  `ProviderAccessRequest` on their PM. On-the-wire protocol is identical
+  to the direct model.
 
 ---
 
@@ -57,15 +57,14 @@ access SDK runs," which is determined by this split.
 | **Provider** | A user who exposes APIExports, ContentConfigurations, etc. |
 | **Owner** | The PM-side workspace owner who wants a Provider's service. Often the same person as the User. |
 | **Provider Workspace** | The kcp workspace containing the Provider's APIExports, created by PM for the Provider. |
-| **`Provider`** | PM-side CRD (`providers.platform-mesh.io/v1alpha1`). Cluster-scoped. Pre-existing resource for kcp-side bootstrap (Workspace, SA, RBAC); extended with `spec.remote` (nested struct, presence-based opt-in) to switch from local mode (kubeconfig Secret stored in PM) to remote mode (kubeconfig delivered to a user-side cluster via `AccessGrant`). Mode is immutable after creation. Local kubeconfig Secret is skipped in remote mode. Persistent lifecycle handle: owns `AccessGrant` and PARs via ownerReferences; `status.remote` surfaces the live connection state (`connectionState`, `tokenID`, `accessGrantRef`, `lastConnected`). Deleting the `Provider` is the authoritative teardown signal. |
+| **`Provider`** | PM-side CRD (`providers.platform-mesh.io/v1alpha1`). Cluster-scoped. Pre-existing resource for kcp-side bootstrap (Workspace, SA, RBAC); extended with `spec.remote` (nested struct, presence-based opt-in) to switch from local mode (kubeconfig Secret stored in PM) to remote mode (kubeconfig delivered to a user-side cluster via `AccessGrant`). `spec.remote.caBundle` (optional, PEM) carries the trust bundle for the access SDK's `/access` TLS endpoint; omitted → system CAs (public web PKI). Mode is immutable after creation. Local kubeconfig Secret is skipped in remote mode. Persistent lifecycle handle: owns `AccessGrant` and PARs; `status.remote` surfaces the live connection state (`connectionState`, `tokenID`, `accessGrantRef`, `lastConnected`). Deleting the `Provider` is the authoritative teardown signal. |
 | **PM Instance** | One deployment of Platform Mesh (kcp + pm-operator). May be public or private. |
-| **Provider's portal** | The Provider's website/system for managing customers. Imports the provider SDK library to create `AccessIdentity` objects on the Provider's cluster and surface the minted `pma1` to the Customer. PM has no opinion on its internals. |
-| **`access-operator`** | PM-side (`platform-mesh/operators/access-operator`, binary: `access-operator`). Watches `AccessGrant` objects in `Pending` state (created and pre-populated by the provider reconciler). For each: mints an SA token via kcp TokenRequest, derives a short-lived call credential from `AccessGrant.spec.pma1`, and `POST`s `/access` with the HMAC credential and a request body carrying `kcpURL`, `caBundle`, `saToken`. Retries on `202` until `200` (ack) or `403`. On `200`: marks `AccessGrant` `Active`. Holds tunnel connections open with leader election (RFC 3); reconnects use session tokens (RFC 3 only). Runs in PM's runtime cluster. |
+| **Provider's portal** | In multi-tenant deployments, the Provider's website/system for managing customers. Creates `AccessIdentity` objects on the Provider's cluster (any Kubernetes client) and surfaces the minted `pma1` to the Customer. PM has no opinion on its internals. |
+| **`access-operator`** | PM-side (`platform-mesh/operators/access-operator`, binary: `access-operator`). Watches `AccessGrant` objects in `Pending` state (created and pre-populated by the provider reconciler). For each: mints an SA token via kcp TokenRequest, derives a short-lived call credential from `AccessGrant.spec.pma1`, and `POST`s `/access` (verifying the server cert against `AccessGrant.spec.caBundle` if set, otherwise system CAs) with the HMAC credential and a request body carrying `kcpURL`, `kcpCABundle`, `saToken`. Retries on `202` until `200` (ack) or `403`. On `200`: marks `AccessGrant` `Active`. Holds tunnel connections open with leader election (RFC 3); reconnects use session tokens (RFC 3 only). Runs in PM's runtime cluster. |
 | **`access` SDK** | User-side (`go.platform-mesh.io/sdk/access`, binary: `platform-mesh-access`). Reconciles `AccessIdentity` objects: on creation, generates the HMAC secret and emits a `pma1` token via an owned Secret. Serves the `/access` endpoint: verifies HMAC against the identity, enforces `accept` mode, manages the pending queue. Manages `Access` objects (one per live connection). Self-renews SA tokens via TokenRequest. Handles CA bundle rotation and offboarding detection. In tunnel mode (RFC 3), additionally issues session tokens for reconnect authentication. |
-| **`provider` SDK** | Go library (`go.platform-mesh.io/sdk/provider`). Portal integration helper for RFC 2: the Provider's portal imports it to create `AccessIdentity` objects on the Provider's own cluster, read the minted `pma1` from the owned Secret, and manipulate `AccessIdentity.spec` (`accept` mode, pending-queue approvals, blocklists) to enforce portal policy. |
-| **`ProviderAccessRequest`** | PM-side CRD. One-shot auth-material delivery object. Owner creates it with `spec.providerRef.name` and a `pma1` access token (from the user-side cluster in RFC 1, from the Provider's portal UI in RFC 2). Reconciled by the provider reconciler (inside `pm-operator`; later `provider-operator`): waits in `Pending` until the referenced `Provider` exists with `spec.remote` set, then propagates `pma1` into the Provider's `AccessGrant`; terminal states `Completed` / `Failed`. One active PAR per `Provider`: new PARs arriving while an older non-terminal PAR exists go `Failed` with reason `AnotherPARActive`. OwnerReference → `Provider` (cascade on Provider deletion). |
-| **`AccessGrant`** | PM-side CRD. Created by provider reconciler in `Pending` state with SA ref, `/access` URL, and `pma1` credentials. OwnerReference → `Provider` (cascade on Provider deletion). access-operator drives it to `Active` by completing the initial `/access` handshake. `spec.pma1` is used for initial handshake (first bind, and re-onboarding after a subsequent PAR delivers fresh `pma1`). In tunnel mode (RFC 3), gains reconnection-credential status fields. PM's view of the live connection. |
-| **`AccessIdentity`** | User-side CRD. Standing authorization for a PM instance connection. On creation, the access SDK generates `(tokenID, HMAC secret)` for verifying `/access` handshakes and emits the full `pma1` into an owned Secret. `spec.accept`: `Always` (auto) or `Manual` (pending queue). `spec.maxPending` caps simultaneous pending entries. One `AccessIdentity` → many `Access` objects over time. Rotate the HMAC secret (new `pma1`) to block future handshakes under this identity — existing `Access` objects keep working on their delivered SA tokens. Delete to end the standing authorization. Per-PM revocation: delete the specific `Access`. (RFC 3 adds a per-identity session-signing key and session tokens for tunnel reconnects.) |
+| **`ProviderAccessRequest`** | PM-side CRD. One-shot auth-material delivery object. Owner creates it with `spec.providerRef.name` and a `pma1` access token (obtained from the user-side cluster — in a portal deployment, from the Provider's portal UI). Reconciled by the provider reconciler (inside `pm-operator`; later `provider-operator`): waits in `Pending` until the referenced `Provider` exists with `spec.remote` set, then propagates `pma1` into the Provider's `AccessGrant`; terminal states `Completed` / `Failed`. One active PAR per `Provider`: new PARs arriving while an older non-terminal PAR exists go `Failed` with reason `AnotherPARActive`. Deleting the `Provider` cascades to its PARs. |
+| **`AccessGrant`** | PM-side CRD living in the Provider Workspace. Created by provider reconciler in `Pending` state with SA ref, `/access` URL, `pma1` credentials, and the `/access` TLS CA bundle propagated from `Provider.spec.remote.caBundle` (if set). access-operator drives it to `Active` by completing the initial `/access` handshake. `spec.pma1` is used for initial handshake (first bind, and re-onboarding after a subsequent PAR delivers fresh `pma1`). In tunnel mode (RFC 3), gains reconnection-credential status fields. PM's view of the live connection. Removed when the Provider Workspace is deleted (which happens on `Provider` deletion). |
+| **`AccessIdentity`** | User-side CRD. Standing authorization for a PM instance connection. Created by the Customer directly (direct deployment) or by the Provider's portal (multi-tenant deployment). On creation, the access SDK generates `(tokenID, HMAC secret)` for verifying `/access` handshakes and emits the full `pma1` into an owned Secret. `spec.accept`: `Always` (auto) or `Manual` (pending queue). `spec.maxPending` caps simultaneous pending entries. One `AccessIdentity` → many `Access` objects over time. Rotate the HMAC secret (new `pma1`) to block future handshakes under this identity — existing `Access` objects keep working on their delivered SA tokens. Delete to end the standing authorization. Per-PM revocation: delete the specific `Access`. (RFC 3 adds a per-identity session-signing key and session tokens for tunnel reconnects.) |
 | **`Access`** | User-side CRD. Ongoing binding. Created by access SDK on successful connection. References the kubeconfig Secret. User cluster's view of the live connection. |
 
 ---
@@ -88,33 +87,23 @@ PM-initiated has two distinct phases.
 #### Phase 1: Registration (one-time)
 
 ```
-RFC 1 (direct):
-  Customer  ──(1) creates AccessIdentity in own cluster ──►  access SDK
-                                                             [mints pma1 → owned Secret]
-  Owner     ──(2) creates Provider (spec.remote: {}) on PM
-  Owner     ──(2) reads pma1, creates ProviderAccessRequest (providerRef: <provider>, pma1) on PM
-                                                             ──►  provider reconciler
-                                                                  [bootstraps Provider: Workspace, SA, RBAC]
-                                                                  [extracts /access URL from pma1]
-                                                                  [creates AccessGrant (Pending), ownerRef → Provider]
-                                                                  [marks PAR Completed]
-
-RFC 2 (portal):
-  Customer  ──(1) logs into Provider's portal
-  Portal    ──(1) provider SDK creates AccessIdentity on Provider's cluster ──►  access SDK
-                                                                                 [mints pma1 → owned Secret]
-  Portal    ──(1) reads pma1 from owned Secret, shows in UI
-  Owner     ──(2) creates Provider (spec.remote: {}) on PM
-  Owner     ──(2) copies pma1 from portal, creates ProviderAccessRequest on PM
-                                                                              ──►  provider reconciler
-                                                                                   [same as RFC 1 from here]
+<creator>  ──(1) creates AccessIdentity in user-side cluster ──►  access SDK
+                                                                  [mints pma1 → owned Secret]
+Owner      ──(2) creates Provider (spec.remote: {}) on PM
+Owner      ──(2) obtains pma1, creates ProviderAccessRequest
+                 (providerRef: <provider>, pma1) on PM         ──►  provider reconciler
+                                                                    [bootstraps Provider: Workspace, SA, RBAC]
+                                                                    [extracts /access URL from pma1]
+                                                                    [creates AccessGrant (Pending) in Provider Workspace]
+                                                                    [marks PAR Completed]
 ```
 
-1. An `AccessIdentity` is created in the user-side cluster — by the Customer
-   directly (RFC 1) or by the Provider's portal via the provider SDK (RFC 2).
-   The access SDK generates the HMAC secret and emits the `pma1` token via an
-   owned Secret. In RFC 2 the portal reads the Secret and surfaces the token
-   in the Provider's UI.
+1. An `AccessIdentity` is created in the user-side cluster. The access SDK
+   generates the HMAC secret and emits the `pma1` token via an owned Secret.
+   Who creates it and how the `pma1` reaches the Owner depends on the
+   deployment model (see Reframe above): the Customer applies it directly on
+   their own cluster, or a Provider's portal applies it on the Provider's
+   cluster and surfaces the `pma1` in its UI.
 2. The Owner creates a `Provider` with `spec.remote: {}` and a
    `ProviderAccessRequest` referencing it by name (`spec.providerRef.name`),
    carrying the `pma1`. Order-independent: whichever is created first waits
@@ -122,12 +111,10 @@ RFC 2 (portal):
 3. The provider reconciler bootstraps the `Provider` (Workspace, SA, RBAC —
    same as local mode but skips the local kubeconfig Secret), extracts the
    `/access` URL from the `pma1`, and creates an `AccessGrant` in `Pending`
-   state pre-populated with the SA ref, `/access` URL, and `pma1` credentials.
-   The `AccessGrant` has `ownerReference` → `Provider`. The PAR is marked
-   `Completed`.
-
-The two modes differ only in who creates the `AccessIdentity` and where the
-Customer gets the `pma1` from. The PM-side flow is identical.
+   state pre-populated with the SA ref, `/access` URL, `pma1` credentials,
+   and the `/access` TLS CA bundle (propagated from
+   `Provider.spec.remote.caBundle`, if set). The `AccessGrant` lives in the
+   Provider Workspace. The PAR is marked `Completed`.
 
 #### Phase 2: Credential delivery and ongoing access
 
@@ -136,7 +123,7 @@ access-operator  ──(4) picks up AccessGrant (Pending)
 access-operator  ──(4) mints SA token via kcp TokenRequest
 access-operator  ──(4) POST /access ──────────────────────────────────►  access SDK
                        Bearer <tokenID>.<derived from pma1>
-                       body: { kcpURL, caBundle, saToken }
+                       body: { kcpURL, kcpCABundle, saToken }
                  ◄──── 202, tokenID (accept: Manual) ────────────────
                        [access-operator retries until approved or TTL]
                  ◄──── 200 (ack; empty body) ──────────────────────────
@@ -150,9 +137,12 @@ operator                ──(6) talks to kcp directly
 4. access-operator picks up the `AccessGrant` in `Pending` state. It mints an
    SA token via kcp TokenRequest for the SA referenced in the `AccessGrant`,
    derives a short-lived call credential from the `pma1` in `AccessGrant.spec`,
-   and calls `POST /access` on the access SDK — the request body carries
-   `kcpURL`, `caBundle`, and the freshly minted `saToken`. The access SDK
-   verifies the HMAC credential against the `AccessIdentity`.
+   and calls `POST /access` on the access SDK — verifying the TLS server cert
+   against `AccessGrant.spec.caBundle` (propagated from
+   `Provider.spec.remote.caBundle`) if set, otherwise using system CAs. The
+   request body carries `kcpURL`, `kcpCABundle`, and the freshly minted
+   `saToken`. The access SDK verifies the HMAC credential against the
+   `AccessIdentity`.
    - `spec.accept: Always` — accepts and proceeds to step 5.
    - `spec.accept: Manual` — creates a pending entry in
      `AccessIdentity.status.pendingConnections` with the `tokenID` and responds
@@ -241,19 +231,19 @@ One deployment handles any number of PM instance connections.
 - Deleting an `AccessIdentity` stops accepting new handshakes under its HMAC
   secret. Existing `Access` objects and kubeconfig Secrets continue to
   function on their delivered SA tokens; the user-side operator (Customer in
-  RFC 1, Provider's portal in RFC 2) deletes individual `Access` objects to
-  cut specific PM connections.
+  a direct deployment, Provider's portal in a multi-tenant deployment)
+  deletes individual `Access` objects to cut specific PM connections.
 
 **`/access` endpoint (PM-initiated):**
 
 - Serves `POST /access`. access-operator presents
   `Bearer <tokenID>.<derived-credential>` and a request body carrying
-  `kcpURL`, `caBundle`, and the SA token access-operator minted.
+  `kcpURL`, `kcpCABundle`, and the SA token access-operator minted.
 - Looks up `AccessIdentity` by `tokenID`, verifies HMAC against stored secret.
 - Writes the kubeconfig Secret from the request body and creates `Access`
   on acceptance.
-- Returns `200` (ack; empty body in RFC 1/RFC 2), `202` (pending), or `403`
-  (denied/unknown/TTL).
+- Returns `200` (ack; empty body in the baseline), `202` (pending), or
+  `403` (denied/unknown/TTL).
 - **Tunnel mode (RFC 3, opt-in):** after credential delivery, if PM's kcp is
   not directly reachable, the connection is upgraded to a persistent reverse L4
   tunnel. Exposes a per-connection local HTTPS proxy endpoint; the kubeconfig
@@ -273,42 +263,25 @@ One deployment handles any number of PM instance connections.
   - 403, 5xx, network errors: not counted as offboarding.
 - Re-onboarding: create a new `ProviderAccessRequest` (PM-initiated).
 
-### `provider` SDK (Go library, `go.platform-mesh.io/sdk/provider`)
-
-Imported by the Provider's portal. Operates against the Provider's own cluster
-— the same cluster the access SDK runs on, co-located with the portal.
-
-- **`AccessIdentity` lifecycle helpers.** Create / update / delete
-  `AccessIdentity` objects on the Provider's cluster, keyed to portal account
-  identity + Customer PM instance. Portal controls timing (eager at account
-  creation, lazy at first bind, or any policy).
-- **`pma1` retrieval.** Read the minted `pma1` from the owned Secret the
-  access SDK writes alongside each `AccessIdentity`. Portal surfaces it in the
-  UI for the Customer to copy.
-- **Policy enforcement via `spec`.** Helpers to flip `accept: Manual`,
-  approve/deny `pendingConnections`, maintain blocklists, revoke per PM by
-  deleting a specific `Access`, revoke per account by deleting the
-  `AccessIdentity`.
-- **GitOps-safe.** All operations are declarative kube operations on the
-  Provider's cluster.
-
 ### `access-operator` (PM-side, `platform-mesh/operators/access-operator`, binary: `access-operator`)
 
 - Watches `AccessGrant` objects in `Pending` state (created and pre-populated
-  by the provider reconciler with SA ref, `/access` URL, and `pma1` credentials).
+  by the provider reconciler with SA ref, `/access` URL, `pma1` credentials,
+  and `/access` TLS CA bundle).
 - Mints an SA token via kcp TokenRequest for the SA in `AccessGrant`, derives
   a short-lived call credential from `AccessGrant.spec.pma1`, and `POST`s
-  `/access` with the HMAC credential and a body carrying `kcpURL`, `caBundle`,
-  and the SA token. Retries on `202` (`accept: Manual`, pending approval)
-  until `200` (ack) or `403` (denied/TTL expired). On `200`: marks
-  `AccessGrant` `Active`. One handshake per `AccessGrant` — re-triggered
-  only when `AccessGrant.spec.pma1` changes (new PAR against the same
-  `Provider`).
+  `/access` (TLS verified against `AccessGrant.spec.caBundle` if set,
+  otherwise system CAs) with the HMAC credential and a body carrying
+  `kcpURL`, `kcpCABundle`, and the SA token. Retries on `202` (`accept:
+  Manual`, pending approval) until `200` (ack) or `403` (denied/TTL
+  expired). On `200`: marks `AccessGrant` `Active`. One handshake per
+  `AccessGrant` — re-triggered only when `AccessGrant.spec.pma1` changes
+  (new PAR against the same `Provider`).
 - RFC 3 adds tunnel-reconnection: session-token issuance on initial handshake,
   session-token presentation on reconnect dials, `NeedsReonboarding` on
   session-token rejection. See Decision 2.
-- Stops when `AccessGrant` is deleted (cascaded from `Provider` deletion via
-  ownerReference).
+- Stops when `AccessGrant` is deleted (which happens when the `Provider`
+  is deleted and its Workspace is torn down).
 - Holds tunnel connections open between PM and remote clusters (RFC 3). Leader
   election governs tunnel management only; credential delivery is stateless.
 - Maintains CA bundle well-known object per workspace (Decision 4).
@@ -333,6 +306,25 @@ call credential from the HMAC secret for each `/access` dial.
 RFC 3 adds a second token type — a short-lived JWT session token issued by
 access SDK on the `/access` 200 response and used by access-operator to
 authenticate tunnel reconnects. See Decision 2.
+
+---
+
+## Protocol versioning
+
+`/access` is served under a TLS connection negotiated via ALPN. The baseline
+uses the ALPN token `pm-access/1`; future protocol shapes get new tokens
+(`pm-access/2`, etc.). access-operator advertises its supported tokens in
+`ClientHello`; access SDK picks the highest mutually-supported one. No
+overlap → TLS handshake fails with an ALPN alert (clean, specific error).
+
+Feature flags within a version (e.g., tunnel support, future OIDC credential
+types) are negotiated in the request/response body — additive within an
+ALPN-selected protocol shape.
+
+The `pma1` URL pins only the host, not the ALPN version, so a long-lived
+`pma1` keeps working as the SDK rolls through protocol versions. There is no
+separate discovery endpoint: ALPN is the version-selection primitive, and
+feature detection lives in the message body.
 
 ---
 
@@ -368,18 +360,18 @@ reconnect-authentication plane disjoint from the initial handshake:
   session-signing key invalidates every outstanding session token and
   drives all current tunnels into `NeedsReonboarding`.
 
-Teardown is independent of tunnel mode: deleting the `Provider` cascades
-to `AccessGrant` deletion via ownerReference, which access-operator
-observes and stops re-dialing. On the user side, `AccessIdentity` deletion
+Teardown is independent of tunnel mode: deleting the `Provider` tears
+down the Provider Workspace, taking the `AccessGrant` with it;
+access-operator observes the deletion and stops re-dialing. On the user side, `AccessIdentity` deletion
 stops accepting new handshakes under that identity; existing `Access`
 objects and kubeconfig Secrets remain. The user-side operator (Customer in
-RFC 1, Provider's portal in RFC 2) deletes individual `Access` objects to
-cut specific PM connections.
+a direct deployment, Provider's portal in a multi-tenant deployment)
+deletes individual `Access` objects to cut specific PM connections.
 
 **3. Offboarding / revocation.** Deleting the `Provider` is the
-authoritative teardown signal; it cascades to `AccessGrant` deletion
-(ownerReference), which access-operator observes and stops tracking (in
-tunnel mode, this also closes the tunnel). On the user side: persistent 401
+authoritative teardown signal; it tears down the Provider Workspace
+(taking the `AccessGrant` with it), which access-operator observes and
+stops tracking (in tunnel mode, this also closes the tunnel). On the user side: persistent 401
 against kcp → access SDK deletes the `Access` and kubeconfig Secret;
 operator loses credentials and stops reconciling. In tunnel mode the same
 401 chain propagates through the tunnel and additionally triggers tunnel
@@ -402,6 +394,13 @@ recreate. `Provider.status.remote` carries live connection state
 (`connectionState`, `tokenID`, `accessGrantRef`, `lastConnected`), fed by
 the provider reconciler watching `AccessGrant.status`.
 
+`Provider.spec.remote.caBundle` (optional, PEM-encoded) carries the CA
+material access-operator uses to verify the TLS server cert on `/access`.
+Omitted → access-operator uses system CAs (public web PKI). Set →
+access-operator uses only this bundle. Rotation of the CA is a
+`Provider.spec` edit; `pma1` and caBundle are independent concerns and
+rotate independently.
+
 `ProviderAccessRequest` is a one-shot auth-material delivery object with
 `spec.providerRef.name` and `spec.pma1`. Reconciled by the provider
 reconciler (inside `pm-operator`; later `provider-operator`), not by
@@ -414,8 +413,7 @@ reconciler (inside `pm-operator`; later `provider-operator`), not by
   non-terminal PAR exists for the same `Provider` go `Failed` immediately
   with `AnotherPARActive: <older-par-name>`. Oldest wins.
 - **Terminal states.** `Completed` / `Failed`.
-- **OwnerReference → `Provider`** set once the referenced `Provider`
-  exists. Deleting the `Provider` cascades to all its PARs.
+- **Deleting the `Provider`** cascades to all its PARs.
 - **Enforcement is reconciler-side**, via `status`.
 
 First bind: Owner creates `Provider` + PAR (either order). Reconciler
@@ -427,22 +425,19 @@ Re-onboarding / rotation: Owner creates a **new PAR** against the same
 (RFC 3 formalises the trigger via a `NeedsReonboarding` condition — see
 Decision 2.)
 
-Teardown: delete the `Provider`. OwnerReferences cascade:
-`AccessGrant` → access-operator closes the connection; PARs → removed.
-Provider's own teardown logic handles SA, Workspace, RBAC.
+Teardown: delete the `Provider`. The Provider Workspace is torn down
+(taking `AccessGrant` with it); access-operator closes the connection.
+PARs are removed. Provider's own teardown logic handles SA, Workspace,
+RBAC.
 
-**6. RFC split.** Three RFCs plus one deferred:
+**6. RFC split.** Two RFCs plus one deferred:
 - *RFC 1*: PM-initiated flow, public PM, no tunnel. access SDK and
-  access-operator fully specified. Four CRDs: `ProviderAccessRequest`,
-  `AccessGrant`, `AccessIdentity`, `Access`. One token (`pma1`), minted by the
-  access SDK on `AccessIdentity` creation. No portal integration — Customer
-  creates `AccessIdentity` on their own cluster, reads the `pma1` from the
-  owned Secret, pastes into the PAR.
-- *RFC 2*: provider SDK — Go library the Provider's portal imports to
-  automate `AccessIdentity` creation on the Provider's own cluster (same
-  cluster the access SDK runs on) and surface the minted `pma1` to the portal
-  UI. Enables multi-tenant Provider portals. Protocol-identical to RFC 1 from
-  PM's perspective.
+  access-operator fully specified. Four CRDs (`ProviderAccessRequest`,
+  `AccessGrant`, `AccessIdentity`, `Access`) plus the `Provider` extension
+  (`spec.remote`). One token (`pma1`), minted by the access SDK on
+  `AccessIdentity` creation. Covers both direct and multi-tenant portal
+  deployment models — protocol is identical; the portal case is a
+  deployment pattern, not a separate RFC.
 - *RFC 3*: tunnel mode. Front-proxy SNI router (new kcp work), access SDK
   tunnel mode, and the reconnect-authentication plane (session tokens,
   per-`AccessIdentity` session-signing key, `NeedsReonboarding` recovery
@@ -450,15 +445,15 @@ Provider's own teardown logic handles SA, Workspace, RBAC.
 - *Deferred*: User-initiated flow. See below.
 
 **7. `AccessIdentity`.** The user-side standing authorization for a PM instance
-connection. Created by the Customer directly (RFC 1) or by the Provider's
-portal via the provider SDK library (RFC 2). On creation, the access SDK mints
-the `pma1` and surfaces it via an owned Secret.
+connection. Created by the Customer directly in a direct deployment, or by
+the Provider's portal in a multi-tenant deployment. On creation, the access
+SDK mints the `pma1` and surfaces it via an owned Secret.
 `spec.accept: Always` auto-accepts incoming `/access` calls; `spec.accept:
 Manual` holds them in a pending queue in `AccessIdentity.status.pendingConnections`.
 Each pending entry surfaces the `tokenID` so the Provider can cross-check it
 against `Provider.status.remote.tokenID` out-of-band before approving. `spec.maxPending`
 caps the queue (prevents flooding); a configurable TTL expires unanswered entries.
-Revocation granularities (user-side — Customer in RFC 1, Provider's portal in RFC 2):
+Revocation granularities (user-side — Customer in a direct deployment, Provider's portal in a multi-tenant deployment):
 - Delete an `Access` → cut one PM instance (operator loses that kubeconfig;
   other `Access` objects and the `AccessIdentity` unaffected).
 - Rotate `AccessIdentity` HMAC secret (new `pma1`) → blocks future
@@ -476,9 +471,9 @@ forces re-authentication of currently-active tunnels.
 
 **OIDC (future).** Using kcp-issued audience-bound JWTs as the `/access` call
 credential — and storing `(issuer, subject)` in `AccessIdentity` instead of
-`(tokenID, secret)` — is a viable follow-up, particularly for the provider SDK
-(RFC 2) case where PM's kcp is publicly reachable. Does not affect the current
-design.
+`(tokenID, secret)` — is a viable follow-up, particularly in multi-tenant
+portal deployments where PM's kcp is publicly reachable. Does not affect the
+current design.
 
 ---
 
