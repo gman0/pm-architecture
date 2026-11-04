@@ -94,10 +94,8 @@ type ProviderStatus struct {
 }
 
 type RemoteStatus struct {
-    ConnectionState string                  `json:"connectionState,omitempty"` // Pending | Connected
-    TokenID         string                  `json:"tokenID,omitempty"`         // from the access token, for OOB verification
-    AccessGrantRef  *corev1.ObjectReference `json:"accessGrantRef,omitempty"`
-    LastConnected   *metav1.Time            `json:"lastConnected,omitempty"`
+    TokenID   string `json:"tokenID,omitempty"`   // from the access token, for OOB verification
+    AccessURL string `json:"accessURL,omitempty"` // where PM dials; informational
 }
 ```
 
@@ -143,9 +141,8 @@ type AccessGrantSpec struct {
 }
 
 type AccessGrantStatus struct {
-    Phase          string             `json:"phase,omitempty"`      // Pending | Active
-    LastConnected  *metav1.Time       `json:"lastConnected,omitempty"`
-    Conditions     []metav1.Condition `json:"conditions,omitempty"`
+    Phase      string             `json:"phase,omitempty"`      // Pending | Active
+    Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 ```
 
@@ -182,6 +179,11 @@ Ongoing binding. Created by the access SDK on a successful `/access`. References
 type AccessSpec struct {
     IdentityRef corev1.LocalObjectReference `json:"identityRef"`
     KubeconfigSecretRef *corev1.LocalObjectReference `json:"kubeconfigSecretRef,omitempty"`
+
+    // Follow-up: PM-wide identifier the user-side receives in the /access
+    // handshake, so the user can see which Access belongs to which PM
+    // instance. Shape and semantics TBD.
+    // PMInstance PMInstance `json:"pmInstance"`
 }
 
 type AccessStatus struct {
@@ -206,6 +208,54 @@ The `pma1.` prefix identifies this as a Platform Mesh access token, version 1. C
 - `secret` is the HMAC credential. access-operator derives a short-lived call credential from it per `/access` dial.
 
 The access SDK generates `(tokenID, secret)` on `AccessIdentity` creation and writes the full access token string into an owned Secret. The access token is long-lived per `AccessIdentity`; rotating it requires minting a new `AccessIdentity` and issuing a new PAR (see [Rotation and revocation](#rotation-and-revocation)).
+
+### Call credential: per-`/access` authentication
+
+Each `POST /access` dial carries an authentication credential in the `Authorization` header. The credential is a short-lived JWT, signed with the access token's HMAC secret, that binds authentication to this specific request body.
+
+**Wire shape:**
+
+```
+Authorization: Bearer <jwt>
+```
+
+JWT header:
+- `alg` — `HS256`.
+
+JWT body:
+- `sub` — `tokenID` (from the access token). Identifies which `AccessIdentity` this dial is for.
+- `iat`, `exp` — standard. `exp - iat` is short; default **60 s**.
+- `jti` — random 128-bit, unique per issuance. Enables replay tracking on the SDK side.
+- `body_sha256` — base64url-encoded SHA-256 of the raw request body. Binds the credential to this exact payload.
+
+**access-operator (signer):**
+
+1. Compute `sha256(body)` of the serialized `/access` request body.
+2. Build the claims above using `AccessIdentity.tokenID` from the stored access token.
+3. Sign with `HS256` using the access token's HMAC secret.
+4. Send on `Authorization: Bearer <jwt>`.
+
+**access SDK (verifier):**
+
+1. Parse the JWT without verifying the signature yet; extract `sub`.
+2. Look up `AccessIdentity` by `tokenID = sub`. Unknown → `403 UnknownIdentity`.
+3. Verify signature using the stored HMAC secret and standard JWT claim checks (`exp`, `iat`, `alg == HS256`). Failure → `403 InvalidCredential`.
+4. Recompute `sha256(body)` from the incoming request body. Compare to `body_sha256`. Mismatch → `403 BodyMismatch`.
+5. Check `jti` against a short-lived replay cache keyed by `(tokenID, jti)`, TTL ≥ `exp - iat` plus clock-skew margin. Present → `403 Replay`. Otherwise record it.
+6. Proceed with the handshake (accept mode, pending queue, etc.).
+
+**Why this shape:**
+
+- JWT is widely supported; standard claim checks (`exp`, `iat`, signature) come free from any mature JWT library.
+- `body_sha256` prevents a captured credential from being replayed against a different payload.
+- `jti` replay cache closes the remaining window within `exp`. Short `exp` (60 s) bounds the cache size.
+- The same JWT primitive is reused in RFC 013 for session tokens on the reconnect plane (signed differently — per-`Access` asymmetric key instead of the Identity's HMAC secret). One mental model across both authentication planes.
+
+**Clock skew.** JWT verifiers accept a configurable tolerance on `exp` / `iat`; default ±30 s. In NTP-synchronized environments this is comfortable.
+
+**Algorithm discipline.** The verifier rejects any token whose header `alg` is not `HS256`. This prevents algorithm-confusion attacks (a classic JWT pitfall) where a token signed with a different algorithm could be confused with an HMAC-signed one.
+
+**Distinguishing from the session token (RFC 013).** The call credential is `HS256`, signed with the access token's HMAC secret. The RFC 013 session token is asymmetric (`EdDSA` or `ES256`), signed with a per-`Access` private key. Access SDK routes verification by `alg` in the header and by the handshake context. No overlap.
 
 ### Protocol versioning
 
@@ -250,14 +300,16 @@ Who creates the `AccessIdentity` depends on the deployment model. In a direct de
 access-operator  ──(4) picks up AccessGrant (Pending)
 access-operator  ──(4) mints SA token via kcp TokenRequest
 access-operator  ──(4) POST /access ──────────────────────────────────►  access SDK
-                       Bearer <tokenID>.<derived from access token secret>
+                       Authorization: Bearer <JWT signed with access token HMAC>
                        body: { kcpURL, kcpCABundle, saToken }
+                       [JWT: sub=tokenID, body_sha256, jti, iat, exp;
+                        see "Call credential"]
                  ◄──── 202, tokenID (accept: Manual) ────────────────
                        [access-operator retries until approved or TTL]
                  ◄──── 200 (ack; empty body) ──────────────────────────
 access-operator      ──(5) marks AccessGrant Active
 access SDK           ──(5) writes kubeconfig Secret from request body, creates Access
-provider reconciler  ──(5) updates Provider.status.remote.connectionState → Connected
+provider reconciler  ──(5) sets Provider.status.conditions[Connected]=True; phase → Ready
 operator             ──(6) talks to kcp directly
 ```
 
@@ -311,9 +363,15 @@ PM publishes its current CA bundle and kcp server URLs in a well-known object in
 
 ### Status surface
 
-- `Provider.status.remote.connectionState` is the Customer's primary signal.
-- `AccessGrant.status` is PM-side infrastructure state; Customers should not rely on it directly.
-- PAR status is per-reconciliation: `Pending` / `Reconciling` / `Completed` / `Failed` with reasons.
+Follows the existing `Provider` convention: `status.phase` plus `status.conditions`, with phase computed from conditions. Adds remote-specific conditions on top of the local-mode set:
+
+- `WorkspaceReady` — Provider Workspace bootstrapped.
+- `Connected` — handshake completed; `AccessGrant` `Active`. Reasons on `Connected=False` include `Reconnecting`, `TunnelDown` (RFC 013), `SessionExpired` (RFC 013), `NeedsReonboarding` (RFC 013), `SARevoked`.
+- `Ready` — aggregate.
+
+Phase transitions: `Pending → Provisioning → Ready ⇄ Degraded`, and `Deleting`. `Degraded` means was-`Ready` before (`status.lastReadyTime`) and currently not; conditions say why. `status.remote` (sub-struct) carries informational fields only (`tokenID`, `accessURL`).
+
+`AccessGrant.status` is PM-side infrastructure state; Customers should not rely on it directly. PAR status is per-reconciliation: `Pending` / `Reconciling` / `Completed` / `Failed` with reasons.
 
 ## Deployment models
 
@@ -336,13 +394,6 @@ On-the-wire protocol is identical. This RFC does not specify portal internals.
 - **SA token exposure.** The SA token lives in the kubeconfig Secret on the user-side cluster. Treated as any kube Secret: RBAC-restricted, etcd-encrypted per cluster policy.
 - **Replay protection.** Each `/access` dial uses a fresh derived credential from the access token's HMAC secret with a timestamp or nonce; the access SDK rejects replays. (Exact mechanism TBD; HMAC-over-nonce is the straightforward choice.)
 - **Abuse by a stolen `AccessGrant`.** Access-operator acts on `AccessGrant` in its own cluster; the PM runtime cluster must be secured as the primary trust boundary. A compromised PM runtime cluster can mint SA tokens and dial out, but this RFC does not re-secure against PM-side compromise.
-
-## Open questions
-
-- Exact wire format for the per-dial HMAC credential (nonce vs. timestamp vs. signed request body).
-- Naming conventions for `AccessIdentity` objects in portal deployments (keying by `(portal account, PM clusterName)`).
-- Whether `Provider.status.remote.connectionState` should be a `status.phase` value, a condition, or both. Existing `Provider.status.phase` conventions should be matched.
-- Whether PAR should be accepted into a separate API group (`providers.platform-mesh.io/v1alpha1` continues to grow) or placed in `access.platform-mesh.io`. Punt until implementation.
 
 ## Future work
 

@@ -34,7 +34,7 @@ Tunnels drop. Reconnecting requires authentication. If reconnect had to re-use t
 - Make PM-initiated remote access work when PM's kcp is not publicly reachable from the user-side cluster.
 - Decouple reconnect authentication from the access token so HMAC rotation never disturbs running tunnels.
 - Provide an incident-response lever that forces re-authentication of currently-active tunnels (session-signing-key rotation).
-- Keep the on-the-wire protocol version-selectable (ALPN token distinct from the baseline if the shape breaks meaningfully).
+- Keep the on-the-wire protocol version-selectable (ALPN); stay within `pm-access/1` while additions are additive, bump only on a real shape break.
 
 **Non-goals:**
 
@@ -52,7 +52,7 @@ In addition to RFC 012 terminology:
 | **SNI router** | New L4 component in PM's kcp front-proxy stack; routes incoming TLS traffic by `ClientHello` SNI without terminating TLS. |
 | **session token** | Short-lived JWT, signed by a per-`Access` session-signing key, issued on `/access` 200 and presented on subsequent reconnect dials. |
 | **session-signing key** | Per-`Access` asymmetric key held by the access SDK (in a Secret owned by the `Access`); used to sign and verify session tokens. |
-| **`NeedsReonboarding`** | `AccessGrant` condition raised when session-token verification fails and recovery requires a new PAR. |
+| **`NeedsReonboarding`** | Reason surfaced on `Provider.status.conditions[Connected]=False` when session-token verification fails and recovery requires a new PAR. |
 
 ## Architecture
 
@@ -71,7 +71,7 @@ After the RFC 012 handshake completes on `/access`, if PM requested a tunnel and
 
 One tunnel per `Access`. A single tunnel carries all kcp traffic for that connection — front-proxy calls and per-shard VW calls — distinguished by the TLS SNI in each inner TLS handshake.
 
-The exact framing (HTTP CONNECT, WebSocket, HTTP/2 extended CONNECT, raw multiplexed stream over the already-authenticated TCP) is an implementation detail; prototype work should pick one. WebSocket is the pragmatic default given it survives most ingress stacks.
+**Framing: WebSocket + yamux.** The TCP+TLS connection is upgraded via `Upgrade: websocket` (RFC 6455); inside the WebSocket, a yamux stream multiplexer carries each operator kcp call as its own stream. WebSocket is chosen for middlebox compatibility — HTTP/2 extended CONNECT would be cleaner but doesn't survive the long tail of ingress stacks PM has to work with. Yamux provides real multiplexing without requiring HTTP/2 end-to-end, is battle-tested (Consul, Nomad), and has mature Go support (`hashicorp/yamux`).
 
 ### Kubeconfig in tunnel mode
 
@@ -127,7 +127,7 @@ On `Access` creation (i.e. when the access SDK accepts a `/access` initial hands
 
 State per `Access`, held by the access SDK:
 
-- `signing_key` — private key material for signing session tokens (`EdDSA` or `ES256`).
+- `signing_key` — private key material for signing session tokens. `EdDSA` (Ed25519) is the default; `ES256` is a conforming alternative.
 - `kid` — SHA-256 fingerprint of the signing public key (self-describing; used in JWT headers).
 - `current_jti` — `jti` of the most recently issued session token.
 - `previous_jti` — the one before (grace-window entry; see [Lost responses and grace window](#lost-responses-and-grace-window) below).
@@ -144,7 +144,7 @@ On `/access` 200, the access SDK issues a **session token** — a short-TTL JWT 
 ```
 
 JWT header:
-- `alg` — `EdDSA` or `ES256` (pick during implementation).
+- `alg` — `EdDSA` (default) or `ES256`. The verifier rejects any other value.
 - `kid` — SHA-256 fingerprint of the signing public key; identifies which generation of the `Access`'s key signed this token.
 
 JWT body:
@@ -197,7 +197,27 @@ Ordering guarantee: the operator holding a valid token always implies the SDK ha
 
 #### Rejection → `NeedsReonboarding`
 
-If the session token is rejected for any reason other than grace-window acceptance (expired, signing key rotated, Access deleted, replay outside window, SDK state lost), access-operator does **not** fall back to the access token. It sets `AccessGrant` condition `NeedsReonboarding` and stops dialing. Recovery is a new PAR against the same `Provider` with a current access token, which propagates the fresh access token into `AccessGrant.spec.accessToken` and triggers a new initial handshake (as in RFC 012). The initial handshake creates a fresh `Access` with a fresh signing key; the stale one is garbage-collected.
+If the session token is rejected for any reason other than grace-window acceptance (expired, signing key rotated, Access deleted, replay outside window, SDK state lost), access-operator does **not** fall back to the access token. It stops dialing. The provider reconciler reflects the failure as `Provider.status.conditions[Connected]=False` with `reason=NeedsReonboarding` and flips phase to `Degraded`. Recovery is a new PAR against the same `Provider` with a current access token, which propagates the fresh access token into `AccessGrant.spec.accessToken` and triggers a new initial handshake (as in RFC 012). The initial handshake creates a fresh `Access` with a fresh signing key; the stale one is garbage-collected.
+
+#### Refresh and restart
+
+A stable tunnel can stay open long past the session token's 30 min TTL. For the stored token not to go stale, access-operator periodically dials `/access` with the current session token on a schedule (default every TTL/2 = 15 min). This is the same `/access` endpoint, with the same request shape, as initial handshake and reconnect — the difference is what the SDK does with it.
+
+**SDK behavior on an incoming `/access` dial:**
+
+| Credential presented | SDK has active tunnel for this `Access`? | Response | Tunnel |
+|---|---|---|---|
+| HMAC call credential (RFC 012) | — (initial handshake) | 200 + body incl. `sessionToken` | upgrade on this connection if `tunnel: required` |
+| Session token | No | 200 + fresh `sessionToken` | upgrade on this connection (reconnect) |
+| Session token | Yes | 200 + fresh `sessionToken` | no upgrade; existing tunnel untouched (refresh) |
+
+In the refresh case, access-operator rolls the stored value and closes the HTTP connection; the pre-existing tunnel on its own TCP connection keeps carrying operator traffic without interruption.
+
+**access-operator restart.** The TCP connection holding the tunnel dies when access-operator exits; the SDK sees the tunnel drop. When access-operator comes back (leader failover or Pod restart) it reads `AccessGrant.status.sessionToken` from etcd and dials `/access` with it — the reconnect path. If the stored token's `exp` is in the future, reconnect succeeds and the tunnel re-establishes. If the stored token has expired (extended outage), `NeedsReonboarding`. With TTL = 30 min and refresh = 15 min, the stored token always has 15–30 min of remaining lifetime at any given time; brief restarts recover without re-onboarding, extended outages (> 30 min from the last refresh) don't.
+
+**access SDK restart.** The TCP peer on the user side goes away; access-operator sees the tunnel drop. When the SDK Pod comes back it loads per-`Access` signing keys, `jti` state, and all CRD state from persisted Secrets. access-operator reconnects and presents its stored session token; the SDK verifies against the persisted signing key and `current_jti`/`previous_jti`. Grace window still applies if the reconnect is within 60 s of the last roll. Tunnel re-establishes. No duration limit on SDK downtime as long as the operator's stored session token remains within `exp`.
+
+**Both sides restart simultaneously.** Same analysis as each individually: whoever comes up first finds the other gone; when both are up, the reconnect path runs. Stored state on both sides is sufficient to resume.
 
 ### Reconnect binding
 
@@ -269,12 +289,12 @@ type AccessGrantStatus struct {
     SessionTokenExpiresAt *metav1.Time `json:"sessionTokenExpiresAt,omitempty"`
 
     // Raised when session-token verification fails and no fallback is available.
-    // Reflected onto Provider.status.remote.connectionState.
+    // Reflected as Provider.status.conditions[Connected]=False with reason=NeedsReonboarding.
     // Recovery: new PAR against the same Provider.
 }
 ```
 
-A new condition type `NeedsReonboarding` on `AccessGrant` indicates that the stored session token has been rejected and access-operator has stopped dialing.
+When the stored session token is rejected and access-operator stops dialing, the provider reconciler surfaces this on the `Provider` as `conditions[Connected]=False` with `reason=NeedsReonboarding` (and `phase=Degraded`).
 
 Per-`Access` session-signing key material and `jti` tracking state (`current_jti`, `previous_jti`) live in access SDK state (likely a Secret owned by the `Access`), not on any PM-side CRD.
 
@@ -293,9 +313,14 @@ Nothing about the HMAC verification or baseline `/access` handling changes. `spe
 
 ### Protocol versioning
 
-If the tunnel-mode request/response shape is additive within the baseline (new fields only, unknown fields ignored), tunnel mode fits inside the `pm-access/1` ALPN token with capability negotiation via the `tunnel` request field. In that case, a baseline access SDK that doesn't understand `tunnel` simply ignores the field, returns a baseline 200, and access-operator sees no `sessionToken` and no tunnel — a clean error path for "PM requires tunnel, SDK doesn't support it."
+Tunnel mode is served under the baseline ALPN token `pm-access/1`. The additions are purely additive: new request-body fields (`tunnel`), new response-body fields (`sessionToken`, `sessionTokenExpiresAt`), new `Authorization` header shape on reconnect dials. Unknown fields are ignored under baseline-RFC-012 handling.
 
-If any part of the shape diverges materially (e.g., we restructure the request body), a new ALPN token `pm-access/2` is introduced. The choice is deferred until implementation; both paths are available.
+Capability detection via field presence:
+
+- A baseline (RFC-012-only) access SDK ignores the `tunnel` request field and returns a baseline 200 (ack, empty body). access-operator sees no `sessionToken` in the response — a clean signal of "this SDK doesn't support tunnel mode." If PM required tunnel, this surfaces as a connection failure on the `Provider`.
+- A baseline access-operator doesn't send the `tunnel` field; the SDK, even if tunnel-capable, treats the call as a plain RFC-012 handshake.
+
+`pm-access/2` is reserved for a future protocol break that actually changes shape or semantics. Until that happens, everything lives in `pm-access/1`.
 
 ## Flow
 
@@ -305,7 +330,9 @@ If any part of the shape diverges materially (e.g., we restructure the request b
 access-operator  ──(4) picks up AccessGrant (Pending)
 access-operator  ──(4) mints SA token via kcp TokenRequest
 access-operator  ──(4) POST /access (ALPN: pm-access/1) ──────────────►  access SDK
-                       Bearer <tokenID>.<derived from access token secret>
+                       Authorization: Bearer <JWT signed with access token HMAC>
+                       [JWT: sub=tokenID, body_sha256, jti, iat, exp;
+                        see RFC 012 "Call credential"]
                        body: { kcpURL, kcpCABundle, saToken, tunnel: "required" }
                  ◄──── 200 (ack + { sessionToken, sessionTokenExpiresAt }) ─
                        [connection upgraded to persistent tunnel]
@@ -314,7 +341,7 @@ access-operator      ──(5) marks AccessGrant Active
 access SDK           ──(5) creates Access, generates per-Access signing key,
                            writes kubeconfig (proxy-url carries Access UID in userinfo)
                            from request body, binds Access to the tunnel
-provider reconciler  ──(5) updates Provider.status.remote.connectionState → Connected
+provider reconciler  ──(5) sets Provider.status.conditions[Connected]=True; phase → Ready
 operator             ──(6) uses kubeconfig → CONNECT via proxy (Proxy-Auth: Access UID)
                            → tunnel → SNI router → kcp
 ```
@@ -350,7 +377,7 @@ The reconnect dial is identical to the initial dial except that:
 - the SA token in the body is a fresh one (access-operator always delivers a fresh SA token on every dial),
 - no new `Access` or kubeconfig Secret is created; the existing ones are reused.
 
-If the session token is rejected (expired, signing key rotated, access SDK state loss), access-operator does **not** fall back to the access token. It sets `AccessGrant` condition `NeedsReonboarding` and stops dialing. The condition is reflected onto `Provider.status.remote.connectionState`. Recovery is a fresh PAR against the same `Provider` with a current access token, which propagates the fresh value into `AccessGrant.spec.accessToken` and triggers a new initial handshake (as in RFC 012).
+If the session token is rejected (expired, signing key rotated, access SDK state loss), access-operator does **not** fall back to the access token. It stops dialing. The provider reconciler reflects the failure as `Provider.status.conditions[Connected]=False` with `reason=NeedsReonboarding` and flips phase to `Degraded`. Recovery is a fresh PAR against the same `Provider` with a current access token, which propagates the fresh value into `AccessGrant.spec.accessToken` and triggers a new initial handshake (as in RFC 012).
 
 ## Leader election
 
@@ -389,9 +416,9 @@ Unchanged from RFC 012: deleting the `Provider` tears down the Provider Workspac
 ## Security considerations
 
 - **Session-signing key is per-`Access`.** A compromise of one `Access`'s signing key affects only that one `Access`'s outstanding session tokens, not siblings under the same `AccessIdentity`. Rotation is Access-scoped; see [Rotation operations](#rotation-operations-user-side).
-- **Session tokens are short-lived.** Default TTL on the order of minutes to one hour; implementation should allow configuration. Shorter TTLs reduce the window a captured token can be replayed, at the cost of more frequent reconnects to roll the token (bounded by a scheduled refresh).
-- **Scheduled refresh.** access-operator should dial `/access` on a timer (e.g., half the session-token TTL) to keep the stored token fresh even without organic tunnel drops. This bounds the recovery time after session-signing-key rotation.
-- **Replay tracking with grace window.** The SDK tracks `current_jti` per `Access` and rejects stale `jti`s. A bounded grace window (default 60 s) accepts `previous_jti` once, to tolerate lost responses. The grace window allows at most one replay of a captured token during the window after the legitimate operator rolls — strictly tighter than no tracking, strictly looser than zero-replay; the alternative (no grace window) trades the sliver for frequent spurious `NeedsReonboarding` incidents on lost responses.
+- **Session tokens are short-lived.** Default TTL **30 min**; configurable. Shorter TTLs reduce the window a captured token can be replayed, at the cost of more frequent reconnects to roll the token (bounded by a scheduled refresh).
+- **Scheduled refresh.** access-operator dials `/access` on a timer to keep the stored token fresh even without organic tunnel drops. Default **15 min** (= TTL/2). Soft constraint: `refresh ≤ TTL/2` so the operator always holds a non-expired token even after one missed refresh. Bounds the recovery time after a session-signing-key rotation to one refresh interval.
+- **Replay tracking with grace window.** The SDK tracks `current_jti` per `Access` and rejects stale `jti`s. A bounded grace window (default **60 s**, configurable) accepts `previous_jti` once, to tolerate lost responses. The grace window allows at most one replay of a captured token during the window after the legitimate operator rolls — strictly tighter than no tracking, strictly looser than zero-replay; the alternative (no grace window) trades the sliver for frequent spurious `NeedsReonboarding` incidents on lost responses.
 - **No fallback is a feature.** Rejecting session tokens without falling back to the access token is deliberate: it prevents an attacker who leaked the access token after a tunnel was established from using it to re-authenticate. The cost is that session-token issues require explicit re-onboarding (a new PAR). This is acceptable because session-token issues should be rare (short-lived, auto-refreshed, signed by a stable key).
 - **Proxy-Authorization carries `Access` UID.** Under the default routing scheme, the `Access` UID appears in the `Proxy-Authorization: Basic` header on CONNECT, inside the user-side-cluster TLS, and in SDK logs. UIDs are not secret; the JWT `sub` remains the authoritative identifier.
 - **SNI router sees SNI hostnames.** The SNI router does not terminate TLS. It can observe which SNI hostname each inner connection targets; this is not sensitive. kcp's front-proxy / shards perform TLS termination and client authentication.
@@ -399,11 +426,16 @@ Unchanged from RFC 012: deleting the `Provider` tears down the Provider Workspac
 
 ## Operations
 
-### `AccessGrant.status` conditions
+### Status surface
 
-- `TunnelHealthy` — tunnel currently connected.
-- `Reconnecting` — tunnel dropped, access-operator is dialing.
-- `NeedsReonboarding` — session token rejected, no further dials until new PAR.
+Tunnel state surfaces on the `Provider` using the baseline status convention from RFC 012 — `status.phase` + `status.conditions`, with phase computed from conditions. RFC 013 adds reasons to the existing `Connected` condition:
+
+- `Connected=True` — tunnel open and traffic flowing.
+- `Connected=False` reasons introduced by tunnel mode: `Reconnecting` (tunnel dropped, access-operator is dialing), `TunnelDown`, `SessionExpired`, `NeedsReonboarding`.
+
+Phase flips to `Degraded` on any `Connected=False` after the Provider was `Ready` at least once.
+
+`AccessGrant.status` carries per-reconciler detail for operator debugging (reconnect counters, last error, etc.); Customers consume the `Provider`'s condition + phase.
 
 ### Metrics
 
@@ -416,24 +448,15 @@ Recommended access-operator metrics:
 
 ## Deployment considerations
 
-- **access SDK HA.** Multiple access SDK replicas can serve `/access`, but tunnel ownership must land on one replica per tunnel (the one that holds the TCP connection). Options: single-active via leader election (simplest; limits scale to one replica's tunnel count), consistent-hashed routing via Service (replica owns a shard of tunnels; a replica restart drops its tunnels until reconnection), or a sidecar access SDK per operator Pod (most Pods, no routing problem). Deployment choice; MVP can go with single-active.
+- **access SDK HA.** Single-active via leader election: one access SDK replica owns all tunnels at a time; standbys take over on failover. Simplest, bounded by one replica's tunnel capacity, which is well within mid-size deployments. Horizontal scaling (consistent-hashed sharding across replicas) and per-operator-Pod sidecars are documented as follow-ups in [Future work](#future-work); neither is required for MVP.
 - **PM's SNI router.** New kcp component; needs its own design sketch (likely a separate ADR or kcp-side proposal). This RFC assumes it exists.
 - **Tunnel keepalive.** TCP keepalives or app-layer pings to detect drops promptly. Default values TBD; implementation should allow tuning.
 - **Egress restrictions on the user-side cluster.** The access SDK needs outbound-only HTTPS. It does not initiate connections to PM's kcp — all PM-side traffic arrives via the inbound tunnel.
-
-## Open questions
-
-- **ALPN token for tunnel mode.** Decide during implementation whether tunnel mode fits inside `pm-access/1` as additive fields or warrants `pm-access/2`.
-- **Tunnel framing.** WebSocket is the default pragmatic choice; HTTP/2 extended CONNECT is a cleaner alternative where supported. Benchmark before committing.
-- **Session-token TTL.** Propose **30 min default** with **15 min scheduled refresh**. Grace window **60 s** default. All configurable.
-- **Signing-key algorithm.** `EdDSA` (Ed25519) vs. `ES256`. Both small/fast; pick during implementation.
-- **access SDK HA model.** Three options sketched in [Deployment considerations](#deployment-considerations); pick a default and allow others as deployment configuration.
-- **SNI router implementation path.** Where this lives in kcp (front-proxy extension vs. separate component), who owns upstream review, timeline. Likely a dependent kcp PR.
-- **Proactive tunnel teardown on signing-key rotation.** Deployment choice: do we close a tunnel immediately when its `Access`'s signing key rotates (defense in depth, slight disruption), or wait for the next drop (less disruption, longer attacker window)? Lean toward immediate close for incident response; less important for scheduled hygiene rotation.
-- **Routing scheme default wording.** The default is Proxy-Authorization-based routing; the two alternatives are explicitly supported. Confirm with implementers that this reads sensibly before a TSC review.
 
 ## Future work
 
 - **`Access` status for tunnel health** on the user-side, to let Customer tooling see connection state without round-tripping to PM.
 - **Multi-tunnel per `Access`** (bandwidth / HA), if single-tunnel throughput becomes a limit.
-- **OIDC as the reconnect credential**, replacing the session-token mechanism if kcp-issued audience-bound JWTs become available. Would subsume Decision 2's reconnect plane.
+- **Horizontal scaling of access SDK** via consistent-hashed sharding across replicas (each replica owns a shard of tunnels keyed by `Access` UID). Preserves the per-`Access` session-key state model unchanged.
+- **Sidecar-per-operator-Pod access SDK**, for strict-isolation deployments where each operator Pod runs its own SDK instance holding exactly one `Access`.
+- **SNI router — external dependency on kcp.** RFC 013 depends on kcp growing an L4 SNI router upstream of front-proxy TLS termination. Design and review happen in the kcp project; RFC 013 implementation is blocked on that landing. Interim option: a PM-operated standalone L4 router component that fakes the role until kcp absorbs it.

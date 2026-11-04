@@ -57,7 +57,7 @@ models:
 | **Provider** | A user who exposes APIExports, ContentConfigurations, etc. |
 | **Owner** | The PM-side workspace owner who wants a Provider's service. Often the same person as the User. |
 | **Provider Workspace** | The kcp workspace containing the Provider's APIExports, created by PM for the Provider. |
-| **`Provider`** | PM-side CRD (`providers.platform-mesh.io/v1alpha1`). Cluster-scoped. Pre-existing resource for kcp-side bootstrap (Workspace, SA, RBAC); extended with `spec.remote` (nested struct, presence-based opt-in) to switch from local mode (kubeconfig Secret stored in PM) to remote mode (kubeconfig delivered to a user-side cluster via `AccessGrant`). `spec.remote.caBundle` (optional, PEM) carries the trust bundle for the access SDK's `/access` TLS endpoint; omitted → system CAs (public web PKI). Mode is immutable after creation. Local kubeconfig Secret is skipped in remote mode. Persistent lifecycle handle: owns `AccessGrant` and PARs; `status.remote` surfaces the live connection state (`connectionState`, `tokenID`, `accessGrantRef`, `lastConnected`). Deleting the `Provider` is the authoritative teardown signal. |
+| **`Provider`** | PM-side CRD (`providers.platform-mesh.io/v1alpha1`). Cluster-scoped. Pre-existing resource for kcp-side bootstrap (Workspace, SA, RBAC); extended with `spec.remote` (nested struct, presence-based opt-in) to switch from local mode (kubeconfig Secret stored in PM) to remote mode (kubeconfig delivered to a user-side cluster via `AccessGrant`). `spec.remote.caBundle` (optional, PEM) carries the trust bundle for the access SDK's `/access` TLS endpoint; omitted → system CAs (public web PKI). Mode is immutable after creation. Local kubeconfig Secret is skipped in remote mode. Persistent lifecycle handle: owns `AccessGrant` and PARs; `status` follows the existing `phase` + `conditions` convention (phase computed from conditions; `Pending → Provisioning → Ready ⇄ Degraded`, `Deleting`). Remote-specific conditions: `Connected` (with reasons like `Reconnecting`, `NeedsReonboarding`). `status.remote` sub-struct carries informational fields only (`tokenID`, `accessURL`). Deleting the `Provider` is the authoritative teardown signal. |
 | **PM Instance** | One deployment of Platform Mesh (kcp + pm-operator). May be public or private. |
 | **Provider's portal** | In multi-tenant deployments, the Provider's website/system for managing customers. Creates `AccessIdentity` objects on the Provider's cluster (any Kubernetes client) and surfaces the minted access token to the Customer. PM has no opinion on its internals. |
 | **`access-operator`** | PM-side (`platform-mesh/operators/access-operator`, binary: `access-operator`). Watches `AccessGrant` objects in `Pending` state (created and pre-populated by the provider reconciler). For each: mints an SA token via kcp TokenRequest, derives a short-lived call credential from `AccessGrant.spec.accessToken`, and `POST`s `/access` (verifying the server cert against `AccessGrant.spec.caBundle` if set, otherwise system CAs) with the HMAC credential and a request body carrying `kcpURL`, `kcpCABundle`, `saToken`. Retries on `202` until `200` (ack) or `403`. On `200`: marks `AccessGrant` `Active`. Holds tunnel connections open with leader election (RFC 3); reconnects use session tokens (RFC 3 only). Runs in PM's runtime cluster. |
@@ -122,7 +122,8 @@ Owner      ──(2) obtains access token, creates ProviderAccessRequest
 access-operator  ──(4) picks up AccessGrant (Pending)
 access-operator  ──(4) mints SA token via kcp TokenRequest
 access-operator  ──(4) POST /access ──────────────────────────────────►  access SDK
-                       Bearer <tokenID>.<derived from access token secret>
+                       Authorization: Bearer <JWT signed with access token HMAC>
+                       [JWT: sub=tokenID, body_sha256, jti, iat, exp]
                        body: { kcpURL, kcpCABundle, saToken }
                  ◄──── 202, tokenID (accept: Manual) ────────────────
                        [access-operator retries until approved or TTL]
@@ -130,7 +131,7 @@ access-operator  ──(4) POST /access ─────────────�
 access-operator  ──(5) marks AccessGrant Active
 access SDK              ──(5) writes kubeconfig Secret from request body,
                                creates Access
-provider reconciler ──(5) updates Provider.status.remote.connectionState → Connected
+provider reconciler ──(5) sets Provider.status.conditions[Connected]=True; phase → Ready
 operator                ──(6) talks to kcp directly
 ```
 
@@ -152,7 +153,7 @@ operator                ──(6) talks to kcp directly
 5. access SDK writes the kubeconfig Secret using the credentials from the
    request body, creates the `Access` object, and responds `200`.
    access-operator marks the `AccessGrant` `Active`. The provider reconciler
-   reflects the `Active` state onto `Provider.status.remote.connectionState`.
+   sets `Provider.status.conditions[Connected]=True` and flips `phase` to `Ready`.
 6. The operator mounts the Secret and talks to kcp directly.
 
 `/access` is a one-shot call per connection: once step 5 completes, PM does
@@ -243,9 +244,11 @@ One deployment handles any number of PM instance connections.
 
 **`/access` endpoint (PM-initiated):**
 
-- Serves `POST /access`. access-operator presents
-  `Bearer <tokenID>.<derived-credential>` and a request body carrying
-  `kcpURL`, `kcpCABundle`, and the SA token access-operator minted.
+- Serves `POST /access`. access-operator presents a short-lived JWT in
+  `Authorization: Bearer …` (HS256-signed with the access token's HMAC
+  secret; claims include `sub=tokenID`, `body_sha256`, `jti`, `iat`, `exp`)
+  and a request body carrying `kcpURL`, `kcpCABundle`, and the SA token
+  access-operator minted.
 - Looks up `AccessIdentity` by `tokenID`, verifies HMAC against stored secret.
 - Writes the kubeconfig Secret from the request body and creates `Access`
   on acceptance.
@@ -361,12 +364,13 @@ reconnect-authentication plane disjoint from the initial handshake:
 - **Replay tracking.** SDK tracks `current_jti` / `previous_jti` per
   `Access`. A grace window (default 60 s) accepts `previous_jti` to
   tolerate lost responses; outside that window → reject.
-- No fallback: session-token rejection sets `AccessGrant` condition
-  `NeedsReonboarding` (reflected onto
-  `Provider.status.remote.connectionState`) and access-operator stops
-  dialing. Recovery is a new PAR against the same `Provider`, which
-  propagates the fresh access token into `AccessGrant.spec.accessToken` and triggers a fresh
-  initial handshake (creating a new `Access` with a new signing key).
+- No fallback: on session-token rejection access-operator stops dialing;
+  the provider reconciler surfaces this as
+  `Provider.status.conditions[Connected]=False` with
+  `reason=NeedsReonboarding` and `phase=Degraded`. Recovery is a new PAR
+  against the same `Provider`, which propagates the fresh access token into
+  `AccessGrant.spec.accessToken` and triggers a fresh initial handshake
+  (creating a new `Access` with a new signing key).
 - HMAC and session-signing-key verification are performed against disjoint
   keys and never substitute for each other. Rotating the HMAC secret on
   `AccessIdentity` (new access token) blocks future initial handshakes under this
@@ -411,9 +415,11 @@ CRD, extended with an optional nested `spec.remote` struct. Presence of
 bootstraps the Workspace, SA, and RBAC (as in local mode), but skips the
 local kubeconfig Secret and instead manages an `AccessGrant` owned by the
 `Provider`. Mode is immutable after creation; mode switch = delete and
-recreate. `Provider.status.remote` carries live connection state
-(`connectionState`, `tokenID`, `accessGrantRef`, `lastConnected`), fed by
-the provider reconciler watching `AccessGrant.status`.
+recreate. `status` follows the existing `phase` + `conditions` convention
+(`Pending → Provisioning → Ready ⇄ Degraded`, `Deleting`; phase computed
+from conditions). Remote mode adds a `Connected` condition with reasons
+(`Reconnecting`, `NeedsReonboarding`, etc.). `status.remote` sub-struct
+holds informational fields only: `tokenID` and `accessURL`.
 
 `Provider.spec.remote.caBundle` (optional, PEM-encoded) carries the CA
 material access-operator uses to verify the TLS server cert on `/access`.
