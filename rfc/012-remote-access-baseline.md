@@ -8,7 +8,7 @@ title: Remote access — baseline
 |---------|------------|
 | Author  | TBD        |
 | Created | 2026-11-03 |
-| Updated | 2026-11-03 |
+| Updated | 2026-11-12 |
 
 ## Summary
 
@@ -136,7 +136,7 @@ Lives in the Provider Workspace. Created by the provider reconciler.
 type AccessGrantSpec struct {
     SAref     corev1.LocalObjectReference `json:"saRef"`      // SA on kcp to mint tokens from
     AccessURL   string                    `json:"accessURL"`   // extracted from the access token
-    AccessToken string                    `json:"accessToken"` // full `pma1.…` wire string
+    AccessToken string                    `json:"accessToken"` // full `pma1.…` access token
     CABundle  string                      `json:"caBundle,omitempty"` // propagated from Provider.spec.remote.caBundle
 }
 
@@ -150,30 +150,27 @@ type AccessGrantStatus struct {
 
 ### `AccessIdentity` (user-side)
 
-Standing authorization for a PM instance connection. Lives on the user-side cluster.
+Long-lived tenant handle on the user-side cluster. Represents a standing authorization that can be dialled from PM. One `AccessIdentity` per tenant (Customer, portal user, etc.); created once and persisted across credential rotations. A tenant may hold multiple `AccessIdentity` objects when they have multiple parallel PM connections — nothing in the API constrains cardinality, and callers that need tenant→identity mapping attach their own labels (e.g. the portal in [Multi-tenant portal](#multi-tenant-portal) uses `portal-user=<id>`).
 
 ```go
-type AccessIdentitySpec struct {
-    // How incoming /access calls are handled.
-    Accept      AcceptMode `json:"accept"`                // Always (default) | Manual
-    MaxPending  int32      `json:"maxPending,omitempty"`  // cap on pending queue size
-    PendingTTL  *metav1.Duration `json:"pendingTTL,omitempty"`
-}
+type AccessIdentitySpec struct{}
 
 type AccessIdentityStatus struct {
-    // HMAC verification material surfaced for debugging; real HMAC secret in owned Secret.
+    // Current tokenID surfaced for display. The authoritative lookup
+    // pivot lives on the owned Secret's `access-sdk.platform-mesh.io/token-id` label.
     TokenID string `json:"tokenID,omitempty"`
-
-    // Pending queue (populated when spec.accept: Manual).
-    PendingConnections []PendingConnection `json:"pendingConnections,omitempty"`
 }
 ```
 
-On creation, the access SDK generates `(tokenID, HMAC secret)` and writes an access token into an owned Secret keyed by the identity. One `AccessIdentity` → many `Access` objects over time.
+In the baseline, every valid handshake is admitted. Operator-controlled admission gating (e.g. a `spec.accept: Manual` mode with a pending-approval queue on `status.pendingConnections`) is a [future-work](#future-work) item.
+
+The access SDK owns one Secret per `AccessIdentity`, named `<identity>-access-token`, containing the current access token (`pma1.<tokenID>.<secret>`) and labelled with the current tokenID at `access-sdk.platform-mesh.io/token-id`. Reconciliation is Secret-driven: on first reconcile the SDK mints `(tokenID, HMAC)` and creates the Secret; if the Secret is later deleted, the SDK mints a fresh pair and creates a new Secret (see [Rotation and revocation](#rotation-and-revocation)). Deleting the `AccessIdentity` offboards the tenant and cascades through OwnerReferences to delete its `Access` objects and their kubeconfig Secrets.
+
+One `AccessIdentity` → many `Access` objects over time (one per completed `/access` handshake). The identity object persists across credential rotations; existing `Access` objects reference the identity and remain valid.
 
 ### `Access` (user-side)
 
-Ongoing binding. Created by the access SDK on a successful `/access`. References the kubeconfig Secret. In tunnel mode ([RFC 013](./013-remote-access-tunnel.md)) each `Access` additionally carries its own session-signing key, `jti` tracking state, and a stable local proxy endpoint URL — held in access SDK state, not on the CRD.
+Ongoing binding. Created by the access SDK on a successful `/access`. References the kubeconfig Secret and its owning `AccessIdentity`. In tunnel mode ([RFC 013](./013-remote-access-tunnel.md)) each `Access` additionally carries its own session-signing key, `jti` tracking state, and a stable local proxy endpoint URL — held in access SDK state, not on the CRD.
 
 ```go
 type AccessSpec struct {
@@ -193,6 +190,10 @@ type AccessStatus struct {
 }
 ```
 
+Each `Access` is created with a controller OwnerReference pointing to its `AccessIdentity`, so deleting the identity cascades to the `Access` and (via the `Access`'s own OwnerReference on the kubeconfig Secret) to the kubeconfig Secret. The access SDK also stamps a `access-sdk.platform-mesh.io/identity=<identityName>` label on every `Access` so clients can filter by identity without walking `spec.identityRef`.
+
+The `Access` name is deterministic in `(identityName, jti)` — `<identityName>-<hex(sha256(jti)[:5])>` — so concurrent handshakes on the same jti across replicas collapse to a single admission via `AlreadyExists`.
+
 ### Access token: wire format
 
 Prefix-tagged dot-separated string:
@@ -203,11 +204,11 @@ pma1.<base64url(URL)>.<tokenID>.<secret>
 
 The `pma1.` prefix identifies this as a Platform Mesh access token, version 1. Clients split on dots and parse by position. Everything else in this document refers to the token as "the access token"; `pma1` appears only on the wire.
 
-- The URL pins the recipient (`https://access.example/access`), so the token cannot be redirected. The URL carries host only, not a protocol version — see [Protocol versioning](#protocol-versioning).
+- The URL pins the recipient (`https://access.example` or `https://access.example/platform-mesh`), so the token cannot be redirected. The URL is a base — host plus optional path prefix — and carries no protocol version; the operator appends `/versions` and `/vN/access` at dial time. See [Protocol versioning](#protocol-versioning).
 - `tokenID` is safe to log. It is also surfaced in `Provider.status.remote.tokenID` for out-of-band verification.
 - `secret` is the HMAC credential. access-operator derives a short-lived call credential from it per `/access` dial.
 
-The access SDK generates `(tokenID, secret)` on `AccessIdentity` creation and writes the full access token string into an owned Secret. The access token is long-lived per `AccessIdentity`; rotating it requires minting a new `AccessIdentity` and issuing a new PAR (see [Rotation and revocation](#rotation-and-revocation)).
+The access SDK generates `(tokenID, secret)` on first reconcile of an `AccessIdentity` and writes the full access token string into an owned Secret. The access token is long-lived per `AccessIdentity` but can be rotated in place by deleting the owned Secret; the SDK observes the deletion and mints a fresh `(tokenID, secret)` into a new Secret, which then needs to be issued through a new PAR (see [Rotation and revocation](#rotation-and-revocation)). The `AccessIdentity` object persists across rotations.
 
 ### Call credential: per-`/access` authentication
 
@@ -242,7 +243,7 @@ JWT body:
 3. Verify signature using the stored HMAC secret and standard JWT claim checks (`exp`, `iat`, `alg == HS256`). Failure → `403 InvalidCredential`.
 4. Recompute `sha256(body)` from the incoming request body. Compare to `body_sha256`. Mismatch → `403 BodyMismatch`.
 5. Check `jti` against a short-lived replay cache keyed by `(tokenID, jti)`, TTL ≥ `exp - iat` plus clock-skew margin. Present → `403 Replay`. Otherwise record it.
-6. Proceed with the handshake (accept mode, pending queue, etc.).
+6. Admit the handshake and create the `Access` + kubeconfig Secret.
 
 **Why this shape:**
 
@@ -259,13 +260,21 @@ JWT body:
 
 ### Protocol versioning
 
-`/access` is served under a TLS connection negotiated via ALPN. The baseline uses the ALPN token `pm-access/1`; future protocol shapes get new tokens. access-operator advertises its supported tokens in `ClientHello`; access SDK picks the highest mutually-supported. No overlap → TLS handshake fails with an ALPN alert.
+The handshake endpoint is versioned at the URL path: `/v1/access` for the baseline, `/v2/access` for a future shape, and so on. The access SDK mounts one handler per supported version; feature flags *within* a version (e.g., opting into RFC 013 tunnel mode on a handshake) are negotiated in the request/response body — additive within a version.
 
-Feature flags within a version (e.g., opting into RFC 013 tunnel mode on a handshake) are negotiated in the request/response body — additive within an ALPN-selected shape.
+Version discovery is explicit. The access SDK serves an unauthenticated `GET /versions` endpoint that returns the set of handshake versions the SDK accepts, newest first:
 
-The URL inside the access token pins only the host; a long-lived access token keeps working as the SDK rolls through protocol versions.
+```json
+{ "versions": ["v2", "v1"] }
+```
 
-There is no separate discovery endpoint. ALPN is the version-selection primitive; feature detection lives in the message body.
+access-operator probes `/versions` on first dial to each access SDK endpoint it hasn't seen before, picks the highest version both sides support, and caches the result keyed by the base URL. Subsequent dials skip the probe. If a later dial fails (e.g., the SDK was upgraded past the cached version), the cache entry is invalidated and the next retry re-probes.
+
+No overlap between the two supported-version lists → access-operator surfaces `Connected=False` with reason `UnsupportedProtocolVersion`, carrying both lists in the condition message so the user can decide whether to upgrade the operator or the provider SDK.
+
+The URL inside the access token is a base URL (host + optional path prefix). access-operator derives the probe URL and the versioned dial URL from it via `url.JoinPath`. Admins fronting the SDK with an ingress that keeps a path prefix (e.g. `https://host/platform-mesh`) configure the prefix once via the SDK's `--public-url`; the SDK mounts its handlers under that same prefix, so no ingress rewrite is required.
+
+TLS version pinning (`MinVersion = TLS 1.2`) stays in place, but the TLS layer carries no protocol-identification role — ALPN is not used. A probe hit to `/versions` is also the operator's cheapest reachability check.
 
 ### TLS trust
 
@@ -304,8 +313,6 @@ access-operator  ──(4) POST /access ─────────────�
                        body: { kcpURL, kcpCABundle, saToken }
                        [JWT: sub=tokenID, body_sha256, jti, iat, exp;
                         see "Call credential"]
-                 ◄──── 202, tokenID (accept: Manual) ────────────────
-                       [access-operator retries until approved or TTL]
                  ◄──── 200 (ack; empty body) ──────────────────────────
 access-operator      ──(5) marks AccessGrant Active
 access SDK           ──(5) writes kubeconfig Secret from request body, creates Access
@@ -315,12 +322,7 @@ operator             ──(6) talks to kcp directly
 
 Request body credentials flow one-way: PM → user-side. The response is an acknowledgement (empty body in the baseline). access-operator verifies the TLS server cert against `AccessGrant.spec.caBundle` or system CAs before sending the request.
 
-**Accept modes:**
-
-- `spec.accept: Always` (default) — access SDK accepts immediately on valid HMAC.
-- `spec.accept: Manual` — access SDK adds a pending entry to `AccessIdentity.status.pendingConnections` (keyed by `tokenID`) and returns `202`. The Provider approves by patching the identity. access-operator retries periodically. Denial or TTL returns `403`.
-
-`spec.accept` applies to the one-shot `/access` call only.
+In the baseline every HMAC-verified handshake is admitted immediately; operator-controlled admission (manual approval, pending queue) is deferred to [future work](#future-work).
 
 `/access` is a one-shot call per connection: once step 5 completes, PM does not dial `/access` again for this `AccessGrant`. Re-onboarding (after SA revocation PM-side, or deliberate rotation) is a new PAR against the same `Provider`, carrying a fresh access token.
 
@@ -328,7 +330,7 @@ Request body credentials flow one-way: PM → user-side. The response is an ackn
 
 After step 5, the access SDK owns the delivered kubeconfig:
 
-- **SA token renewal:** access SDK periodically renews via `TokenRequest` against kcp. The operator never sees the handshake; it just reads the Secret.
+- **SA token renewal:** an `Access` reconciler in the access SDK periodically renews the ServiceAccount token embedded in each `Access`'s kubeconfig Secret via kcp's TokenRequest API, authenticating with the current kubeconfig. The operator never sees the handshake; it just reads the Secret. Details below under [SA token renewal](#sa-token-renewal).
 - **CA bundle rotation:** access SDK polls a well-known object in the workspace maintained by access-operator (Decision 4 in the overview; see [Operations](#operations)). Rewrites the kubeconfig when the bundle changes.
 - **Offboarding detection:**
   - `401` after the delivered JWT's `exp` → token expired; access SDK renews.
@@ -336,13 +338,38 @@ After step 5, the access SDK owns the delivered kubeconfig:
   - `403`, 5xx, network errors are not treated as offboarding.
 - **Re-onboarding:** create a new PAR on PM. No user-side state machine needed for recovery — the user-side is passive.
 
+### SA token renewal
+
+Each `Access` is reconciled by the SDK's `Access` controller. Per reconcile:
+
+1. Load the kubeconfig Secret referenced by `Access.spec.kubeconfigSecretRef`.
+2. Parse the current ServiceAccount token (standard JWT): read the `sub` claim to recover `(saNamespace, saName)` and the `exp` claim to recover expiry (absent for legacy static tokens).
+3. Decide whether to renew:
+   - If `exp` is absent, renew immediately. This is the expected first reconcile after a handshake: PM delivers a long-lived static token (the access-operator cannot call `TokenRequest` on kcp across workspaces until kcp supports subresource PermissionClaims), and the SDK promotes it to a bound token on first pass.
+   - If `time.Until(exp) < DefaultAccessTokenTTL × DefaultRenewalThresholdFraction`, renew.
+   - Otherwise requeue at `exp − threshold`.
+4. Renew by building a REST client from the kubeconfig and calling `POST /api/v1/namespaces/{saNamespace}/serviceaccounts/{saName}/token` with a requested TTL. The delivered kubeconfig has admin on its own workspace, so TokenRequest is authorised natively — no cross-workspace PermissionClaim indirection is involved on the user side.
+5. Rewrite every `AuthInfo.token` in the kubeconfig with the new value and `Update` the Secret.
+6. Set `Access.status.lastRefreshed = now` and requeue at `newExp − threshold`.
+
+Defaults the SDK ships with:
+
+- `DefaultAccessTokenTTL = 1h` — the TTL the SDK requests from `TokenRequest`.
+- `DefaultRenewalThresholdFraction = 0.2` — renew when less than 20% of the current token's lifetime is left (matches the kubelet's convention).
+
+Both are controller fields; flags can be added without an API change when a deployment needs to tune them.
+
+The renewal loop is the authoritative writer of `Access.status.lastRefreshed`. The handshake handler initialises it at admission; every subsequent successful renewal advances it. Portal and operator consumers treat an `Access` whose `lastRefreshed` is far behind the configured TTL as stale.
+
 ## Rotation and revocation
 
 ### User-side levers
 
 - **Delete `Access`** → cut one PM instance (operator loses that kubeconfig; other `Access` objects and the `AccessIdentity` unaffected).
-- **Rotate `AccessIdentity` HMAC secret** (new access token) → blocks future handshakes under this identity. Existing `Access` objects continue working on their delivered SA tokens.
-- **Delete `AccessIdentity`** → stops accepting new handshakes. Existing `Access` objects keep working until their delivered SA token is revoked PM-side or their `Access` is deleted.
+- **Rotate the access token** (delete the owned Secret) → SDK mints a fresh `(tokenID, HMAC)` into a new Secret with a fresh `metadata.creationTimestamp`. Existing `Access` objects are unaffected; their delivered SA tokens are independent of the handshake credential. Future handshakes under the stale token fail at sub-lookup (the old tokenID is no longer labelled on any Secret).
+- **Delete `AccessIdentity`** → tenant offboarding. Cascades through OwnerReferences: owned Secret, all `Access` objects, and each `Access`'s kubeconfig Secret are garbage-collected by Kubernetes.
+
+Rotation is modelled as **delete-then-create** on the owned Secret, not in-place update. This gives every rotation a new `creationTimestamp` the portal can display, and makes the Secret the single lifecycle unit for the credential (labels, data, and timestamps move together on a single Kubernetes write — no cross-object race during rotation).
 
 ### PM-side levers
 
@@ -351,7 +378,7 @@ After step 5, the access SDK owns the delivered kubeconfig:
 
 ### Rotation after a leaked access token
 
-Rotate the HMAC secret on the `AccessIdentity` (mint a new access token). The attacker cannot open a new handshake under the stale token. Existing connections are unaffected because the baseline only uses the access token once, at initial handshake; no further verification of the stale token ever happens. The Owner creates a fresh PAR with the new access token to replace the stored value in `AccessGrant.spec`.
+Rotate the access token by deleting the owned Secret; the SDK mints a new `(tokenID, HMAC)` into a fresh Secret. The attacker cannot open a new handshake under the stale token — the old tokenID no longer resolves to a Secret, so sub-lookup returns `UnknownIdentity`. Existing connections are unaffected because the baseline only uses the access token once, at initial handshake; no further verification of the stale token ever happens. The Owner creates a fresh PAR with the new access token to replace the stored value in `AccessGrant.spec`.
 
 A leaked access token cannot be used by the attacker against a `Provider` that already has an active `AccessGrant` for a different access token — the attacker's call would be verified against the current HMAC secret, which they do not have.
 
@@ -397,6 +424,7 @@ On-the-wire protocol is identical. This RFC does not specify portal internals.
 
 ## Future work
 
+- **Operator-controlled admission.** A `spec.accept: Manual` mode on `AccessIdentity` with a pending-approval queue (`status.pendingConnections` plus `spec.maxPending` / `spec.pendingTTL`). An unverified handshake hitting a Manual identity gets `202` + a pending-entry tokenID; the Provider approves by patching the identity; access-operator retries until `200` or TTL-expiry → `403`. The baseline admits every valid handshake unconditionally, so this entire surface — the `AcceptMode` enum, the `PendingConnection` type, the maxPending/pendingTTL fields on spec, and the pending-queue plumbing in the handler — is deferred.
 - **RFC 013 (tunnel mode).** Adds persistent tunnel and session-based reconnect for the case where PM's kcp is not publicly reachable from the user-side cluster.
 - **OIDC call credentials.** Using kcp-issued audience-bound JWTs as the `/access` call credential, replacing `(tokenID, secret)` with `(issuer, subject)` in `AccessIdentity`. Particularly interesting in multi-tenant portal deployments where PM's kcp is publicly reachable.
 - **User-initiated flow.** Design is sketched in the overview as "copy PM's token to User." Implementation deferred until cross-org delegation becomes a priority.
