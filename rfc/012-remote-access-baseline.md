@@ -332,25 +332,26 @@ After step 5, the access SDK owns the delivered kubeconfig:
 
 - **SA token renewal:** an `Access` reconciler in the access SDK periodically renews the ServiceAccount token embedded in each `Access`'s kubeconfig Secret via kcp's TokenRequest API, authenticating with the current kubeconfig. The operator never sees the handshake; it just reads the Secret. Details below under [SA token renewal](#sa-token-renewal).
 - **CA bundle rotation:** access SDK polls a well-known object in the workspace maintained by access-operator (Decision 4 in the overview; see [Operations](#operations)). Rewrites the kubeconfig when the bundle changes.
-- **Offboarding detection:**
-  - `401` after the delivered JWT's `exp` → token expired; access SDK renews.
-  - Persistent `401` before `exp` (including repeated renewal failures) → SA revoked PM-side. Access SDK deletes the Secret and `Access`, emits a Pod Event, reports not-ready. Operator loses credentials and stops reconciling.
-  - `403`, 5xx, network errors are not treated as offboarding.
-- **Re-onboarding:** create a new PAR on PM. No user-side state machine needed for recovery — the user-side is passive.
+- **Offboarding detection:** once the current SA token's `exp` has passed and the renewal loop can no longer mint a replacement (TokenRequest consistently fails with `401`/`403`, e.g. the SA was revoked or the workspace was deleted on PM), the Access reconciler flips `Access.status.phase` to `Revoked`. Reconcilers stop acting on Revoked Accesses — the kubeconfig Secret is left in place (now carrying an expired token) and no further renewal is attempted. `Revoked` is terminal in v1alpha1. Auto-deletion of Revoked Accesses and their Secrets is [future work](#future-work).
+- **Re-onboarding:** create a new PAR on PM. No user-side state machine needed for recovery — the user-side is passive. Re-onboarding produces a new `Access` CR; the Revoked one is left for a human (or future cleanup loop) to garbage-collect.
 
 ### SA token renewal
 
 Each `Access` is reconciled by the SDK's `Access` controller. Per reconcile:
 
-1. Load the kubeconfig Secret referenced by `Access.spec.kubeconfigSecretRef`.
-2. Parse the current ServiceAccount token (standard JWT): read the `sub` claim to recover `(saNamespace, saName)` and the `exp` claim to recover expiry (absent for legacy static tokens).
-3. Decide whether to renew:
+1. If `Access.status.phase == Revoked`, return immediately. `Revoked` is a terminal state and the loop stops acting.
+2. Load the kubeconfig Secret referenced by `Access.spec.kubeconfigSecretRef`.
+3. Parse the current ServiceAccount token (standard JWT): read the `sub` claim to recover `(saNamespace, saName)` and the `exp` claim to recover expiry (absent for legacy static tokens).
+4. If `exp` is set and already in the past, the token can no longer be renewed. Set `Access.status.phase = Revoked` and return. No requeue.
+5. Decide whether to renew:
    - If `exp` is absent, renew immediately. This is the expected first reconcile after a handshake: PM delivers a long-lived static token (the access-operator cannot call `TokenRequest` on kcp across workspaces until kcp supports subresource PermissionClaims), and the SDK promotes it to a bound token on first pass.
    - If `time.Until(exp) < DefaultAccessTokenTTL × DefaultRenewalThresholdFraction`, renew.
    - Otherwise requeue at `exp − threshold`.
-4. Renew by building a REST client from the kubeconfig and calling `POST /api/v1/namespaces/{saNamespace}/serviceaccounts/{saName}/token` with a requested TTL. The delivered kubeconfig has admin on its own workspace, so TokenRequest is authorised natively — no cross-workspace PermissionClaim indirection is involved on the user side.
-5. Rewrite every `AuthInfo.token` in the kubeconfig with the new value and `Update` the Secret.
-6. Set `Access.status.lastRefreshed = now` and requeue at `newExp − threshold`.
+6. Renew by building a REST client from the kubeconfig and calling `POST /api/v1/namespaces/{saNamespace}/serviceaccounts/{saName}/token` with a requested TTL. The delivered kubeconfig has admin on its own workspace, so TokenRequest is authorised natively — no cross-workspace PermissionClaim indirection is involved on the user side.
+7. Rewrite every `AuthInfo.token` in the kubeconfig with the new value and `Update` the Secret.
+8. Set `Access.status.lastRefreshed = now` and requeue at `newExp − threshold`.
+
+If TokenRequest fails (for example, PM has revoked the SA or deleted the workspace), the reconciler returns the error and lets controller-runtime back off. Retries continue until `exp` passes, at which point step 4 transitions the Access to `Revoked` and the loop goes quiet.
 
 Defaults the SDK ships with:
 
@@ -418,12 +419,15 @@ On-the-wire protocol is identical. This RFC does not specify portal internals.
 - **The access token's HMAC secret is long-lived.** Treat it like any shared-secret bearer token: transport out of band, do not log, rotate on suspicion of leak. HMAC-derived per-dial credentials limit replay windows.
 - **`tokenID` is public.** Surfaced in logs and in `Provider.status.remote.tokenID`. Only the `secret` component is sensitive.
 - **Trust boundary for TLS to `/access`.** If a `caBundle` is pinned on `Provider.spec.remote`, it is the only trust material used; system CAs are ignored. Operators running access SDK with private PKI should keep the TLS key across cert renewals so trust doesn't need to be rotated on every renewal.
+- **Confidentiality is TLS, not HMAC.** The call credential's HMAC provides authentication, integrity (`body_sha256`), and replay protection — not encryption. The handshake body (`kcpURL`, `kcpCABundle`, `saToken`) travels as plain JSON inside the TLS tunnel to the access SDK. Anyone who can break or terminate that TLS connection before the SDK sees the `saToken` in cleartext; pinning `caBundle` on `Provider.spec.remote` is therefore the primary defence. Payload-level encryption (e.g. HPKE to a per-`AccessIdentity` public key carried in the access token) would add defence-in-depth against a compromised fronting proxy, but is deferred — if it lands, it will likely piggyback on the per-`Access` asymmetric keys introduced by [RFC 013](./013-remote-access-tunnel.md).
 - **SA token exposure.** The SA token lives in the kubeconfig Secret on the user-side cluster. Treated as any kube Secret: RBAC-restricted, etcd-encrypted per cluster policy.
 - **Replay protection.** Each `/access` dial uses a fresh derived credential from the access token's HMAC secret with a timestamp or nonce; the access SDK rejects replays. (Exact mechanism TBD; HMAC-over-nonce is the straightforward choice.)
 - **Abuse by a stolen `AccessGrant`.** Access-operator acts on `AccessGrant` in its own cluster; the PM runtime cluster must be secured as the primary trust boundary. A compromised PM runtime cluster can mint SA tokens and dial out, but this RFC does not re-secure against PM-side compromise.
 
 ## Future work
 
+- **Auto-cleanup of Revoked Accesses.** Today an `Access` whose SA token expired without a renewal path flips to `Phase=Revoked` and sits there — its kubeconfig Secret stays on the cluster (with an expired token) until a human deletes the Access, which cascades. A follow-up garbage-collection loop could delete Revoked Accesses after a configurable retention (so operators have a window to inspect).
+- **Short-circuit Revoked on persistent 401/403.** Today the reconciler retries TokenRequest with controller-runtime backoff until `exp` passes, then flips to Revoked. A smarter transition could watch for N consecutive `401`/`403` and transition earlier, reducing log noise during the pre-expiry window.
 - **Operator-controlled admission.** A `spec.accept: Manual` mode on `AccessIdentity` with a pending-approval queue (`status.pendingConnections` plus `spec.maxPending` / `spec.pendingTTL`). An unverified handshake hitting a Manual identity gets `202` + a pending-entry tokenID; the Provider approves by patching the identity; access-operator retries until `200` or TTL-expiry → `403`. The baseline admits every valid handshake unconditionally, so this entire surface — the `AcceptMode` enum, the `PendingConnection` type, the maxPending/pendingTTL fields on spec, and the pending-queue plumbing in the handler — is deferred.
 - **RFC 013 (tunnel mode).** Adds persistent tunnel and session-based reconnect for the case where PM's kcp is not publicly reachable from the user-side cluster.
 - **OIDC call credentials.** Using kcp-issued audience-bound JWTs as the `/access` call credential, replacing `(tokenID, secret)` with `(issuer, subject)` in `AccessIdentity`. Particularly interesting in multi-tenant portal deployments where PM's kcp is publicly reachable.
