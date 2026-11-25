@@ -89,11 +89,11 @@ AccessIdentity represents a tenant of the remote-side (although a tenant may hav
 
 **Example:** a public service provider has a portal where its customers may create an account, fill in their contact and payment information. Any kubeconfig handed over is booked under this identity. Consumers of the service that will appear on that PM instance (where this kubeconfig originates from) will be charged to this customer.
 
-**Deliverable:** `platform-mesh-sdk-access-crds` Helm chart that has the Access SDK CRDs. The owner of the remote-side deploys it.
+**Deliverable:** `sdk-access-crds` Helm chart that has the Access SDK CRDs. The owner of the remote-side deploys it.
 
-**Deliverable:** `platform-mesh-sdk-access-controller` Helm chart for the Access SDK operator. The owner of the remote-side deploys it.
+**Deliverable:** `sdk-access-operator` Helm chart for the Access SDK operator. The owner of the remote-side deploys it.
 
-**Deliverable:** `platform-mesh-sdk-access-server` Helm chart for the HTTP server of the Access SDK machinery. It registers endpoints to handle the communication initiated from the PM-side. This is how the kubeconfig gets from PM to the remote cluster. The owner of the remote-side deploys it, and makes it accessible.
+**Deliverable:** `sdk-access-server` Helm chart for the HTTP server of the Access SDK machinery. It registers endpoints to handle the communication initiated from the PM-side. This is how the kubeconfig gets from PM to the remote cluster. The owner of the remote-side deploys it, and makes it accessible.
 
 ```go
 // AccessIdentitySpec defines the desired state of an AccessIdentity.
@@ -118,7 +118,7 @@ Note the `TokenID` field. We've mentioned the **access token,** and the `TokenID
 
 AccessGrant links a ServiceAccount in a kcp workspace to an AccessIdentity on the remote-side. To establish that link, it needs the **access token** and the **access URL** of the remote-side. Creating such an AccessGrant then triggers kubeconfig transfer of the associated ServiceAccount token to that remote cluster.
 
-**Example:** the service provider created an AccessIdentity for us and generated an access token. The provider also runs `platform-mesh-sdk-access-server` and exposes it on a public URL. Now, if we want to onboard / "invite" the provider to our workspace, we use that token and URL to create an AccessGrant for some ServiceAccount, so that the provider can bootstrap itself and publish its services on this PM instance.
+**Example:** the service provider created an AccessIdentity for us and generated an access token. The provider also runs `sdk-access-server` and exposes it on a public URL. Now, if we want to onboard / "invite" the provider to our workspace, we use that token and URL to create an AccessGrant for some ServiceAccount, so that the provider can bootstrap itself and publish its services on this PM instance.
 
 **Deliverable:** `access-operator` Helm chart for the operator. Reconciles AccessGrants, and dials the Access SDK server on the remote-side. The PM deploys this automatically.
 
@@ -153,7 +153,7 @@ Here, the access token is used only for the initial handshake. Afterwards, even 
 
 #### `Access` (remote-side)
 
-Access marks an ongoing connection from some PM instance to this remote cluster. This is created by `platform-mesh-sdk-access-server` after a successful handshake. The kubeconfig is then stored in a dedicated Secret `<Access.Name>-kubeconfig`, and kept refreshed by `platform-mesh-sdk-access-controller`.
+Access marks an ongoing connection from some PM instance to this remote cluster. This is created by `sdk-access-server` after a successful handshake. The kubeconfig is then stored in a dedicated Secret `<Access.Name>-kubeconfig`, and kept refreshed by `sdk-access-operator`.
 
 **Example:** The user has granted this service provider access. Now that it received the kubeconfig, it can bootstrap itself (e.g. create its APIExports, APIResourceSchemas, ContentConfigurations, ...), and start reconciling. If the provider is able to watch many such kubeconfig Secrets, it can serve many PM instances.
 
@@ -296,4 +296,4 @@ Alternatives exist for getting a kubeconfig into a remote cluster, but because w
 
 **Q: Is it enough to rely only on TLS for payload encryption?** This RFC sends kubeconfig material in the request body in cleartext. Whatever terminates TLS will see it. Is that a problem? Maybe, it depends on trust boundaries. We could add payload-level encryption as a follow-up if needed.
 
-**Q: How does the remote-side keep up with kcp's CA rotation?** `platform-mesh-sdk-access-controller` is the one that keeps the SA tokens alive. But if PM rotates its kcp CAs, the controller needs to be notified about that so that it can roll over safely. ClusterCachedResource for KcpCAs?
+**Q: How does the remote-side keep up with kcp's CA rotation?** `sdk-access-operator` is the one that keeps the SA tokens alive. But if PM rotates its kcp CAs, the controller needs to be notified about that so that it can roll over safely. ClusterCachedResource for KcpCAs?
